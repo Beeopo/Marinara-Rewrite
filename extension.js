@@ -47,12 +47,22 @@
     historyDepth: 5, compact: false,
     localContextEnabled: false, localContextWords: 150,
     useLorebookEntries: false, usePrevMessages: false, prevMessageCount: 2,
-    charCardIds: [], reviewBeforeApply: false,
+    charCardIds: [], reviewBeforeApply: false, useUserPersona: false,
     // Connection: "sidecar" (Marinara local sidecar) or "direct" (OpenAI-compatible
     // endpoint such as Ollama/llama.cpp). Direct avoids running two models at once.
     connMode: "sidecar", apiUrl: "http://127.0.0.1:11434/v1", apiModel: "", apiKey: "", directTemp: 0.7,
     autoProfileEnabled: true, promptsVersion: 0, debugEnabled: false,
     mergeMultiMsg: false,
+    // When true, selecting text does NOT auto-open the popup; only Alt+R does.
+    // Keeps normal highlight/copy/paste from triggering the popup.
+    manualTriggerOnly: false,
+    // Swap the full system prompt for a terse one to save tokens on small models.
+    conciseSysPrompt: false,
+    // Collapsed state of the popup's token-cost panel (the ^ toggle).
+    ctxCollapsed: false,
+    // Pinned popup position {left,top} as CSS px strings, or null to follow the
+    // selection. Pinning locks WHERE the popup appears, not whether it stays open.
+    pinnedPos: null,
   };
 
   // Shared rewrite system prompt (single + merge paths).
@@ -66,7 +76,18 @@
     "- Keep the same point of view and verb tense as the original.\n" +
     "- Keep every named character, plot fact, and continuity detail unchanged unless the edit explicitly calls for it.\n" +
     "- Match the voice, register, and language of the surrounding prose.\n" +
-    "- Treat anything inside <context>, <character>, or <lore> as reference only — never rewrite or quote it.";
+    "- Treat anything inside <context>, <character>, <persona>, or <lore> as reference only — never rewrite or quote it.";
+
+  // Terse system prompt for users on tiny context windows (small local models).
+  // Keeps the must-haves (output-only, reference-only, POV/continuity) and drops
+  // the elaboration. ~90 tokens vs ~180. Toggled by cfg.conciseSysPrompt.
+  var REWRITE_SYS_CONCISE =
+    "You are a line editor. Rewrite the text inside <rewrite_this> as instructed.\n" +
+    "Output ONLY the rewritten passage — no preamble, notes, quotes, or markdown.\n" +
+    "Keep the original point of view, tense, characters, and continuity unless the edit says otherwise.\n" +
+    "Treat <context>, <character>, <persona>, and <lore> as reference only; never rewrite or quote them.";
+
+  function sysPrompt() { return cfg.conciseSysPrompt ? REWRITE_SYS_CONCISE : REWRITE_SYS; }
 
   var cfg = (function () {
     var stored = load(K_CFG) || {};
@@ -236,6 +257,65 @@
     }).catch(function () { return ""; });
   }
 
+  function buildPersonaContext(p) {
+    if (!p) return "";
+    var lines = [];
+    if (p.name)        lines.push("Name: " + p.name);
+    if (p.description) lines.push("Description: " + String(p.description).slice(0, 300));
+    if (p.personality) lines.push("Personality: " + String(p.personality).slice(0, 200));
+    if (p.appearance)  lines.push("Appearance: " + String(p.appearance).slice(0, 150));
+    return lines.length
+      ? "\n\n<persona note=\"This is the human user's persona. When rewriting their own message, keep their voice and self-description.\">\n" + lines.join("\n") + "\n</persona>"
+      : "";
+  }
+
+  // Inject the user's persona, but only when the selected message was authored by
+  // the user (role === "user"). Role comes from the stored message data, not DOM
+  // class guessing — the fork's bug was defaulting to the character on any miss.
+  function fetchUserPersona(cid, mid) {
+    if (!cfg.useUserPersona || !cid) return Promise.resolve("");
+    return cachedMessages(cid).then(function (msgs) {
+      if (!Array.isArray(msgs)) return "";
+      var msg = null;
+      for (var i = 0; i < msgs.length; i++) { if (msgs[i].id === mid) { msg = msgs[i]; break; } }
+      if (!msg || (msg.role || "").toLowerCase() !== "user") return "";
+      return marinara.apiFetch("/chats/" + cid).then(function (chat) {
+        var pid = chat && chat.personaId;
+        if (!pid) return "";
+        // Marinara serves personas under /characters/personas/:id (not /personas/:id,
+        // which is the SillyTavern-era path the fork assumed).
+        return marinara.apiFetch("/characters/personas/" + pid)
+          .then(function (p) { return buildPersonaContext(p); })
+          .catch(function () { return ""; });
+      });
+    }).catch(function () { return ""; });
+  }
+
+  // Fetch all async context parts at once, cached by chat+message+enabled-flags so
+  // the popup's preview fetch and the actual rewrite share one round trip. Local
+  // (surrounding) context is selection-derived and stays out of this cache.
+  var _ctxCache = { key: null, ts: 0, data: null };
+  function ctxKey(cid, mid) {
+    return [cid, mid, !!cfg.useCharCard, !!cfg.useUserPersona, !!cfg.useLorebookEntries,
+      !!cfg.usePrevMessages, cfg.prevMessageCount, (cfg.charCardIds || []).join(",")].join("|");
+  }
+  function fetchContextParts(cid, mid) {
+    var key = ctxKey(cid, mid);
+    if (_ctxCache.key === key && Date.now() - _ctxCache.ts < 20000 && _ctxCache.data) {
+      return Promise.resolve(_ctxCache.data);
+    }
+    return Promise.all([
+      cfg.useCharCard ? fetchCharCard(cid) : Promise.resolve(""),
+      cfg.useLorebookEntries ? fetchLorebookEntries(cid) : Promise.resolve(""),
+      fetchPrevMessages(cid, mid),
+      fetchUserPersona(cid, mid),
+    ]).then(function (r) {
+      var data = { card: r[0], lore: r[1], prev: r[2], persona: r[3] };
+      _ctxCache = { key: key, ts: Date.now(), data: data };
+      return data;
+    });
+  }
+
   function extractLocalContext(mid, selText) {
     var msgEl = document.querySelector('[data-message-id="' + mid + '"]');
     if (!msgEl) return "";
@@ -355,6 +435,8 @@
     plus:  '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
     x:     '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
     grip:  '<path d="M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01"/>',
+    chevron: '<polyline points="18 15 12 9 6 15"/>',
+    pin:   '<line x1="12" y1="17" x2="12" y2="22"/><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6z"/>',
   };
   function svgEl(paths, size) {
     var s = size || 16;
@@ -380,6 +462,8 @@
   var sel   = { text: "", mid: "", cid: null };
   var dragId = null;
   var _twCancel = null;
+  var _movingPopup = false;  // set during a corner-grabber drag to suppress dismiss
+  var _ctxOff = {};          // per-popup overrides: context sources excluded via the dots
 
   // ── Styles ────────────────────────────────────────────────────────────────
 
@@ -550,6 +634,7 @@
 
   function showPopup(rect, segments) {
     killPopup();
+    _ctxOff = {};
     var cid = getChatId();
     // segments: [{mid, text}] in document order. sel.text/mid mirror the first
     // segment so single-message helpers (Custom Prompt, undo) keep working.
@@ -563,7 +648,9 @@
     var colCount  = Math.max(1, cfg.cols || 2);
     var rowCount  = Math.max(1, cfg.rows || 6);
     var estWidth  = Math.max(200, colCount * 115) + 20;
-    var estHeight = rowCount * 34 - 4 + 140;
+    var panelRows = 2 + (cfg.localContextEnabled ? 1 : 0) + (cfg.useUserPersona ? 1 : 0) +
+      (cfg.useCharCard ? 1 : 0) + (cfg.useLorebookEntries ? 1 : 0) + (cfg.usePrevMessages ? 1 : 0);
+    var estHeight = rowCount * 34 - 4 + 140 + (cfg.ctxCollapsed ? 0 : panelRows * 16);
 
     var lft = rect.left;
     var top;
@@ -578,6 +665,13 @@
     }
     if (lft + estWidth > window.innerWidth) lft = window.innerWidth - estWidth - 8;
 
+    // Pinned: appear at the locked spot (clamped to the viewport) instead of by
+    // the selection. Content still re-populates for each new selection.
+    if (cfg.pinnedPos) {
+      lft = Math.min(parseFloat(cfg.pinnedPos.left) || lft, window.innerWidth - estWidth - 8);
+      top = Math.min(parseFloat(cfg.pinnedPos.top) || top, window.innerHeight - 60);
+    }
+
     var p = mk("div", "rwa");
     p.style.left     = Math.max(8, lft) + "px";
     p.style.top      = Math.max(8, top) + "px";
@@ -589,8 +683,136 @@
 
     var mhdr = ap(p, mk("div", "rwa-mini-hdr"));
     ap(mhdr, mk("span", "rwa-mini-title", "REWRITE"));
-    var sub = ap(mhdr, mk("span", "rwa-mini-sub", segments.length > 1 ? segments.length + " messages" : "1 message"));
+    var selTok = segments.reduce(function (s, g) { return s + tokest(g.text); }, 0);
+    var sub = ap(mhdr, mk("span", "rwa-mini-sub",
+      (segments.length > 1 ? segments.length + " messages" : "1 message") + " · ~" + selTok + " tok"));
     if (segments.length > 1) { sub.style.color = "var(--primary)"; sub.title = "Selection spans " + segments.length + " messages; each is rewritten in turn."; }
+
+    // Collapse chevron for the token panel (sits at the top-right of the header).
+    var collapseBtn = mk("button", "rwa-ibtn");
+    collapseBtn.style.cssText = "width:18px;height:18px;margin-left:auto;flex:0 0 auto;";
+    collapseBtn.setAttribute("aria-label", "Collapse token panel");
+    ap(mhdr, collapseBtn);
+
+    // ── Context cost panel: selection (instant) + each enabled source (async,
+    // cached). Empty dot = fetch pending; green dot = counted. Total updates live.
+    var partsToks = { sel: selTok, local: 0, persona: 0, card: 0, lore: 0, prev: 0 };
+    var ctxPanel = ap(p, mk("div", "rwa-ctx"));
+    ctxPanel.style.cssText = "padding:2px 12px 4px;font-size:10px;color:var(--muted-foreground);line-height:1.6;";
+    function setCollapsed(on) {
+      cfg.ctxCollapsed = on; saveC();
+      ctxPanel.style.display = on ? "none" : "";
+      collapseBtn.innerHTML = svgEl(ICON.chevron, 14);
+      collapseBtn.firstChild.style.transition = "transform .15s";
+      collapseBtn.firstChild.style.transform = on ? "rotate(180deg)" : "";
+      collapseBtn.setAttribute("aria-label", on ? "Show token panel" : "Collapse token panel");
+    }
+    collapseBtn.addEventListener("click", function (e) { e.stopPropagation(); setCollapsed(!cfg.ctxCollapsed); });
+    // Dot states: pending (empty) → counting; on (green) → counted & included;
+    // off (red) → user-excluded via click, dropped from the next rewrite.
+    function paintDot(dot, state) {
+      var c = state === "off" ? "#ef4444" : state === "on" ? "#22c55e" : "var(--muted-foreground)";
+      dot.style.cssText = "width:8px;height:8px;border-radius:50%;flex:0 0 auto;border:1px solid " + c +
+        ";background:" + (state === "pending" ? "transparent" : c) + ";";
+    }
+    var ctxRows = {};
+    function repaint(key) {
+      var r = ctxRows[key]; if (!r) return;
+      var off = r.tkey && _ctxOff[r.tkey];
+      paintDot(r.dot, off ? "off" : (r.loaded ? "on" : "pending"));
+      r.val.style.textDecoration = off ? "line-through" : "";
+      r.val.style.opacity = off ? ".7" : "";
+      if (off) r.val.textContent = r.loaded ? ("~" + r.toks + " off") : "off";
+      else r.val.textContent = r.loaded ? (r.toks > 0 ? ("~" + r.toks + " tok") : "none") : "counting…";
+    }
+    function addCtxRow(key, label, pending, tkey) {
+      var row = mk("div", ""); row.style.cssText = "display:flex;align-items:center;gap:6px;";
+      var dot = mk("span", "");
+      var nm = mk("span", "", label); nm.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+      var val = mk("span", "");
+      row.appendChild(dot); row.appendChild(nm); row.appendChild(val);
+      ap(ctxPanel, row);
+      ctxRows[key] = { dot: dot, val: val, tkey: tkey || null, loaded: !pending, toks: 0 };
+      if (tkey) {
+        dot.style.cursor = "pointer";
+        row.title = "Click the dot to include / exclude this source from the rewrite.";
+        dot.addEventListener("click", function (e) { e.stopPropagation(); _ctxOff[tkey] = !_ctxOff[tkey]; repaint(key); updateTotal(); });
+      } else if (pending) {
+        row.title = "Counting… fetched live from the app and cached for 20s (no model call — local only).";
+      }
+      repaint(key);
+    }
+    function fillCtxRow(key, toks) {
+      var r = ctxRows[key]; if (!r) return;
+      r.loaded = true; r.toks = toks; repaint(key);
+    }
+    function updateTotal() {
+      var t = partsToks.sel +
+        (_ctxOff.local ? 0 : partsToks.local) + (_ctxOff.persona ? 0 : partsToks.persona) +
+        (_ctxOff.card ? 0 : partsToks.card) + (_ctxOff.lore ? 0 : partsToks.lore) +
+        (_ctxOff.prev ? 0 : partsToks.prev);
+      if (ctxRows.total) { ctxRows.total.val.textContent = "~" + t + " tok"; ctxRows.total.val.style.fontWeight = "700"; }
+    }
+    addCtxRow("sel", "Selected text", false); fillCtxRow("sel", partsToks.sel);
+    if (cfg.localContextEnabled) {
+      partsToks.local = tokest(extractLocalContext(sel.mid, sel.text));
+      addCtxRow("local", "Surrounding", false, "local"); fillCtxRow("local", partsToks.local);
+    }
+    var asyncSrc = [];
+    if (cfg.useUserPersona)     { addCtxRow("persona", "Persona", true, "persona");    asyncSrc.push(["persona", "persona"]); }
+    if (cfg.useCharCard)        { addCtxRow("card", "Character", true, "card");        asyncSrc.push(["card", "card"]); }
+    if (cfg.useLorebookEntries) { addCtxRow("lore", "Lorebook", true, "lore");         asyncSrc.push(["lore", "lore"]); }
+    if (cfg.usePrevMessages)    { addCtxRow("prev", "Prev messages", true, "prev");    asyncSrc.push(["prev", "prev"]); }
+    addCtxRow("total", "Total", asyncSrc.length > 0); updateTotal();
+    if (asyncSrc.length && cid) {
+      fetchContextParts(cid, sel.mid).then(function (parts) {
+        if (!popup) return;
+        asyncSrc.forEach(function (s) { partsToks[s[0]] = tokest(parts[s[1]]); fillCtxRow(s[0], partsToks[s[0]]); });
+        if (ctxRows.total) { ctxRows.total.loaded = true; paintDot(ctxRows.total.dot, "on"); }
+        updateTotal();
+      }).catch(function () {});
+    }
+    setCollapsed(!!cfg.ctxCollapsed); // apply persisted collapse state + chevron icon
+
+    // Trim flyout (single-segment only): edit/trim the selection before sending.
+    function showTrim() {
+      hideTip();
+      var orig = sel.text;
+      var ov = mkOv(10003);
+      var body = mkWin(ov, "480px", "Trim selection before sending");
+      ap(body, mk("div", "rwa-plbl", "Text to send — trim the edges"));
+      var ta = mk("textarea", "rwa-inp");
+      ta.value = orig;
+      ta.style.cssText = "width:100%;min-height:120px;font-size:12px;line-height:1.5;resize:vertical;";
+      ap(body, ta);
+      var info = mk("div", ""); info.style.cssText = "font-size:10px;margin:6px 0 12px;line-height:1.6;";
+      ap(body, info);
+      function upd() {
+        var v = ta.value.trim();
+        var ok = v.length > 0 && orig.indexOf(v) !== -1;
+        info.innerHTML = "";
+        var meta = mk("span", "", "~" + tokest(v) + " tok · " + v.length + " chars");
+        meta.style.color = "var(--muted-foreground)"; ap(info, meta);
+        var hint = mk("span", "", ok ? "   ✓ within the original selection"
+          : (v.length ? "   ⚠ edited beyond the original — the rewrite may not apply cleanly" : "   ⚠ empty"));
+        hint.style.color = ok ? "#22c55e" : "var(--destructive, #ef4444)";
+        ap(info, hint);
+      }
+      ta.addEventListener("input", upd); upd();
+      var ft2 = ap(body, mk("div", "rwa-foot"));
+      ap(ft2, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+      ap(ft2, mkBtn("Use this text", null, function () {
+        var v = ta.value.trim();
+        if (!v) { showToast(null, "Selection can't be empty."); return; }
+        sel.text = v;
+        if (sel.segments && sel.segments[0]) sel.segments[0].text = v;
+        partsToks.sel = tokest(v); fillCtxRow("sel", partsToks.sel);
+        if (cfg.localContextEnabled) { partsToks.local = tokest(extractLocalContext(sel.mid, v)); fillCtxRow("local", partsToks.local); }
+        updateTotal();
+        ov.remove();
+        showToast(null, "Selection set to ~" + partsToks.sel + " tok", "ok");
+      })).style.flex = "1";
+    }
 
     var grid = ap(p, mk("div", "rwa-grid"));
     grid.style.gridTemplateColumns = "repeat(" + colCount + ", 1fr)";
@@ -605,16 +827,16 @@
       var albl = mk("span", "", activeAutoProf.name);
       albl.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
       ab.appendChild(albl);
-      ab.addEventListener("mouseenter", function () { showTip(ab, activeAutoProf.name + ": " + activeAutoProf.prompt); });
+      ab.addEventListener("mouseenter", function () { showTip(ab, activeAutoProf.name + ": " + activeAutoProf.prompt + "  (instruction ~" + tokest(activeAutoProf.prompt) + " tok)"); });
       ab.addEventListener("mouseleave", hideTip);
       ab.addEventListener("click", function (e) { e.stopPropagation(); hideTip(); doRewrite(autoPr); });
       p.insertBefore(ab, grid);
     }
 
-    profiles.slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); }).forEach(function (pr) {
+    profiles.slice().filter(function (pr) { return !pr.hidden; }).sort(function (a, b) { return (a.order || 0) - (b.order || 0); }).forEach(function (pr) {
       var label = cfg.compact ? pr.name.slice(0, 2).toUpperCase() : pr.name;
       var b = mk("button", "rwa-pb", label);
-      b.addEventListener("mouseenter", function () { showTip(b, pr.name + ": " + pr.prompt); });
+      b.addEventListener("mouseenter", function () { showTip(b, pr.name + ": " + pr.prompt + "  (instruction ~" + tokest(pr.prompt) + " tok)"); });
       b.addEventListener("mouseleave", hideTip);
       b.addEventListener("click", function (e) { e.stopPropagation(); hideTip(); doRewrite(pr); });
       ap(grid, b);
@@ -655,11 +877,62 @@
     ub.style.cssText = "flex:0 0 auto;padding:6px 10px;color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;";
     if (!hist.length) ub.disabled = true;
     ap(ft, ub);
+    var single = segments.length === 1;
+    var tb = mkBtn("", null, function () { if (single) showTrim(); });
+    tb.innerHTML = svgEl(ICON.edit);
+    tb.setAttribute("aria-label", single ? "Trim selection before sending" : "Trim unavailable for multi-message selections");
+    tb.title = single ? "Trim the selection before sending" : "Trimming works on single-message selections only — select within one message.";
+    tb.style.cssText = "flex:0 0 auto;padding:6px 10px;color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;" +
+      (single ? "" : "opacity:.4;cursor:not-allowed;");
+    ap(ft, tb);
     ap(ft, mkBtn("Custom prompt", null, showCustom)).style.flex = "1";
+    var pb2 = mkBtn("", null, function () {
+      cfg.pinnedPos = cfg.pinnedPos ? null : { left: p.style.left, top: p.style.top };
+      saveC(); paintPin();
+    });
+    pb2.innerHTML = svgEl(ICON.pin);
+    function paintPin() {
+      var on = !!cfg.pinnedPos;
+      pb2.style.cssText = "flex:0 0 auto;padding:6px 10px;color:" + (on ? "var(--primary)" : "var(--muted-foreground)") + ";display:inline-flex;align-items:center;justify-content:center;";
+      pb2.setAttribute("aria-label", on ? "Unpin (popup follows your selection)" : "Pin popup to this spot");
+      pb2.title = on ? "Pinned here — new selections open the popup at this spot. Click to unpin." : "Pin the popup to this spot.";
+    }
+    paintPin();
+    ap(ft, pb2);
     var gb = mkBtn("", null, showSettings);
     gb.innerHTML = svgEl(ICON.gear); gb.setAttribute("aria-label", "Settings");
     gb.style.cssText = "flex:0 0 auto;padding:6px 10px;color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;";
     ap(ft, gb);
+
+    // Corner grabbers (bottom-left/right): drag to move the popup.
+    function startDrag(e) {
+      e.preventDefault(); e.stopPropagation();
+      var sx = e.clientX, sy = e.clientY, r = p.getBoundingClientRect(), ox = r.left, oy = r.top;
+      function mv(ev) {
+        var nx = Math.max(4, Math.min(ox + (ev.clientX - sx), window.innerWidth - p.offsetWidth - 4));
+        var ny = Math.max(4, Math.min(oy + (ev.clientY - sy), window.innerHeight - p.offsetHeight - 4));
+        p.style.left = nx + "px"; p.style.top = ny + "px";
+      }
+      function up() {
+        _movingPopup = true;
+        if (cfg.pinnedPos) { cfg.pinnedPos = { left: p.style.left, top: p.style.top }; saveC(); }
+        document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up, true);
+      }
+      document.addEventListener("mousemove", mv);
+      document.addEventListener("mouseup", up, true); // capture: runs before the selection handler
+    }
+    ["left", "right"].forEach(function (side) {
+      var g = mk("div", "");
+      g.title = "Drag to move";
+      var base = "position:absolute;bottom:0;" + side + ":0;width:11px;height:11px;cursor:move;z-index:2;transition:opacity .12s;" +
+        "background:repeating-linear-gradient(" + (side === "left" ? "45deg" : "-45deg") +
+        ",var(--muted-foreground) 0 1px,transparent 1px 4px);";
+      g.style.cssText = base + "opacity:.12;";
+      g.addEventListener("mousedown", startDrag);
+      g.addEventListener("mouseenter", function () { g.style.opacity = ".55"; });
+      g.addEventListener("mouseleave", function () { g.style.opacity = ".12"; });
+      ap(p, g);
+    });
   }
 
   // ── Error ─────────────────────────────────────────────────────────────────
@@ -694,6 +967,19 @@
     var body = ap(win, mk("div", "rwa-body"));
     body._titleEl = titleEl;
     return body;
+  }
+
+  // ── Token estimate ────────────────────────────────────────────────────────
+  // Rough estimate (~4 chars/token). NOT a real tokenizer — exact counts vary by
+  // model. Always shown with a leading "~" so it never reads as authoritative.
+  function tokest(str) { return str ? Math.ceil(String(str).length / 4) : 0; }
+  var _lastCost = null; // { prompt, sel, total } from the most recent assembly
+  function costLine(c) {
+    var d = mk("div", "rwa-cost",
+      "~" + c.total + " tokens  ·  prompt ~" + c.prompt + "  ·  highlighted ~" + c.sel);
+    d.style.cssText = "font-size:10px;color:var(--muted-foreground);margin:2px 0 10px;letter-spacing:.02em;";
+    d.title = "Rough estimate (~4 chars per token). Actual tokens vary by model and tokenizer.";
+    return d;
   }
 
   function showModalErr(ov, body, msg) {
@@ -915,7 +1201,34 @@
     });
   }
 
+  // List models from the direct endpoint: Ollama's native /api/tags first, then
+  // the OpenAI-compatible /models. Returns {models:[...]} or {error}.
+  function discoverModels() {
+    var base = (cfg.apiUrl || "").trim().replace(/\/+$/, "").replace(/\/chat\/completions$/, "");
+    if (!base) return Promise.resolve({ error: "No API URL set (Settings → Connection)." });
+    var headers = {};
+    if (cfg.apiKey) headers["Authorization"] = "Bearer " + cfg.apiKey;
+    var root = base.replace(/\/v1$/, "");
+    return fetch(root + "/api/tags", { headers: headers })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; })
+      .then(function (j) {
+        var names = j && Array.isArray(j.models) ? j.models.map(function (m) { return m.name; }).filter(Boolean) : null;
+        if (names && names.length) return { models: names };
+        return fetch(base + "/models", { headers: headers })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (j2) {
+            var ids = j2 && Array.isArray(j2.data) ? j2.data.map(function (m) { return m.id; }).filter(Boolean) : [];
+            return { models: ids };
+          });
+      })
+      .catch(function (e) {
+        return { error: "Discovery failed: " + (e && e.message ? e.message : String(e)) + " — if using Ollama, set OLLAMA_ORIGINS=* and restart it." };
+      });
+  }
+
   function doRewrite(profile, queue) {
+    _lastCost = null;
     // Merge mode: rewrite the whole multi-message span as one, then split back.
     if (!queue && cfg.mergeMultiMsg && sel.segments && sel.segments.length > 1) {
       doMergeRewrite(profile, sel.segments);
@@ -958,16 +1271,15 @@
     var ft = ap(body, mk("div", "rwa-foot"));
     ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
 
-    var localCtx    = cfg.localContextEnabled ? extractLocalContext(savedSel.mid, savedSel.text) : "";
-    var cardPromise = cfg.useCharCard ? fetchCharCard(savedSel.cid) : Promise.resolve("");
-    var lorePromise = cfg.useLorebookEntries ? fetchLorebookEntries(savedSel.cid) : Promise.resolve("");
-    var prevPromise = fetchPrevMessages(savedSel.cid, savedSel.mid);
+    var localCtx = (cfg.localContextEnabled && !_ctxOff.local) ? extractLocalContext(savedSel.mid, savedSel.text) : "";
 
-    Promise.all([cardPromise, lorePromise, prevPromise])
-      .then(function (ctxResults) {
-        var cardCtx = ctxResults[0];
-        var loreCtx = ctxResults[1];
-        var prevCtx = ctxResults[2];
+    fetchContextParts(savedSel.cid, savedSel.mid)
+      .then(function (parts) {
+        // Respect per-popup dot overrides — an excluded source is dropped here.
+        var cardCtx = _ctxOff.card ? "" : parts.card;
+        var loreCtx = _ctxOff.lore ? "" : parts.lore;
+        var prevCtx = _ctxOff.prev ? "" : parts.prev;
+        var personaCtx = _ctxOff.persona ? "" : parts.persona;
         if (!ov.parentNode) return;
         var safeText = savedSel.text.length > 10000 ? savedSel.text.slice(0, 10000) + "\u2026" : savedSel.text;
 
@@ -986,12 +1298,12 @@
         // Order matters: reference context first, then the operation, then the
         // target span last and clearly fenced (research: small models lose the
         // instruction when it sits above a wall of context).
-        var ctxBlock = (cardCtx + loreCtx + localCtx + prevCtx).replace(/^\n+/, "");
+        var ctxBlock = (cardCtx + personaCtx + loreCtx + localCtx + prevCtx).replace(/^\n+/, "");
         logDbg("rewrite.assemble", {
           profile: profile.name, profileId: profile.id, selChars: savedSel.text.length,
           lengthNote: lengthNote || null,
-          ctxChars: { character: cardCtx.length, lore: loreCtx.length, surrounding: localCtx.length, prevMessages: prevCtx.length },
-          ctxEnabled: { charCard: !!cfg.useCharCard, lorebook: !!cfg.useLorebookEntries, surrounding: !!cfg.localContextEnabled, prevMessages: !!cfg.usePrevMessages },
+          ctxChars: { character: cardCtx.length, persona: personaCtx.length, lore: loreCtx.length, surrounding: localCtx.length, prevMessages: prevCtx.length },
+          ctxEnabled: { charCard: !!cfg.useCharCard, userPersona: !!cfg.useUserPersona, lorebook: !!cfg.useLorebookEntries, surrounding: !!cfg.localContextEnabled, prevMessages: !!cfg.usePrevMessages },
         });
         var userPrompt =
           (ctxBlock ? ctxBlock + "\n\n" : "") +
@@ -999,7 +1311,15 @@
           "\n\nRewrite only the text inside <rewrite_this>. Output the rewritten passage and nothing else.\n" +
           "<rewrite_this>\n" + safeText + "\n</rewrite_this>";
 
-        return runInference(REWRITE_SYS, userPrompt);
+        // Token estimate: total = system + full user prompt; highlighted = the
+        // selection; prompt = everything else (system + task + context + scaffold).
+        var sys = sysPrompt();
+        var selTok = tokest(safeText);
+        var totalTok = tokest(sys) + tokest(userPrompt);
+        _lastCost = { sel: selTok, total: totalTok, prompt: Math.max(0, totalTok - selTok) };
+        if (ov.parentNode) ap(body, costLine(_lastCost));
+
+        return runInference(sys, userPrompt);
       })
       .then(function (resp) {
         if (!resp || !ov.parentNode) return;
@@ -1105,7 +1425,7 @@
           "\n\nRewrite only the text inside <rewrite_this>, preserving the [[SECTION n]] markers. Output the rewritten passage and nothing else.\n" +
           "<rewrite_this>\n" + safeMerged + "\n</rewrite_this>";
         logDbg("rewrite.merge.request", { messages: segments.length, mergedChars: merged.length });
-        return runInference(REWRITE_SYS + "\n- Preserve any [[SECTION n]] markers exactly, on their own lines, in order.", userPrompt);
+        return runInference(sysPrompt() + "\n- Preserve any [[SECTION n]] markers exactly, on their own lines, in order.", userPrompt);
       })
       .then(function (resp) {
         if (!resp || !ov.parentNode) return;
@@ -1191,6 +1511,7 @@
       var note = ap(body, mk("div", "", "Message " + (idx + 1) + " of " + total + " in this selection."));
       note.style.cssText = "font-size:11px;color:var(--primary);margin-bottom:10px;font-weight:600;";
     }
+    if (_lastCost) ap(body, costLine(_lastCost));
     ap(body, mk("div", "rwa-plbl", "Original"));
     var origBox = mk("div", "rwa-prev");
     origBox.style.cssText = "max-height:90px;opacity:.65;margin-bottom:12px;";
@@ -1219,6 +1540,15 @@
     ap(ft, mkBtn("Retry", null, function () {
       ov.remove();
       doRewrite(profile, queue);
+    })).style.flex = "1";
+    // Copy fallback — if the splice-back can't locate the text, paste it yourself.
+    ap(ft, mkBtn("Copy", null, function () {
+      try {
+        navigator.clipboard.writeText(result).then(
+          function () { showToast(null, "Copied to clipboard", "ok"); },
+          function () { showToast(null, "Copy failed — select and copy manually."); }
+        );
+      } catch (e) { showToast(null, "Copy failed — select and copy manually."); }
     })).style.flex = "1";
     if (hasNext) {
       ap(ft, mkBtn("Skip", null, function () { ov.remove(); advance(); })).style.flex = "1";
@@ -1403,6 +1733,33 @@
     ta.style.cssText = "height:80px;resize:vertical;margin-bottom:6px;";
     ap(body, ta);
 
+    // AI Refine: turn a rough note into a clear instruction, in place.
+    var refineRow = mk("div", ""); refineRow.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:10px;";
+    ap(body, refineRow);
+    var refineBtn = mkBtn("✨ Refine", null, function () {
+      var d = ta.value.trim();
+      if (!d) { refineSt.textContent = "Type a rough prompt first."; return; }
+      refineBtn.disabled = true; refineBtn.textContent = "Refining…"; refineSt.textContent = "";
+      runInference(
+        "You turn a rough text-editing note into ONE clear, specific instruction for an AI that rewrites a passage. Start with a verb, keep it to one sentence, preserve the user's intent. Output ONLY the instruction — no quotes, preamble, or alternatives.",
+        "Rough note: " + d
+      ).then(function (resp) {
+        refineBtn.disabled = false; refineBtn.textContent = "✨ Refine";
+        if (resp && resp.error) { refineSt.textContent = "Failed: " + resp.error; return; }
+        var out = resp && resp.result ? resp.result.trim().replace(/^["'“‘]+|["'”’]+$/g, "").trim() : "";
+        if (!out) { refineSt.textContent = "Empty response."; return; }
+        ta.value = out; refineSt.textContent = "Refined ✓";
+      }).catch(function (e) {
+        refineBtn.disabled = false; refineBtn.textContent = "✨ Refine";
+        refineSt.textContent = "Failed: " + (e && e.message ? e.message : String(e));
+      });
+    });
+    refineBtn.classList.add("rwa-btn-sm");
+    refineBtn.title = 'Refine a simple prompt into something more defined — e.g. "bigger, longer" → "Expand this text to be longer and more robust."';
+    ap(refineRow, refineBtn);
+    var refineSt = mk("span", ""); refineSt.style.cssText = "font-size:10px;color:var(--muted-foreground);";
+    ap(refineRow, refineSt);
+
     if (customs.length) {
       ap(body, mk("div", "rwa-lbl", "Past Prompts"));
       var lw = mk("div", "");
@@ -1435,6 +1792,14 @@
       }
       ov.remove();
       doRewrite({ id: "custom", name: "Custom", order: -1, prompt: v });
+    })).style.flex = "1";
+    ap(ft, mkBtn("Save as profile", null, function () {
+      var v = ta.value.trim();
+      if (!v) { return; }
+      ov.remove();
+      // Open the profile editor prefilled so the user can name it; it becomes a
+      // permanent popup button.
+      showEdit(null, -1, function () { showToast(null, "Saved as a profile button", "ok"); }, { name: "", prompt: v });
     })).style.flex = "1";
     ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
   }
@@ -1489,15 +1854,22 @@
   watchForChatSwitch();
 
   // ── Settings ──────────────────────────────────────────────────────────────
-  function exportProfiles() {
-    var data = { type: "rwa-profiles-export", version: 1, profiles: profiles, config: cfg, customs: customs };
+  function exportProfiles(opts) {
+    opts = opts || { profiles: true, config: true, customs: true, autoProfs: true };
+    var data = { type: "rwa-profiles-export", version: 1 };
+    var picked = [];
+    if (opts.profiles)  { data.profiles = profiles;        picked.push("profiles"); }
+    if (opts.config)    { data.config = cfg;               picked.push("settings"); }
+    if (opts.customs)   { data.customs = customs;          picked.push("custom prompts"); }
+    if (opts.autoProfs) { data.autoProfiles = autoProfs;   picked.push("auto-profiles"); }
+    if (!picked.length) { showToast(null, "Select at least one thing to export."); return; }
     var json = JSON.stringify(data, null, 2);
     var blob = new Blob([json], { type: "application/json" });
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
-    a.href = url; a.download = "rewrite-assistant-profiles.json"; a.click();
+    a.href = url; a.download = "rewrite-assistant-export.json"; a.click();
     URL.revokeObjectURL(url);
-    showToast(null, "Profiles exported!", "ok");
+    showToast(null, "Exported: " + picked.join(", "), "ok");
   }
 
   function importProfiles(render) {
@@ -1515,7 +1887,8 @@
           if (Array.isArray(data.profiles)) { profiles = data.profiles; saveP(); }
           if (data.config) { Object.keys(data.config).forEach(function (k) { if (cfg.hasOwnProperty(k)) cfg[k] = data.config[k]; }); saveC(); }
           if (Array.isArray(data.customs)) { customs = data.customs; saveX(); }
-          showToast(null, "Profiles imported!", "ok");
+          if (data.autoProfiles && typeof data.autoProfiles === "object") { autoProfs = data.autoProfiles; saveA(); }
+          showToast(null, "Imported!", "ok");
           render();
         } catch (e) { showToast(null, "Import failed: invalid JSON."); }
       };
@@ -1600,20 +1973,44 @@
         ap(acts, actBtn(ICON.spark, "AI architect", "rwa-accept", function () { showAI(render); }));
         ap(pane, mk("div", "rwa-pane-desc", "Drag to reorder — sets the popup button order."));
 
+        var profSearch = mk("input", "rwa-inp"); profSearch.type = "text"; profSearch.placeholder = "Search profiles…";
+        profSearch.style.cssText = "width:100%;margin:0 0 8px;padding:6px 10px;font-size:12px;";
+        ap(pane, profSearch);
+        var listWrap = mk("div", ""); ap(pane, listWrap);
+        profSearch.addEventListener("input", function () {
+          var q = profSearch.value.trim().toLowerCase();
+          listWrap.querySelectorAll(".rwa-item").forEach(function (it) {
+            it.style.display = (!q || (it._q || "").indexOf(q) !== -1) ? "" : "none";
+          });
+        });
+
         profiles.slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); }).forEach(function (pr) {
           var ri   = profiles.indexOf(pr);
           var item = mk("div", "rwa-item");
+          item._q = ((pr.name || "") + " " + (pr.prompt || "")).toLowerCase();
           item.setAttribute("draggable", "true");
-          ap(pane, item);
+          ap(listWrap, item);
           var hnd = ap(item, mk("span", "rwa-hnd")); hnd.innerHTML = svgEl(ICON.grip, 14);
           ap(item, mk("span", "rwa-dot")).style.background = pr.color || "var(--primary)";
           var inf = mk("div", "");
           inf.style.cssText = "flex:1;min-width:0;";
           ap(item, inf);
           var nm = ap(inf, mk("div", "", pr.name));
-          nm.style.cssText = "font-weight:600;font-size:12px;color:var(--foreground);";
+          nm.style.cssText = "font-weight:600;font-size:12px;color:var(--foreground);display:flex;justify-content:space-between;gap:8px;";
+          var tk = ap(nm, mk("span", "", "~" + tokest(pr.prompt) + " tok"));
+          tk.style.cssText = "font-weight:400;font-size:10px;color:var(--muted-foreground);flex:0 0 auto;";
+          tk.title = "Estimated tokens this profile's instruction adds to the prompt (excludes your selection and context).";
           var pp = ap(inf, mk("div", "", pr.prompt));
           pp.style.cssText = "font-size:10px;color:var(--muted-foreground);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+          function applyHidden() { item.style.opacity = pr.hidden ? ".5" : ""; }
+          var hideWrap = mk("label", ""); hideWrap.style.cssText = "display:flex;align-items:center;gap:3px;font-size:9px;color:var(--muted-foreground);flex:0 0 auto;cursor:pointer;";
+          hideWrap.title = "Hide this profile's button from the main popup (keeps the profile here).";
+          var hideCb = mk("input", ""); hideCb.type = "checkbox"; hideCb.checked = !!pr.hidden;
+          hideCb.style.cssText = "width:13px;height:13px;accent-color:var(--primary);cursor:pointer;";
+          hideCb.addEventListener("change", function () { pr.hidden = hideCb.checked; saveP(); applyHidden(); });
+          ap(hideWrap, hideCb); ap(hideWrap, mk("span", "", "hide"));
+          ap(item, hideWrap);
+          applyHidden();
           ap(item, iconBtn(ICON.edit, null, function () { showEdit(pr, ri, render); }, "Edit " + pr.name));
           ap(item, iconBtn(ICON.trash, "rwa-dng", function () {
             if (confirm('Delete "' + pr.name + '"?')) { profiles.splice(ri, 1); saveP(); render(); }
@@ -1660,8 +2057,62 @@
           ti.addEventListener("change", function () { cfg[cfgKey] = ti.value.trim(); saveC(); });
           row(direct, label, ti);
         }
-        txtRow("API URL:", "apiUrl", "http://127.0.0.1:11434/v1");
-        txtRow("Model name:", "apiModel", "llama3.1");
+        // API URL with click-to-fill presets for popular local endpoints.
+        var urlInp = mk("input", "rwa-inp"); urlInp.type = "text"; urlInp.placeholder = "http://localhost:11434/v1";
+        urlInp.value = cfg.apiUrl || ""; urlInp.style.cssText = "flex:1;margin:0;padding:6px 10px;font-size:12px;";
+        urlInp.addEventListener("change", function () { cfg.apiUrl = urlInp.value.trim(); saveC(); });
+        row(direct, "API URL:", urlInp);
+        var presets = [
+          ["Ollama", "http://localhost:11434/v1"], ["LM Studio", "http://localhost:1234/v1"],
+          ["llama.cpp", "http://localhost:8080/v1"], ["KoboldCpp", "http://localhost:5001/v1"],
+          ["Jan", "http://localhost:1337/v1"], ["text-gen-webui", "http://localhost:5000/v1"],
+          ["vLLM", "http://localhost:8000/v1"],
+        ];
+        var presetWrap = mk("div", ""); presetWrap.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;margin:2px 0 4px;";
+        presets.forEach(function (pr) {
+          var chip = mk("button", "", pr[0]);
+          chip.title = "Set API URL to " + pr[1];
+          chip.style.cssText = "font-size:10px;padding:2px 8px;border:1px solid var(--border,rgba(127,127,127,.3));border-radius:10px;background:transparent;color:var(--muted-foreground);cursor:pointer;";
+          chip.addEventListener("click", function (e) { e.stopPropagation(); urlInp.value = pr[1]; cfg.apiUrl = pr[1]; saveC(); });
+          ap(presetWrap, chip);
+        });
+        ap(direct, presetWrap);
+        var presetNote = mk("div", "", "Common local endpoints — click to fill. Most expose an OpenAI-compatible API at /v1; default ports vary, so confirm yours in the server's settings.");
+        presetNote.style.cssText = "font-size:9px;color:var(--muted-foreground);margin:0 0 8px;line-height:1.5;";
+        ap(direct, presetNote);
+        // Model name + a Discover button that lists models from the endpoint.
+        var modelInp = mk("input", "rwa-inp"); modelInp.type = "text"; modelInp.placeholder = "llama3.1";
+        modelInp.value = cfg.apiModel || ""; modelInp.style.cssText = "flex:1;margin:0;padding:6px 10px;font-size:12px;";
+        modelInp.addEventListener("change", function () { cfg.apiModel = modelInp.value.trim(); saveC(); });
+        row(direct, "Model name:", modelInp);
+        var discRow = mk("div", "rwa-setting-row"); ap(direct, discRow);
+        ap(discRow, mk("span", "", "Discover models:"));
+        var discWrap = mk("div", ""); discWrap.style.cssText = "display:flex;gap:6px;flex:1;align-items:center;";
+        ap(discRow, discWrap);
+        var discSel = mk("select", "rwa-sel"); discSel.style.cssText = "flex:1;"; discSel.style.display = "none";
+        var discBtn = mkBtn("Discover", null, function () {
+          discBtn.textContent = "…";
+          discoverModels().then(function (res) {
+            discBtn.textContent = "Discover";
+            if (res.error || !res.models || !res.models.length) {
+              showToast(null, res.error || "No models found at that URL."); return;
+            }
+            discSel.innerHTML = "";
+            var ph = mk("option", "", "Select a model… (" + res.models.length + ")"); ph.value = ""; discSel.appendChild(ph);
+            res.models.forEach(function (name) {
+              var o = mk("option", "", name); o.value = name;
+              if (name === cfg.apiModel) o.selected = true;
+              discSel.appendChild(o);
+            });
+            discSel.style.display = "";
+          });
+        });
+        ap(discWrap, discBtn);
+        ap(discWrap, discSel);
+        discSel.addEventListener("change", function () {
+          if (!discSel.value) return;
+          cfg.apiModel = discSel.value; modelInp.value = discSel.value; saveC();
+        });
         txtRow("API key (optional):", "apiKey", "leave blank for local");
         var tr = mk("input", "rwa-inp"); tr.type = "number"; tr.min = "0"; tr.max = "2"; tr.step = "0.1";
         tr.value = String(cfg.directTemp != null ? cfg.directTemp : 0.7);
@@ -1705,9 +2156,12 @@
         var db = pane;
         paneHead(pane, "Behaviour", "How the popup looks and applies rewrites.");
         row(db, "Include character card in prompt:", ck(cfg.useCharCard, function (e) { cfg.useCharCard = e.target.checked; saveC(); }));
+        row(db, "Include your persona (on your own messages):", ck(cfg.useUserPersona, function (e) { cfg.useUserPersona = e.target.checked; saveC(); }));
         row(db, "Typewriter reveal on result:",      ck(cfg.typewriter,  function (e) { cfg.typewriter  = e.target.checked; saveC(); }));
         row(db, "Show word diff in result:",         ck(cfg.showDiff,    function (e) { cfg.showDiff    = e.target.checked; saveC(); }));
         row(db, "Auto-apply (skip preview modal):",  ck(cfg.autoApply,   function (e) { cfg.autoApply   = e.target.checked; saveC(); }));
+        row(db, "Manual trigger only (Alt+R, no popup on select):", ck(cfg.manualTriggerOnly, function (e) { cfg.manualTriggerOnly = e.target.checked; saveC(); }));
+        row(db, "Concise system prompt (save tokens on small models):", ck(cfg.conciseSysPrompt, function (e) { cfg.conciseSysPrompt = e.target.checked; saveC(); }));
         row(db, "Leave editor open (save manually):",  ck(cfg.reviewBeforeApply, function (e) { cfg.reviewBeforeApply = e.target.checked; saveC(); }));
         row(db, "Compact buttons:",                   ck(cfg.compact,    function (e) { cfg.compact     = e.target.checked; saveC(); }));
         row(db, "Merge multi-message rewrites:",       ck(cfg.mergeMultiMsg, function (e) { cfg.mergeMultiMsg = e.target.checked; saveC(); }));
@@ -1779,8 +2233,17 @@
         var hint = mk("div", "", "Leave all unchecked to use chat’s characters.");
         hint.style.cssText = "font-size:10px;color:var(--muted-foreground);margin-bottom:6px;";
         ap(db, hint);
+        var charSearch = mk("input", "rwa-inp"); charSearch.type = "text"; charSearch.placeholder = "Search characters…";
+        charSearch.style.cssText = "width:100%;margin:0 0 8px;padding:6px 10px;font-size:12px;";
+        ap(db, charSearch);
         var charListWrap = mk("div", "rwa-char-list");
         ap(db, charListWrap);
+        charSearch.addEventListener("input", function () {
+          var q = charSearch.value.trim().toLowerCase();
+          charListWrap.querySelectorAll(".rwa-charrow").forEach(function (it) {
+            it.style.display = (!q || (it._q || "").indexOf(q) !== -1) ? "" : "none";
+          });
+        });
         if (_charListCache) { renderCharList(charListWrap, _charListCache); }
         else {
           var charLoadEl = ap(charListWrap, mk("div", "", "Loading…"));
@@ -1811,12 +2274,22 @@
       function secBackup(pane) {
         var db = pane;
         paneHead(pane, "Backup & Reset", "Move profiles and settings between instances, or restore defaults.");
-        var hint = mk("div", "", "Export saves profiles, settings, and custom prompts. Import merges from a previous export.");
+        var hint = mk("div", "", "Choose what to export below, or import to merge from a previous export. Files are JSON — the only format that can be re-imported.");
         hint.style.cssText = "font-size:11px;color:var(--muted-foreground);margin-bottom:10px;line-height:1.5;";
         ap(db, hint);
-        var btnRow = mk("div", ""); btnRow.style.cssText = "display:flex;gap:8px;";
+        var exOpts = { profiles: true, config: true, customs: true, autoProfs: true };
+        [["profiles", "Profiles (" + profiles.length + ")"], ["config", "Settings"],
+         ["customs", "Custom prompts (" + customs.length + ")"],
+         ["autoProfs", "Auto-profiles (" + Object.keys(autoProfs).length + ")"]].forEach(function (o) {
+          var rrow = mk("label", ""); rrow.style.cssText = "display:flex;align-items:center;gap:8px;font-size:11px;color:var(--foreground);margin:3px 0;cursor:pointer;";
+          var c = mk("input", ""); c.type = "checkbox"; c.checked = true;
+          c.style.cssText = "width:14px;height:14px;accent-color:var(--primary);cursor:pointer;";
+          c.addEventListener("change", function () { exOpts[o[0]] = c.checked; });
+          ap(rrow, c); ap(rrow, mk("span", "", o[1])); ap(db, rrow);
+        });
+        var btnRow = mk("div", ""); btnRow.style.cssText = "display:flex;gap:8px;margin-top:10px;";
         ap(db, btnRow);
-        ap(btnRow, mkBtn("Export", "rwa-accept", function () { exportProfiles(); })).style.flex = "1";
+        ap(btnRow, mkBtn("Export selected", "rwa-accept", function () { exportProfiles(exOpts); })).style.flex = "1";
         ap(btnRow, mkBtn("Import", null, function () { importProfiles(render); })).style.flex = "1";
 
         ap(db, mk("div", "rwa-sep"));
@@ -1847,7 +2320,8 @@
       var data = {};
       try { data = typeof char.data === "string" ? JSON.parse(char.data) : char.data || {}; } catch (e) {}
       var name = data.name || char.name || char.id;
-      var charRow = mk("div", "");
+      var charRow = mk("div", "rwa-charrow");
+      charRow._q = String(name).toLowerCase();
       charRow.style.cssText = "display:flex;align-items:center;gap:8px;padding:4px 4px;border-radius:4px;cursor:pointer;";
       charRow.addEventListener("mouseenter", function () { charRow.style.background = "var(--accent)"; });
       charRow.addEventListener("mouseleave", function () { charRow.style.background = ""; });
@@ -1873,21 +2347,21 @@
   }
 
   // ── Edit profile ──────────────────────────────────────────────────────────
-  function showEdit(profile, idx, onDone) {
+  function showEdit(profile, idx, onDone, prefill) {
     var ov   = mkOv(10002);
     var body = mkWin(ov, "400px", (profile ? "Edit" : "New") + " Style");
 
     ap(body, mk("div", "rwa-lbl", "Name"));
     var ni = mk("input", "rwa-inp");
     ni.placeholder = "e.g. Pirate Speak";
-    ni.value = profile ? profile.name : "";
+    ni.value = profile ? profile.name : ((prefill && prefill.name) || "");
     ap(body, ni);
 
     ap(body, mk("div", "rwa-lbl", "Instruction"));
     var pi = mk("textarea", "rwa-inp");
     pi.placeholder = "Rewrite the following text...";
     pi.style.cssText = "height:110px;resize:vertical;";
-    pi.value = profile ? profile.prompt : "";
+    pi.value = profile ? profile.prompt : ((prefill && prefill.prompt) || "");
     ap(body, pi);
 
     ap(body, mk("div", "rwa-lbl", "Accent colour (optional)"));
@@ -1920,7 +2394,7 @@
         color:  chosenColor,
       };
       if (idx >= 0) profiles[idx] = e; else profiles.push(e);
-      saveP(); ov.remove(); onDone();
+      saveP(); ov.remove(); if (onDone) onDone();
     })).style.flex = "1";
     ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
   }
@@ -2025,6 +2499,8 @@
   }
 
   marinara.on(document, "mouseup", function (e) {
+    if (_movingPopup) { _movingPopup = false; return; } // just finished dragging the popup
+    if (cfg.manualTriggerOnly) return;
     if (e.target && !document.body.contains(e.target)) return;
     if (popup && popup.contains(e.target)) return;
     var ov = document.querySelector(".rwa-ov");
