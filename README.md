@@ -42,9 +42,50 @@ When using Ollama from the browser, start it with `OLLAMA_ORIGINS=*` to permit c
 
 ## Limitations
 
-- Rewrites are not guaranteed to apply on every attempt. If one fails, re-select a slightly different range and
-  retry. Large or heavily formatted selections fail more often.
-- Output quality depends on the configured model.
+The model generates the rewrite; the extension then has to locate your selected text inside the stored message
+and splice the new text in. Most failures happen at that second step, not the generation step.
+
+- **The selection can't be located in the stored message.** The text shown on screen does not always match what
+  is stored byte-for-byte: Markdown markers (`*emphasis*`, `_italics_`, `` `code` ``), list bullets, and the blank
+  lines between paragraphs are common sources of mismatch. The extension tries four matching passes (exact, then
+  whitespace-flexible, then first/last-word anchors, then a Markdown-tolerant word match) before giving up, but a
+  selection that straddles formatting boundaries can still miss.
+- **Large or multi-paragraph selections fail more often.** A bigger span has more opportunities to mismatch, and
+  the anchor/fuzzy fallbacks are deliberately bounded to avoid matching the wrong region.
+- **Output quality depends entirely on the configured model.** Small local models in particular may ignore the
+  length target, leak the surrounding context into the rewrite, or return commentary instead of just the passage.
+- **Context costs tokens and attention.** Enabling surrounding text, previous messages, lorebook entries, and
+  multiple character cards all at once produces a large prompt that weaker models handle poorly.
+
+## Troubleshooting
+
+**A rewrite failed to apply ("Could not locate the selected text").**
+
+- Re-select within a single paragraph. Avoid grabbing the blank line between paragraphs.
+- Avoid starting or ending the selection on a formatting marker or a list bullet; select the words, not the `*`/`_`.
+- Try a smaller range. Long selections miss more often than short ones.
+- Enable **Settings → Behaviour → Leave editor open (save manually)**. The rewrite is placed in the editor and you
+  save it yourself with `Ctrl+Enter`, so you can confirm it landed before committing.
+
+**The rewrite applied but the message didn't change / reverted.**
+
+- The save did not register. Use the manual-save mode above and confirm with `Ctrl+Enter`.
+- Use **Undo** (in the popup) to roll back; history depth is configurable in Settings.
+
+**Output is low quality, wrong length, or includes the surrounding text.**
+
+- Turn off context sources you don't need (**Settings → Context**); fewer inputs help weaker models stay on task.
+- In Direct API mode, lower the temperature (Settings → Connection) for more faithful, less inventive edits.
+- The length control sends an explicit word-count range; if the model still ignores it, disable the length toggle
+  and rely on the mode's own instruction.
+
+**Direct API errors / "Test connection" fails.**
+
+- Confirm the URL, model name, and key in Settings → Connection, then use **Test Connection**.
+- For Ollama, start it with `OLLAMA_ORIGINS=*` so the browser is allowed to call it.
+
+**Diagnosing anything else.** Enable the debug log (Settings) to capture the exact prompts and replies, then
+export it. The API key is redacted from the export.
 
 ## Development
 
