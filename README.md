@@ -3,6 +3,16 @@
 An extension for [Marinara Engine](https://github.com/SillyTavern/Marinara-Engine) that rewrites a selected
 section of text in a message using an AI model. Select text, choose a mode, and the selection is replaced in place.
 
+## Screenshots
+
+| Rewrite popup | Custom prompt |
+| --- | --- |
+| <img src="screenshots/rewrite-popup.png" width="380" alt="Rewrite popup with mode grid and length control"> | <img src="screenshots/custom-prompt.png" width="380" alt="Custom prompt dialog"> |
+
+![Settings — Profiles](screenshots/settings-profiles.png)
+
+![Settings — Connection](screenshots/settings-connection.png)
+
 ## Features
 
 - **13 built-in rewrite modes:** Expand, Compress, Add Inner Thoughts, Convert to Dialogue, Passive to Active,
