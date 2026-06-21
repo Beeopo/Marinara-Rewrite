@@ -1,0 +1,2069 @@
+// Rewrite Assistant v4 — Marinara Engine Extension (UI Overhaul)
+(function (marinara) {
+  "use strict";
+
+  // ── Storage ───────────────────────────────────────────────────────────────
+  var NS = "rwa-" + marinara.extensionId;
+  var K_PROF  = NS + "-p";
+  var K_CFG   = NS + "-c";
+  var K_HIST  = NS + "-h";
+  var K_CUST  = NS + "-x";
+  var K_AUTO  = NS + "-a";
+  var K_DBG   = NS + "-dbg";
+
+  var _quotaWarned = false;
+  function load(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
+  function save(k, v) {
+    try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {
+      if (!_quotaWarned) { _quotaWarned = true; showToast(null, "Storage full \u2014 changes may not persist"); }
+    }
+  }
+
+  // Prompts are terse, imperative operations. Shared rules (preserve POV, tense,
+  // facts, voice; output only the rewrite) live in the system prompt, so each
+  // profile says only what to change. Bump PROMPTS_VERSION when these change.
+  var PROMPTS_VERSION = 2;
+  var DEF_PROFILES = [
+    { id: "expand",      name: "Expand",               order: 0,  prompt: "Expand the passage with more descriptive detail, sensory imagery, and action. Add no new plot events." },
+    { id: "compress",    name: "Compress",              order: 1,  prompt: "Condense the passage to be more succinct, keeping every key event and beat." },
+    { id: "thoughts",    name: "Add Inner Thoughts",    order: 2,  prompt: "Weave in the point-of-view character's inner thoughts and emotional reactions, in close POV." },
+    { id: "dialogue",    name: "Convert to Dialogue",   order: 3,  prompt: "Convert the passage into natural spoken dialogue between the characters, carrying the same information through what they say and do." },
+    { id: "active",      name: "Passive to Active",     order: 4,  prompt: "Convert passive-voice constructions to active voice." },
+    { id: "diffwords",   name: "Use Different Words",   order: 5,  prompt: "Rephrase using different vocabulary and sentence structure, keeping the exact meaning and tone." },
+    { id: "showdont",    name: "Show, Don't Tell",      order: 6,  prompt: "Show, don't tell: turn statements of emotion or state into concrete action, sensory detail, and behaviour. Example: \"She was afraid\" becomes \"Her breath caught and her hands went cold.\"" },
+    { id: "emotion",     name: "Show More Emotion",     order: 7,  prompt: "Heighten the emotional depth so the characters' feelings land more vividly. Do not change what happens." },
+    { id: "transitions", name: "Fix Transitions",       order: 8,  prompt: "Smooth the flow and transitions so sentences and ideas connect naturally." },
+    { id: "noai",        name: "Remove LLM-isms",       order: 9,  prompt: "Remove AI-writing tells. Cut filler clichés (\"a testament to\", \"the air was thick with\", \"couldn't help but\", \"a mix of X and Y\"), purple metaphors, and uniform sentence rhythm. Vary sentence length and keep it plainly human. Add no new content." },
+    { id: "expdialogue", name: "Expand Dialogue",       order: 10, prompt: "Expand the existing dialogue with more back-and-forth, subtext, and distinct character voice." },
+    { id: "romance",     name: "Increase Romance",      order: 11, prompt: "Increase the romantic tension, chemistry, and intimacy between the characters." },
+    { id: "grammar",     name: "Grammar Fix",           order: 12, prompt: "Fix only grammar, spelling, and punctuation. Do not change wording, style, or content." },
+  ];
+
+  var profiles = load(K_PROF) || DEF_PROFILES;
+
+  var DEF_CFG = {
+    cols: 2, rows: 8, typewriter: false, useCharCard: false, showDiff: false,
+    lengthEnabled: false, lengthPct: 0, autoApply: false, popupPos: "auto",
+    historyDepth: 5, compact: false,
+    localContextEnabled: false, localContextWords: 150,
+    useLorebookEntries: false, usePrevMessages: false, prevMessageCount: 2,
+    charCardIds: [], reviewBeforeApply: false,
+    // Connection: "sidecar" (Marinara local sidecar) or "direct" (OpenAI-compatible
+    // endpoint such as Ollama/llama.cpp). Direct avoids running two models at once.
+    connMode: "sidecar", apiUrl: "http://127.0.0.1:11434/v1", apiModel: "", apiKey: "", directTemp: 0.7,
+    autoProfileEnabled: true, promptsVersion: 0, debugEnabled: false,
+    mergeMultiMsg: false,
+  };
+
+  // Shared rewrite system prompt (single + merge paths).
+  var REWRITE_SYS =
+    "You are a line editor rewriting a passage of fiction in place for an author.\n\n" +
+    "Output rules:\n" +
+    "- Output ONLY the rewritten passage. No preamble, notes, explanations, quotation marks, markdown, or code fences.\n" +
+    "- Do not repeat or acknowledge these instructions.\n\n" +
+    "Always:\n" +
+    "- Apply the requested edit to the text inside <rewrite_this> only.\n" +
+    "- Keep the same point of view and verb tense as the original.\n" +
+    "- Keep every named character, plot fact, and continuity detail unchanged unless the edit explicitly calls for it.\n" +
+    "- Match the voice, register, and language of the surrounding prose.\n" +
+    "- Treat anything inside <context>, <character>, or <lore> as reference only — never rewrite or quote it.";
+
+  var cfg = (function () {
+    var stored = load(K_CFG) || {};
+    var merged = {};
+    Object.keys(DEF_CFG).forEach(function (k) { merged[k] = stored[k] !== undefined ? stored[k] : DEF_CFG[k]; });
+    return merged;
+  })();
+  var hist    = load(K_HIST) || [];
+  var customs = load(K_CUST) || [];
+  var autoProfs = load(K_AUTO) || {};
+  var dbg     = load(K_DBG) || [];
+
+  function saveP() { save(K_PROF, profiles); }
+  function saveC() { save(K_CFG, cfg); }
+  function saveH() { save(K_HIST, hist); }
+  function saveX() { save(K_CUST, customs); }
+  function saveA() { save(K_AUTO, autoProfs); }
+  function saveDbg() { save(K_DBG, dbg.slice(-100)); }
+
+  // ── Debug log ───────────────────────────────────────────────────────────────
+  // Ring buffer (last 100 events) persisted to localStorage, mirrored to the
+  // console, and exportable to ME-rewrite-debug.json in the Downloads folder.
+  function logDbg(event, data) {
+    if (!cfg.debugEnabled) return;
+    var entry = { t: new Date().toISOString(), event: event };
+    if (data) Object.keys(data).forEach(function (k) { entry[k] = data[k]; });
+    dbg.push(entry);
+    if (dbg.length > 100) dbg.splice(0, dbg.length - 100);
+    saveDbg();
+    try { console.log("[RewriteAssistant:" + event + "]", data || ""); } catch (e) {}
+  }
+  function downloadDebug() {
+    var safeCfg = {};
+    Object.keys(cfg).forEach(function (k) { if (k !== "apiKey") safeCfg[k] = cfg[k]; });
+    safeCfg.apiKeySet = !!cfg.apiKey;
+    var payload = {
+      extension: "rewrite-assistant-v4",
+      exportedAt: new Date().toISOString(),
+      userAgent: navigator.userAgent,
+      config: safeCfg,
+      entries: dbg,
+    };
+    var blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url; a.download = "ME-rewrite-debug.json"; a.click();
+    URL.revokeObjectURL(url);
+  }
+  try {
+    window.__rwaDebug = {
+      get entries() { return dbg; },
+      dump: downloadDebug,
+      clear: function () { dbg.length = 0; saveDbg(); },
+    };
+  } catch (e) {}
+
+  // Upgrade built-in profile prompts/names in place when PROMPTS_VERSION bumps.
+  // Matches by id, so user-added profiles and saved order/colour are preserved.
+  (function migratePrompts() {
+    if (cfg.promptsVersion === PROMPTS_VERSION) return;
+    var defById = {};
+    DEF_PROFILES.forEach(function (d) { defById[d.id] = d; });
+    profiles.forEach(function (p) {
+      var d = defById[p.id];
+      if (d) { p.prompt = d.prompt; p.name = d.name; }
+    });
+    cfg.promptsVersion = PROMPTS_VERSION;
+    saveP(); saveC();
+  })();
+
+  // ── Caches ───────────────────────────────────────────────────────────────
+  var _msgCache = { key: null, msgs: null, ts: 0 };
+  function cachedMessages(cid) {
+    var key = "/chats/" + cid + "/messages";
+    if (_msgCache.key === key && Date.now() - _msgCache.ts < 2000 && _msgCache.msgs) return Promise.resolve(_msgCache.msgs);
+    return marinara.apiFetch(key).then(function (msgs) {
+      if (Array.isArray(msgs)) { _msgCache = { key: key, msgs: msgs, ts: Date.now() }; }
+      return msgs;
+    });
+  }
+  function invalidateMsgCache() { _msgCache = { key: null, msgs: null, ts: 0 }; }
+
+  var _loreCache = { key: null, result: null, ts: 0 };
+  var _charListCache = null;
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function getChatId() {
+    var fromStore = localStorage.getItem("marinara-active-chat-id");
+    if (fromStore) return fromStore;
+    var el = document.querySelector('[data-chat-id][class*="sidebar-accent"]');
+    return el ? el.getAttribute("data-chat-id") : null;
+  }
+
+  function buildCharCardContext(chars) {
+    var parts = [];
+    chars.forEach(function (char) {
+      var data = {};
+      try { data = typeof char.data === "string" ? JSON.parse(char.data) : char.data || {}; } catch (e) {}
+      var name        = data.name        || char.name        || "";
+      var personality = data.personality || char.personality || "";
+      var description = data.description || char.description || "";
+      var lines = [];
+      if (name)        lines.push("Character: " + name);
+      if (personality) lines.push("Personality: " + personality.slice(0, 300));
+      if (description) lines.push("Description: " + description.slice(0, 200));
+      if (lines.length) parts.push(lines.join("\n"));
+    });
+    return parts.length ? "\n\n<character note=\"Match this character's voice, register, and speech style.\">\n" + parts.join("\n\n") + "\n</character>" : "";
+  }
+
+  function fetchCharCard(cid) {
+    var specificIds = cfg.charCardIds || [];
+    if (specificIds.length) {
+      return Promise.all(specificIds.map(function (id) {
+        return marinara.apiFetch("/characters/" + id).catch(function () { return null; });
+      })).then(function (chars) { return buildCharCardContext(chars.filter(Boolean)); });
+    }
+    if (!cid) return Promise.resolve("");
+    return marinara.apiFetch("/chats/" + cid)
+      .then(function (chat) {
+        var ids = [];
+        try { ids = typeof chat.characterIds === "string" ? JSON.parse(chat.characterIds) : chat.characterIds || []; } catch (e) {}
+        if (!ids.length) return "";
+        return Promise.all(ids.map(function (id) {
+          return marinara.apiFetch("/characters/" + id).catch(function () { return null; });
+        })).then(function (chars) { return buildCharCardContext(chars.filter(Boolean)); });
+      })
+      .catch(function () { return ""; });
+  }
+
+  function fetchLorebookEntries(cid) {
+    if (!cid) return Promise.resolve("");
+    var key = "/lorebooks/scan/" + cid;
+    if (_loreCache.key === key && Date.now() - _loreCache.ts < 30000 && _loreCache.result !== null) return Promise.resolve(_loreCache.result);
+    return marinara.apiFetch(key)
+      .then(function (entries) {
+        if (!Array.isArray(entries) || !entries.length) { _loreCache = { key: key, result: "", ts: Date.now() }; return ""; }
+        var parts = entries.slice(0, 20).map(function (e) {
+          var lkey     = (e.key || (Array.isArray(e.keys) ? e.keys.join(", ") : "") || "").trim();
+          var content = (e.content || e.value || "").trim();
+          return lkey ? lkey + ": " + content : content;
+        }).filter(function (s) { return s.length > 3; });
+        if (!parts.length) { _loreCache = { key: key, result: "", ts: Date.now() }; return ""; }
+        var combined = parts.join("\n");
+        var ws = combined.split(/\s+/);
+        if (ws.length > 500) combined = ws.slice(0, 500).join(" ") + "\u2026";
+        var result = "\n\n<lore note=\"World facts for continuity — reference only.\">\n" + combined + "\n</lore>";
+        _loreCache = { key: key, result: result, ts: Date.now() };
+        return result;
+      })
+      .catch(function () { return ""; });
+  }
+
+  function fetchPrevMessages(cid, mid) {
+    if (!cfg.usePrevMessages || !cid) return Promise.resolve("");
+    var n = Math.max(1, Math.min(4, cfg.prevMessageCount || 2));
+    return cachedMessages(cid).then(function (msgs) {
+      if (!Array.isArray(msgs)) return "";
+      var idx = -1;
+      for (var i = 0; i < msgs.length; i++) { if (msgs[i].id === mid) { idx = i; break; } }
+      if (idx < 1) return "";
+      var sl = msgs.slice(Math.max(0, idx - n), idx);
+      if (!sl.length) return "";
+      return "\n\n<context note=\"Preceding messages — reference only, do not rewrite.\">\n" + sl.map(function (m) {
+        return (m.role || "user").toUpperCase() + ": " + (m.content || "").slice(0, 300);
+      }).join("\n") + "\n</context>";
+    }).catch(function () { return ""; });
+  }
+
+  function extractLocalContext(mid, selText) {
+    var msgEl = document.querySelector('[data-message-id="' + mid + '"]');
+    if (!msgEl) return "";
+    var fullText = (msgEl.textContent || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+    var normSel  = selText.trim();
+    var idx      = fullText.indexOf(normSel);
+    var words    = Math.max(20, Math.min(400, cfg.localContextWords || 150));
+
+    var allMsgs = Array.from(document.querySelectorAll("[data-message-id]"));
+    var myIdx   = allMsgs.findIndex(function (el) { return el.getAttribute("data-message-id") === mid; });
+
+    function wordArr(str) { return str.split(/\s+/).filter(Boolean); }
+    function tailWords(arr, n) { return arr.slice(-n).join(" "); }
+    function headWords(arr, n) { return arr.slice(0, n).join(" "); }
+
+    var ctxBefore = "", ctxAfter = "";
+    if (idx !== -1) {
+      ctxBefore = tailWords(wordArr(fullText.slice(0, idx).trim()), words);
+      ctxAfter  = headWords(wordArr(fullText.slice(idx + normSel.length).trim()), words);
+    }
+    if (wordArr(ctxBefore).length < 20 && myIdx > 0) {
+      var prevText = (allMsgs[myIdx - 1].textContent || "").trim();
+      ctxBefore = tailWords(wordArr(tailWords(wordArr(prevText), words) + " " + ctxBefore), words);
+    }
+    if (wordArr(ctxAfter).length < 20 && myIdx >= 0 && myIdx < allMsgs.length - 1) {
+      var nextText = (allMsgs[myIdx + 1].textContent || "").trim();
+      ctxAfter = headWords(wordArr(ctxAfter + " " + headWords(wordArr(nextText), words)), words);
+    }
+    var parts = [];
+    if (ctxBefore) parts.push("Before: " + ctxBefore);
+    if (ctxAfter)  parts.push("After: "  + ctxAfter);
+    return parts.length ? "\n\n<context note=\"Surrounding prose — reference only, do not rewrite.\">\n" + parts.join("\n\n") + "\n</context>" : "";
+  }
+
+  function wc(s) { return s.trim().split(/\s+/).filter(Boolean).length; }
+  function wcDiff(a, b) {
+    var d = wc(b) - wc(a), p = wc(a) ? Math.round((d / wc(a)) * 100) : 0;
+    return (d >= 0 ? "+" : "") + d + " words (" + (p >= 0 ? "+" : "") + p + "%)";
+  }
+  function formatPct(v) { return (v >= 0 ? "+" : "") + v + "%"; }
+
+  // ── Word-level diff (capped) ───────────────────────────────────────────────
+  var DIFF_TOKEN_CAP = 500;
+  function computeWordDiff(oldStr, newStr) {
+    var oldToks = oldStr.split(/(\s+)/);
+    var newToks = newStr.split(/(\s+)/);
+    if (oldToks.length > DIFF_TOKEN_CAP * 2) oldToks = oldToks.slice(0, DIFF_TOKEN_CAP * 2);
+    if (newToks.length > DIFF_TOKEN_CAP * 2) newToks = newToks.slice(0, DIFF_TOKEN_CAP * 2);
+    var m = oldToks.length, n = newToks.length;
+    if (m * n > DIFF_TOKEN_CAP * DIFF_TOKEN_CAP) return null;
+    var dp = [];
+    for (var i = 0; i <= m; i++) { dp[i] = []; for (var j = 0; j <= n; j++) dp[i][j] = 0; }
+    for (var i = 1; i <= m; i++) {
+      for (var j = 1; j <= n; j++) {
+        dp[i][j] = oldToks[i - 1] === newToks[j - 1]
+          ? dp[i - 1][j - 1] + 1
+          : Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+    var ops = [], i = m, j = n;
+    while (i > 0 || j > 0) {
+      if (i > 0 && j > 0 && oldToks[i - 1] === newToks[j - 1]) {
+        ops.unshift({ t: "eq", v: oldToks[i - 1] }); i--; j--;
+      } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+        ops.unshift({ t: "ins", v: newToks[j - 1] }); j--;
+      } else {
+        ops.unshift({ t: "del", v: oldToks[i - 1] }); i--;
+      }
+    }
+    return ops;
+  }
+
+  function renderDiff(el, oldStr, newStr) {
+    var ops = computeWordDiff(oldStr, newStr);
+    el.innerHTML = "";
+    if (!ops) { el.textContent = newStr; return; }
+    ops.forEach(function (op) {
+      if (op.t === "eq") {
+        el.appendChild(document.createTextNode(op.v));
+      } else {
+        var s = document.createElement("span");
+        s.style.cssText = op.t === "ins"
+          ? "color:#10b981;font-weight:700;"
+          : "color:#ef4444;text-decoration:line-through;opacity:.65;";
+        s.textContent = op.v;
+        el.appendChild(s);
+      }
+    });
+  }
+
+  // ── DOM ───────────────────────────────────────────────────────────────────
+  function mk(tag, cls, txt) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (txt !== undefined) n.textContent = txt;
+    return n;
+  }
+  function ap(p, c) { if (p && c) p.appendChild(c); return c; }
+  function mkBtn(label, cls, fn) {
+    var b = mk("button", "rwa-btn" + (cls ? " " + cls : ""), label);
+    b.addEventListener("click", function (e) { e.stopPropagation(); fn(e); });
+    return b;
+  }
+  function xBtn(fn) {
+    var b = mkBtn("", null, fn);
+    b.innerHTML = svgEl(ICON.x);
+    b.setAttribute("aria-label", "Close");
+    b.style.cssText = "flex:0 0 auto;padding:5px;color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;";
+    return b;
+  }
+  var ICON = {
+    edit:  '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+    trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+    undo:  '<path d="M9 14 4 9l5-5"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/>',
+    gear:  '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+    spark: '<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/>',
+    plus:  '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
+    x:     '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+    grip:  '<path d="M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01"/>',
+  };
+  function svgEl(paths, size) {
+    var s = size || 16;
+    return '<svg viewBox="0 0 24 24" width="' + s + '" height="' + s + '" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + paths + '</svg>';
+  }
+  function iconBtn(paths, cls, fn, aria) {
+    var b = mk("button", "rwa-ibtn" + (cls ? " " + cls : ""));
+    if (aria) b.setAttribute("aria-label", aria);
+    b.innerHTML = svgEl(paths);
+    b.addEventListener("click", function (e) { e.stopPropagation(); fn(e); });
+    return b;
+  }
+  // Compact icon+label action button (header actions).
+  function actBtn(paths, label, cls, fn) {
+    var b = mkBtn("", cls, fn);
+    b.classList.add("rwa-btn-sm");
+    b.innerHTML = svgEl(paths) + "<span>" + label + "</span>";
+    return b;
+  }
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  var popup = null;
+  var sel   = { text: "", mid: "", cid: null };
+  var dragId = null;
+  var _twCancel = null;
+
+  // ── Styles ────────────────────────────────────────────────────────────────
+
+  marinara.addStyle(
+        ".rwa{position:fixed;background:var(--popover);border:1px solid var(--border);border-radius:12px;" +
+    "padding:12px;box-shadow:0 12px 40px rgba(0,0,0,.55);z-index:10000;display:flex;flex-direction:column;gap:6px;" +
+    "min-width:200px;width:max-content;max-width:min(90vw,480px);backdrop-filter:blur(18px);overflow:hidden;" +
+    "animation:rwa-in .14s cubic-bezier(.22,1,.36,1);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,'Open Sans','Helvetica Neue',sans-serif;}" +
+    "@keyframes rwa-in{from{opacity:0;transform:translateY(6px) scale(.95)}to{opacity:1;transform:none}}" +
+    ".rwa-topbar{height:2px;background:var(--primary);opacity:.5;flex-shrink:0;margin:-12px -12px 0;}" +
+    ".rwa-mini-hdr{display:flex;align-items:center;padding:2px 2px 8px;margin:0 0 8px;" +
+    "border-bottom:1px solid var(--border);}" +
+    ".rwa-mini-title{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;" +
+    "color:var(--muted-foreground);}" +
+    ".rwa-mini-sub{margin-left:auto;font-size:9.5px;color:var(--muted-foreground);white-space:nowrap;}" +
+    ".rwa-grid{display:grid;gap:4px;overflow-y:auto;}" +
+    ".rwa-pb{display:block;width:100%;height:30px;line-height:30px;padding:0 12px;" +
+    "background:var(--secondary);border:1px solid var(--border);border-radius:8px;" +
+    "color:var(--secondary-foreground);font:600 11px/1 inherit;cursor:pointer;text-align:left;" +
+    "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" +
+    "transition:all .15s;}" +
+    ".rwa-pb:hover{background:var(--accent);border-color:var(--primary);}" +
+    ".rwa-auto{display:flex;align-items:center;gap:6px;width:100%;background:color-mix(in srgb,var(--primary) 12%,transparent);border:1px solid color-mix(in srgb,var(--primary) 32%,transparent);border-radius:8px;padding:8px 12px;color:var(--primary);font:600 11.5px/1 inherit;cursor:pointer;text-align:left;overflow:hidden;transition:background .12s;}" +
+    ".rwa-auto:hover{background:color-mix(in srgb,var(--primary) 18%,transparent);}" +
+    ".rwa-auto svg{width:14px;height:14px;flex-shrink:0;}" +
+    ".rwa-btn{background:var(--secondary);border:1px solid var(--border);color:var(--foreground);padding:6px 12px;" +
+    "border-radius:8px;font:600 11px/1 inherit;cursor:pointer;white-space:nowrap;" +
+    "transition:all .15s;}" +
+    ".rwa-btn:hover{background:var(--accent);border-color:var(--primary);}" +
+    ".rwa-btn:disabled{opacity:.35;cursor:not-allowed;}" +
+    ".rwa-btn svg{width:15px;height:15px;display:block;}" +
+    ".rwa-btn-sm{padding:5px 10px;font-size:11px;display:inline-flex;align-items:center;gap:5px;line-height:1;}" +
+    ".rwa-btn-sm svg{width:13px;height:13px;}" +
+    ".rwa-accept{background:var(--primary)!important;color:var(--primary-foreground)!important;border-color:transparent!important;font-weight:600;}" +
+    ".rwa-accept:hover{filter:brightness(1.1);}" +
+    ".rwa-dng{color:var(--destructive)!important;}" +
+    ".rwa-ibtn{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;flex:0 0 auto;padding:0;background:transparent;border:1px solid transparent;border-radius:8px;color:var(--muted-foreground);cursor:pointer;transition:background .12s,color .12s;}" +
+    ".rwa-ibtn:hover{background:var(--accent);color:var(--foreground);}" +
+    ".rwa-ibtn.rwa-dng:hover{color:var(--destructive)!important;}" +
+    ".rwa-ibtn svg{width:15px;height:15px;}" +
+    ".rwa-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}" +
+    ".rwa-foot{display:flex;gap:6px;border-top:1px solid var(--border);padding-top:10px;margin-top:0;}" +
+    ".rwa-slider-row{display:flex;align-items:center;gap:8px;padding:10px 0 0;" +
+    "border-top:1px solid var(--border);margin-top:0;transition:opacity .15s;}" +
+    ".rwa-slider-lbl{font-size:9px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;" +
+    "color:var(--muted-foreground);white-space:nowrap;}" +
+    ".rwa-slider-val{font-size:10px;font-weight:700;color:var(--primary);min-width:38px;text-align:right;}" +
+    ".rwa-range{flex:1;accent-color:var(--primary);cursor:pointer;height:3px;}" +
+    ".rwa-toggle-wrap{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0;cursor:pointer;}" +
+    ".rwa-toggle-wrap input{opacity:0;width:0;height:0;position:absolute;}" +
+    ".rwa-toggle-sl{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;" +
+    "background:color-mix(in srgb,var(--muted) 60%,var(--muted-foreground) 20%);border-radius:20px;transition:background .2s;}" +
+    ".rwa-toggle-sl:before{content:'';position:absolute;height:14px;width:14px;" +
+    "left:3px;bottom:3px;background:var(--muted-foreground);border-radius:50%;transition:transform .2s,background .2s;}" +
+    ".rwa-toggle-wrap input:checked+.rwa-toggle-sl{background:color-mix(in srgb,var(--primary) 35%,transparent);}" +
+    ".rwa-toggle-wrap input:checked+.rwa-toggle-sl:before{transform:translateX(16px);background:var(--primary);}" +
+    ".rwa-tip{position:fixed;background:var(--popover);border:1px solid var(--border);" +
+    "border-radius:8px;padding:6px 10px;font-size:11px;line-height:1.5;" +
+    "color:var(--foreground);max-width:260px;white-space:normal;" +
+    "box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:10010;pointer-events:none;" +
+    "opacity:0;transition:opacity .12s;}" +
+    ".rwa-tip-show{opacity:1!important;}" +
+    ".rwa-ov{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.72);" +
+    "backdrop-filter:blur(8px);z-index:10001;display:flex;align-items:center;justify-content:center;" +
+    "animation:rwa-fade .18s ease-out;}" +
+    "@keyframes rwa-fade{from{opacity:0}to{opacity:1}}" +
+    ".rwa-win{background:var(--popover);border:1px solid var(--border);border-radius:12px;" +
+    "width:560px;max-width:95vw;max-height:88vh;box-shadow:0 28px 56px rgba(0,0,0,.8);" +
+    "display:flex;flex-direction:column;overflow:hidden;animation:rwa-up .18s cubic-bezier(.22,1,.36,1);}" +
+    "@keyframes rwa-up{from{opacity:0;transform:translateY(10px) scale(.97)}to{opacity:1;transform:none}}" +
+    ".rwa-bar{height:2px;background:var(--primary);opacity:.5;}" +
+    ".rwa-hdr{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;" +
+    "justify-content:space-between;background:var(--secondary);}" +
+    ".rwa-title{font-size:13.5px;font-weight:600;color:var(--foreground);}" +
+    ".rwa-body{padding:16px;overflow-y:auto;flex:1;}" +
+    ".rwa-prev{background:var(--secondary);border:1px solid var(--border);border-radius:8px;" +
+    "padding:12px;font-size:12px;line-height:1.6;max-height:200px;overflow-y:auto;white-space:pre-wrap;color:var(--foreground);}" +
+    ".rwa-plbl{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;" +
+    "color:var(--muted-foreground);margin-bottom:6px;}" +
+    ".rwa-wc{font-size:9px;color:var(--muted-foreground);text-align:right;margin-top:4px;}" +
+    ".rwa-err{padding:12px;font-size:11px;color:var(--destructive);line-height:1.6;white-space:pre-wrap;}" +
+    ".rwa-inp{background:var(--secondary);border:1px solid var(--border);color:var(--foreground);" +
+    "padding:8px 12px;border-radius:8px;width:100%;margin-bottom:12px;" +
+    "font:13px/1.4 inherit;box-sizing:border-box;outline:none;transition:border-color .12s;}" +
+    ".rwa-inp:focus{border-color:var(--primary);box-shadow:0 0 0 2px color-mix(in srgb,var(--ring) 22%,transparent);}" +
+    ".rwa-sel{-webkit-appearance:none;appearance:none;background:var(--secondary);" +
+    "border:1px solid var(--border);padding:8px 32px 8px 12px;border-radius:8px;color:var(--foreground);" +
+    "font-size:12px;outline:none;cursor:pointer;background-image:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23b57edc' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\");" +
+    "background-repeat:no-repeat;background-position:right 12px center;transition:border-color .12s;}" +
+    ".rwa-sel:focus{border-color:var(--primary);}" +
+    ".rwa-lbl{display:block;font-size:9px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;" +
+    "color:var(--muted-foreground);margin:16px 0 8px;}" +
+    ".rwa-sep{height:1px;background:var(--border);margin:16px 0;}" +
+    ".rwa-item{display:flex;align-items:center;gap:8px;padding:8px 12px;" +
+    "border-radius:8px;border:1px solid var(--border);background:var(--secondary);" +
+    "margin-bottom:6px;cursor:grab;transition:all .15s;}" +
+    ".rwa-item:hover{border-color:var(--primary);}" +
+    ".rwa-item.rwa-drag{opacity:.3;}.rwa-item.rwa-over{border-color:var(--primary);border-style:dashed;}" +
+    ".rwa-hnd{color:var(--muted-foreground);display:inline-flex;user-select:none;cursor:grab;}" +
+    ".rwa-hnd svg{width:14px;height:14px;display:block;}" +
+    ".rwa-pulse{height:2px;background:var(--primary);border-radius:2px;" +
+    "transform-origin:center;animation:rwa-pls 1.4s ease-in-out infinite;}" +
+    "@keyframes rwa-pls{0%,100%{opacity:.3;transform:scaleX(.45)}50%{opacity:1;transform:scaleX(1)}}" +
+    ".rwa-shimmer{position:relative;overflow:hidden;}" +
+    ".rwa-shimmer::after{content:'';position:absolute;top:0;left:-100%;width:200%;height:100%;" +
+    "background:linear-gradient(90deg,transparent 0%,color-mix(in srgb,var(--primary) 10%,transparent) 50%,transparent 100%);" +
+    "animation:rwa-shim 1.8s linear infinite;pointer-events:none;}" +
+    "@keyframes rwa-shim{from{left:-100%}to{left:100%}}" +
+    ".rwa-msg-hl{outline:2px solid var(--primary)!important;outline-offset:3px;border-radius:4px;}" +
+    ".rwa-toast{position:fixed;background:var(--primary);color:var(--primary-foreground);" +
+    "padding:8px 16px;border-radius:8px;font:700 12px/1.4 inherit;" +
+    "box-shadow:0 4px 20px rgba(0,0,0,.5);z-index:20000;pointer-events:none;" +
+    "transition:opacity .4s ease;max-width:320px;text-align:center;}" +
+    ".rwa-toast-ok{background:linear-gradient(135deg,#10b981,#14b8a6)!important;color:#fff!important;}" +
+    ".rwa-hist{background:var(--secondary);border:1px solid var(--border);" +
+    "border-radius:8px;padding:8px 12px;margin-bottom:6px;}" +
+    ".rwa-badge{display:inline-block;font-size:9px;font-weight:600;background:var(--primary);" +
+    "color:var(--primary-foreground);padding:2px 8px;border-radius:999px;margin-bottom:4px;}" +
+    ".rwa-setting-row{display:flex;align-items:center;gap:12px;margin-bottom:10px;font-size:12px;color:var(--foreground);}" +
+    ".rwa-setting-row span{flex:1;}" +
+    ".rwa-split{display:flex;height:440px;max-height:72vh;}" +
+    ".rwa-nav{width:158px;flex-shrink:0;border-right:1px solid var(--border);padding:8px;display:flex;flex-direction:column;gap:4px;overflow-y:auto;}" +
+    ".rwa-nav-item{padding:8px 12px;border-radius:8px;font-size:12.5px;color:var(--muted-foreground);cursor:pointer;user-select:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background .12s,color .12s;}" +
+    ".rwa-nav-item:hover{background:color-mix(in srgb,var(--accent) 55%,transparent);color:var(--foreground);}" +
+    ".rwa-nav-active{background:color-mix(in srgb,var(--primary) 14%,transparent)!important;color:var(--primary)!important;font-weight:600;}" +
+    ".rwa-pane{flex:1;min-width:0;padding:16px;overflow-y:auto;}" +
+    ".rwa-pane-title{font-size:13px;font-weight:600;color:var(--foreground);margin-bottom:4px;}" +
+    ".rwa-pane-desc{font-size:11.5px;color:var(--muted-foreground);margin-bottom:16px;line-height:1.5;}" +
+    ".rwa-card{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--secondary);border-radius:8px;margin-bottom:6px;border:1px solid var(--border);}" +
+    ".rwa-char-list{max-height:150px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:8px 12px;margin-bottom:12px;background:var(--secondary);}" +
+    ".rwa-subtitle{font-size:11px;color:var(--muted-foreground);margin-top:2px;}" +
+    ".rwa-foot-note{padding:12px 16px;border-top:1px solid var(--border);font-size:10.5px;color:var(--muted-foreground);}" +
+    "@media(max-width:560px){.rwa-split{flex-direction:column;height:auto;}.rwa-nav{width:auto;flex-direction:row;flex-wrap:wrap;border-right:0;border-bottom:1px solid var(--border);}}"+
+    ".rwa ::-webkit-scrollbar{width:6px;}" +
+    ".rwa ::-webkit-scrollbar-track{background:transparent;}" +
+    ".rwa ::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--muted-foreground) 28%,transparent);border-radius:3px;}" +
+    ".rwa ::-webkit-scrollbar-thumb:hover{background:var(--primary);}" +
+    ".rwa-win ::-webkit-scrollbar{width:6px;}" +
+    ".rwa-win ::-webkit-scrollbar-track{background:transparent;}" +
+    ".rwa-win ::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--muted-foreground) 28%,transparent);border-radius:3px;}" +
+    ".rwa-win ::-webkit-scrollbar-thumb:hover{background:var(--primary);}"
+
+  );
+
+  // ── Tooltip helpers ───────────────────────────────────────────────────────
+  var _tip = null;
+  function showTip(anchor, text) {
+    if (!_tip) { _tip = mk("div", "rwa-tip"); document.body.appendChild(_tip); }
+    _tip.textContent = text;
+    var r = anchor.getBoundingClientRect();
+    _tip.style.left = (r.right + 8) + "px";
+    _tip.style.top  = r.top + "px";
+    marinara.setTimeout(function () {
+      if (!_tip) return;
+      var tw = _tip.offsetWidth;
+      if (r.right + 8 + tw > window.innerWidth) _tip.style.left = (r.left - tw - 8) + "px";
+      _tip.classList.add("rwa-tip-show");
+    }, 0);
+  }
+  function hideTip() { if (_tip) _tip.classList.remove("rwa-tip-show"); }
+
+  // ── Popup ─────────────────────────────────────────────────────────────────
+  function killPopup() {
+    hideTip();
+    if (_twCancel) { _twCancel(); _twCancel = null; }
+    if (popup) { popup.remove(); popup = null; }
+  }
+
+  function showPopup(rect, segments) {
+    killPopup();
+    var cid = getChatId();
+    // segments: [{mid, text}] in document order. sel.text/mid mirror the first
+    // segment so single-message helpers (Custom Prompt, undo) keep working.
+    sel = {
+      segments: segments,
+      text: segments[0].text,
+      mid: segments[0].mid,
+      cid: cid,
+    };
+
+    var colCount  = Math.max(1, cfg.cols || 2);
+    var rowCount  = Math.max(1, cfg.rows || 6);
+    var estWidth  = Math.max(200, colCount * 115) + 20;
+    var estHeight = rowCount * 34 - 4 + 140;
+
+    var lft = rect.left;
+    var top;
+    var pos = cfg.popupPos || "auto";
+    if (pos === "above") {
+      top = rect.top - estHeight - 8;
+    } else if (pos === "below") {
+      top = rect.bottom + 8;
+    } else {
+      top = rect.bottom + 8;
+      if (top + estHeight > window.innerHeight) top = rect.top - estHeight - 8;
+    }
+    if (lft + estWidth > window.innerWidth) lft = window.innerWidth - estWidth - 8;
+
+    var p = mk("div", "rwa");
+    p.style.left     = Math.max(8, lft) + "px";
+    p.style.top      = Math.max(8, top) + "px";
+    p.style.minWidth = Math.max(200, colCount * 115) + "px";
+    document.body.appendChild(p);
+    popup = p;
+
+    ap(p, mk("div", "rwa-topbar"));
+
+    var mhdr = ap(p, mk("div", "rwa-mini-hdr"));
+    ap(mhdr, mk("span", "rwa-mini-title", "REWRITE"));
+    var sub = ap(mhdr, mk("span", "rwa-mini-sub", segments.length > 1 ? segments.length + " messages" : "1 message"));
+    if (segments.length > 1) { sub.style.color = "var(--primary)"; sub.title = "Selection spans " + segments.length + " messages; each is rewritten in turn."; }
+
+    var grid = ap(p, mk("div", "rwa-grid"));
+    grid.style.gridTemplateColumns = "repeat(" + colCount + ", 1fr)";
+    grid.style.maxHeight = (rowCount * 34 - 4) + "px";
+
+    // Pinned auto-profile (full-width, above the grid) when one exists for this chat.
+    var activeAutoProf = cid && autoProfs[cid] ? autoProfs[cid] : null;
+    if (activeAutoProf) {
+      var autoPr = { id: activeAutoProf.id, name: activeAutoProf.name, prompt: activeAutoProf.prompt };
+      var ab = mk("button", "rwa-auto");
+      ab.innerHTML = svgEl(ICON.spark);
+      var albl = mk("span", "", activeAutoProf.name);
+      albl.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+      ab.appendChild(albl);
+      ab.addEventListener("mouseenter", function () { showTip(ab, activeAutoProf.name + ": " + activeAutoProf.prompt); });
+      ab.addEventListener("mouseleave", hideTip);
+      ab.addEventListener("click", function (e) { e.stopPropagation(); hideTip(); doRewrite(autoPr); });
+      p.insertBefore(ab, grid);
+    }
+
+    profiles.slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); }).forEach(function (pr) {
+      var label = cfg.compact ? pr.name.slice(0, 2).toUpperCase() : pr.name;
+      var b = mk("button", "rwa-pb", label);
+      b.addEventListener("mouseenter", function () { showTip(b, pr.name + ": " + pr.prompt); });
+      b.addEventListener("mouseleave", hideTip);
+      b.addEventListener("click", function (e) { e.stopPropagation(); hideTip(); doRewrite(pr); });
+      ap(grid, b);
+    });
+
+    var slRow = ap(p, mk("div", "rwa-slider-row"));
+    var togWrap = mk("label", "rwa-toggle-wrap");
+    var togInp  = mk("input"); togInp.type = "checkbox"; togInp.checked = !!cfg.lengthEnabled;
+    var togSl   = mk("span", "rwa-toggle-sl");
+    togWrap.appendChild(togInp); togWrap.appendChild(togSl);
+    ap(slRow, togWrap);
+    ap(slRow, mk("span", "rwa-slider-lbl", "LENGTH"));
+    var range = mk("input", "rwa-range");
+    range.type = "range"; range.min = "-99"; range.max = "200";
+    range.value = String(cfg.lengthPct || 0);
+    ap(slRow, range);
+    var valLbl = ap(slRow, mk("span", "rwa-slider-val", formatPct(cfg.lengthPct || 0)));
+    function updateSlider() {
+      var on = !!cfg.lengthEnabled;
+      slRow.style.opacity = on ? "1" : "0.45";
+      range.disabled = !on;
+    }
+    updateSlider();
+    range.addEventListener("input", function () {
+      cfg.lengthPct = parseInt(range.value, 10);
+      valLbl.textContent = formatPct(cfg.lengthPct);
+      saveC();
+    });
+    togInp.addEventListener("change", function () {
+      cfg.lengthEnabled = togInp.checked;
+      saveC();
+      updateSlider();
+    });
+
+    var ft = ap(p, mk("div", "rwa-foot"));
+    var ub = mkBtn("", null, doUndo);
+    ub.innerHTML = svgEl(ICON.undo); ub.setAttribute("aria-label", "Undo last rewrite");
+    ub.style.cssText = "flex:0 0 auto;padding:6px 10px;color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;";
+    if (!hist.length) ub.disabled = true;
+    ap(ft, ub);
+    ap(ft, mkBtn("Custom prompt", null, showCustom)).style.flex = "1";
+    var gb = mkBtn("", null, showSettings);
+    gb.innerHTML = svgEl(ICON.gear); gb.setAttribute("aria-label", "Settings");
+    gb.style.cssText = "flex:0 0 auto;padding:6px 10px;color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;";
+    ap(ft, gb);
+  }
+
+  // ── Error ─────────────────────────────────────────────────────────────────
+  function showErr(msg) {
+    if (!popup) {
+      var p = mk("div", "rwa");
+      p.style.cssText = "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);min-width:280px;max-width:400px;";
+      document.body.appendChild(p);
+      popup = p;
+    }
+    popup.innerHTML = "";
+    ap(popup, mk("div", "rwa-err", msg));
+    var ft = ap(popup, mk("div", "rwa-foot"));
+    ap(ft, mkBtn("Close", null, killPopup)).style.flex = "1";
+  }
+
+  // ── Modal helpers ─────────────────────────────────────────────────────────
+  function mkOv(z) {
+    var ov = mk("div", "rwa-ov");
+    ov.style.zIndex = String(z);
+    document.body.appendChild(ov);
+    return ov;
+  }
+
+  function mkWin(ov, w, title) {
+    var win = ap(ov, mk("div", "rwa-win"));
+    if (w) win.style.width = w;
+    ap(win, mk("div", "rwa-bar"));
+    var hdr = ap(win, mk("div", "rwa-hdr"));
+    var titleEl = ap(hdr, mk("div", "rwa-title", title));
+    ap(hdr, xBtn(function () { ov.remove(); }));
+    var body = ap(win, mk("div", "rwa-body"));
+    body._titleEl = titleEl;
+    return body;
+  }
+
+  function showModalErr(ov, body, msg) {
+    body.innerHTML = "";
+    if (body._titleEl) body._titleEl.textContent = "Error";
+    ap(body, mk("div", "rwa-err", msg));
+    var ft = ap(body, mk("div", "rwa-foot"));
+    ap(ft, mkBtn("Close", null, function () { ov.remove(); })).style.flex = "1";
+  }
+
+  // ── Toast ─────────────────────────────────────────────────────────────────
+  function showToast(anchorEl, msg, variant) {
+    var t = mk("div", "rwa-toast" + (variant === "ok" ? " rwa-toast-ok" : ""), msg);
+    if (anchorEl) {
+      var rect = anchorEl.getBoundingClientRect();
+      t.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - 330)) + "px";
+      t.style.top  = (rect.top > 60 ? rect.top - 50 : rect.bottom + 8) + "px";
+    } else {
+      t.style.bottom = "80px";
+      t.style.left = "50%";
+      t.style.transform = "translateX(-50%)";
+    }
+    document.body.appendChild(t);
+    marinara.setTimeout(function () {
+      t.style.opacity = "0";
+      marinara.setTimeout(function () { t.remove(); }, 420);
+    }, 3200);
+  }
+
+  // -- Pre-fill edit textarea --------------------------------------------------
+  function setNativeTextareaValue(ta, value) {
+    // Marinara's roleplay editor textarea is React-controlled; a plain `.value`
+    // set won't fire React's onChange, so save reads stale state. Use the
+    // prototype's native setter so React sees a real value change.
+    try {
+      var d = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
+      if (d && d.set) { d.set.call(ta, value); return; }
+    } catch (e) {}
+    ta.value = value;
+  }
+
+  function findEditTextarea(mid) {
+    var el = document.querySelector('[data-message-id="' + mid + '"]');
+    if (el) { var t = el.querySelector("textarea"); if (t) return t; }
+    // Roleplay editor (ConversationMessage) renders the textarea inside the
+    // message list, OUTSIDE the id node. Pick the message-list textarea that
+    // isn't the composer (the composer has a placeholder; the editor doesn't).
+    var scroller = document.querySelector(".mari-messages-scroll") ||
+                   document.querySelector("[data-chat-scroll]");
+    if (scroller) {
+      var tas = scroller.querySelectorAll("textarea");
+      for (var i = 0; i < tas.length; i++) { if (!tas[i].placeholder) return tas[i]; }
+      if (tas.length) return tas[0];
+    }
+    return null;
+  }
+
+  function findSaveButton(ta) {
+    // ChatMessage editor: titled icon button.
+    var byTitle = document.querySelector('button[title="Save (Cmd+Enter)"]') ||
+                  document.querySelector('button[aria-label*="save" i]');
+    if (byTitle) return byTitle;
+    // ConversationMessage (roleplay) editor: plain text button reading "save",
+    // sitting next to the textarea (no title, no aria, no Ctrl+Enter handler).
+    var scope = (ta && ta.closest && (ta.closest(".space-y-2") ||
+                 (ta.parentElement && ta.parentElement.parentElement))) || document;
+    var btns = scope.querySelectorAll("button");
+    for (var i = 0; i < btns.length; i++) {
+      if ((btns[i].textContent || "").trim().toLowerCase() === "save") return btns[i];
+    }
+    return null;
+  }
+
+  function prefillEditTextarea(mid, content, onDone) {
+    var msgEl = document.querySelector('[data-message-id="' + mid + '"]');
+    if (!msgEl) {
+      logDbg("apply.error", { stage: "find-message", mid: mid });
+      showErr("Cannot find message in the DOM.\nHas the chat changed?\n\nDebug: message-id=" + mid);
+      return false;
+    }
+    msgEl.classList.add("rwa-msg-hl");
+    logDbg("apply.openEditor", { mid: mid });
+    // Marinara opens the inline editor via this event -- there is no edit button
+    // in the DOM to click. Both message components listen on `window`.
+    window.dispatchEvent(new CustomEvent("marinara:start-edit-message", { detail: { messageId: mid } }));
+    waitForTextarea(mid, content, onDone);
+    return true;
+  }
+
+  function applyToTextarea(mid, ta, content, onDone) {
+    logDbg("apply.fill", { chars: content.length });
+    setNativeTextareaValue(ta, content);
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+
+    marinara.setTimeout(function () {
+      var el = document.querySelector('[data-message-id="' + mid + '"]');
+      if (el) el.classList.remove("rwa-msg-hl");
+      var scope = el || document;
+
+      if (cfg.reviewBeforeApply) {
+        logDbg("apply.review", { mid: mid });
+        if (onDone) onDone();
+        showToast(el, "✏️ Edit open — review and press Ctrl+Enter to save");
+        return;
+      }
+
+      var saveBtn = findSaveButton(ta);
+      if (saveBtn) {
+        saveBtn.click();
+        logDbg("apply.saved", { via: "button", label: (saveBtn.textContent || saveBtn.title || "").trim().slice(0, 20) });
+        showToast(null, "✓ Applied", "ok");
+      } else {
+        // ChatMessage editor also saves on Ctrl+Enter; ConversationMessage does
+        // not, but if its save button vanished there's nothing better to try.
+        ta.dispatchEvent(new KeyboardEvent("keydown", {
+          key: "Enter", ctrlKey: true, bubbles: true, cancelable: true,
+        }));
+        logDbg("apply.saved", { via: "ctrl-enter", saveBtnFound: false });
+        showToast(el, "✏️ Saved via Ctrl+Enter — verify the message updated");
+      }
+      if (onDone) onDone();
+    }, 50);
+  }
+
+  function waitForTextarea(mid, content, onDone) {
+    var settled = false;
+    var observer = null;
+    function attempt() {
+      if (settled) return;
+      var ta = findEditTextarea(mid);
+      if (!ta) return;
+      settled = true;
+      if (observer) observer.disconnect();
+      logDbg("apply.textareaFound", {});
+      applyToTextarea(mid, ta, content, onDone);
+    }
+    // Observe the whole document: the roleplay component can remount the message
+    // node, which would detach an observer scoped to the original element.
+    observer = marinara.observe(document.body, attempt, { childList: true, subtree: true });
+    attempt(); // in case the editor is already open
+    // Never hang the result modal: if the editor never appears, fail loudly.
+    marinara.setTimeout(function () {
+      if (settled) return;
+      settled = true;
+      if (observer) observer.disconnect();
+      var el = document.querySelector('[data-message-id="' + mid + '"]');
+      if (el) el.classList.remove("rwa-msg-hl");
+      logDbg("apply.error", {
+        stage: "textarea-timeout",
+        mid: mid,
+        anyTextarea: !!document.querySelector("[data-chat-scroll] textarea"),
+      });
+      showErr(
+        "The message editor didn't open within 3s.\n\n" +
+        "Marinara's edit UI may have changed, or this message type isn't editable.\n" +
+        "The rewrite is still shown above -- copy it manually if needed."
+      );
+    }, 3000);
+  }
+
+  // ── Rewrite — opens generation modal ─────────────────────────────────────
+  // ── Inference: route to local sidecar or a direct OpenAI-compatible endpoint ─
+  // Resolves to { result: string } or { error: string } so callers stay identical.
+  function runInference(systemPrompt, userPrompt) {
+    var mode = cfg.connMode === "direct" ? "direct" : "sidecar";
+    var started = Date.now();
+    var p;
+    if (mode === "sidecar") {
+      logDbg("inference.request", { mode: mode, system: systemPrompt, user: userPrompt });
+      p = marinara.apiFetch("/sidecar/tracker", {
+        method: "POST",
+        body: JSON.stringify({ systemPrompt: systemPrompt, userPrompt: userPrompt }),
+      });
+    } else {
+      // Accept bare host, ".../v1", or a full ".../chat/completions" paste.
+      var base = (cfg.apiUrl || "").trim().replace(/\/+$/, "").replace(/\/chat\/completions$/, "");
+      if (!base) return Promise.resolve({ error: "No API URL set (Settings → Connection)." });
+      if (!cfg.apiModel) return Promise.resolve({ error: "No model name set (Settings → Connection)." });
+      var endpoint = base + "/chat/completions";
+      var temp = typeof cfg.directTemp === "number" ? cfg.directTemp : 0.7;
+      logDbg("inference.request", { mode: mode, endpoint: endpoint, model: cfg.apiModel, temperature: temp, system: systemPrompt, user: userPrompt });
+      var headers = { "Content-Type": "application/json" };
+      if (cfg.apiKey) headers["Authorization"] = "Bearer " + cfg.apiKey;
+      p = fetch(endpoint, {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify({
+          model: cfg.apiModel,
+          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+          temperature: temp,
+          stream: false,
+        }),
+      })
+        .then(function (r) {
+          return r.json().catch(function () { return {}; }).then(function (j) { return { status: r.status, json: j }; });
+        })
+        .then(function (o) {
+          var j = o.json || {};
+          if (j.error) return { error: j.error.message || j.error.type || JSON.stringify(j.error) };
+          if (!o.status || o.status >= 400) return { error: "HTTP " + o.status + " from endpoint." };
+          var msg = j.choices && j.choices[0] && j.choices[0].message;
+          return { result: msg && typeof msg.content === "string" ? msg.content : "" };
+        })
+        .catch(function (e) {
+          return {
+            error: "Direct API request failed: " + (e && e.message ? e.message : String(e)) +
+              "\n\nIf using Ollama, the browser is blocked by CORS — set OLLAMA_ORIGINS=* (env var) and restart Ollama.",
+          };
+        });
+    }
+    return p.then(function (resp) {
+      logDbg("inference.response", {
+        mode: mode,
+        ms: Date.now() - started,
+        error: (resp && resp.error) || null,
+        result: resp && typeof resp.result === "string" ? resp.result : null,
+      });
+      return resp;
+    });
+  }
+
+  function doRewrite(profile, queue) {
+    // Merge mode: rewrite the whole multi-message span as one, then split back.
+    if (!queue && cfg.mergeMultiMsg && sel.segments && sel.segments.length > 1) {
+      doMergeRewrite(profile, sel.segments);
+      return;
+    }
+    // queue: { segments:[{mid,text}], index }. Built from sel on first call so a
+    // multi-message selection is rewritten one message at a time.
+    if (!queue) {
+      var segs = (sel.segments && sel.segments.length) ? sel.segments : [{ mid: sel.mid, text: sel.text }];
+      queue = { segments: segs, index: 0 };
+    }
+    var seg = queue.segments[queue.index];
+    var total = queue.segments.length;
+    var savedSel = { text: seg.text, mid: seg.mid, cid: sel.cid };
+    killPopup();
+    if (!savedSel.cid) savedSel.cid = getChatId();
+
+    var ov   = mkOv(10002);
+    var counter = total > 1 ? " (Msg " + (queue.index + 1) + "/" + total + ")" : "";
+    var body = mkWin(ov, "560px", profile.name + counter + " \u2014 Generating\u2026");
+
+    if (total > 1) {
+      var note = ap(body, mk("div", "", "Selection spans " + total + " messages \u2014 rewriting each in turn."));
+      note.style.cssText = "font-size:11px;color:var(--primary);margin-bottom:10px;font-weight:600;";
+    }
+    ap(body, mk("div", "rwa-plbl", "Selected Text"));
+    var selBox = mk("div", "rwa-prev rwa-shimmer", savedSel.text);
+    selBox.style.marginBottom = "14px";
+    ap(body, selBox);
+
+    var loadRow = mk("div", "");
+    loadRow.style.cssText = "padding:8px 0 12px;";
+    ap(loadRow, mk("div", "rwa-pulse"));
+    var loadLbl = mk("div", "", "Rewriting\u2026");
+    loadLbl.style.cssText = "font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;" +
+      "color:var(--muted-foreground);margin-top:6px;text-align:center;";
+    ap(loadRow, loadLbl);
+    ap(body, loadRow);
+
+    var ft = ap(body, mk("div", "rwa-foot"));
+    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+
+    var localCtx    = cfg.localContextEnabled ? extractLocalContext(savedSel.mid, savedSel.text) : "";
+    var cardPromise = cfg.useCharCard ? fetchCharCard(savedSel.cid) : Promise.resolve("");
+    var lorePromise = cfg.useLorebookEntries ? fetchLorebookEntries(savedSel.cid) : Promise.resolve("");
+    var prevPromise = fetchPrevMessages(savedSel.cid, savedSel.mid);
+
+    Promise.all([cardPromise, lorePromise, prevPromise])
+      .then(function (ctxResults) {
+        var cardCtx = ctxResults[0];
+        var loreCtx = ctxResults[1];
+        var prevCtx = ctxResults[2];
+        if (!ov.parentNode) return;
+        var safeText = savedSel.text.length > 10000 ? savedSel.text.slice(0, 10000) + "\u2026" : savedSel.text;
+
+        // Small models can't reason about "70% of the original", so convert the
+        // percentage into an explicit target word-count range from the real count.
+        var lengthNote = "";
+        if (cfg.lengthEnabled && cfg.lengthPct !== 0) {
+          var ow = wc(safeText);
+          var target = Math.max(1, Math.round(ow * (1 + cfg.lengthPct / 100)));
+          var lo = Math.max(1, Math.round(target * 0.85));
+          var hi = Math.round(target * 1.15);
+          lengthNote = "\n\nLength: the original is " + ow + " words; rewrite to approximately " +
+            target + " words (range " + lo + "\u2013" + hi + ").";
+        }
+
+        // Order matters: reference context first, then the operation, then the
+        // target span last and clearly fenced (research: small models lose the
+        // instruction when it sits above a wall of context).
+        var ctxBlock = (cardCtx + loreCtx + localCtx + prevCtx).replace(/^\n+/, "");
+        logDbg("rewrite.assemble", {
+          profile: profile.name, profileId: profile.id, selChars: savedSel.text.length,
+          lengthNote: lengthNote || null,
+          ctxChars: { character: cardCtx.length, lore: loreCtx.length, surrounding: localCtx.length, prevMessages: prevCtx.length },
+          ctxEnabled: { charCard: !!cfg.useCharCard, lorebook: !!cfg.useLorebookEntries, surrounding: !!cfg.localContextEnabled, prevMessages: !!cfg.usePrevMessages },
+        });
+        var userPrompt =
+          (ctxBlock ? ctxBlock + "\n\n" : "") +
+          "Task: " + profile.prompt + lengthNote +
+          "\n\nRewrite only the text inside <rewrite_this>. Output the rewritten passage and nothing else.\n" +
+          "<rewrite_this>\n" + safeText + "\n</rewrite_this>";
+
+        return runInference(REWRITE_SYS, userPrompt);
+      })
+      .then(function (resp) {
+        if (!resp || !ov.parentNode) return;
+        if (resp.error) {
+          var hint = cfg.connMode === "direct"
+            ? "Check Settings \u2192 Connection \u2014 API URL and model name must point to a running server."
+            : "Check Settings \u2192 AI Models \u2014 a local model must be loaded.";
+          showModalErr(ov, body,
+            (cfg.connMode === "direct" ? "Direct API error: " : "Sidecar error: ") + resp.error +
+            "\n\n" + hint + "\n\nRaw: " +
+            JSON.stringify(resp).slice(0, 300)
+          );
+          return;
+        }
+        var result_raw = typeof resp.result === "string" ? resp.result.trim() : "";
+        var result_clean = result_raw;
+        var openQ  = result_raw.match(/^["\u201c\u2018\u00ab]/);
+        var closeQ = result_raw.match(/["\u201d\u2019\u00ab]$/);
+        if (openQ && closeQ) {
+          var o = openQ[0], c = closeQ[0];
+          var pairs = { '"': '"', '\u201c': '\u201d', '\u2018': '\u2019', '\u00ab': '\u00bb' };
+          if (pairs[o] === c) result_clean = result_raw.slice(1, -1);
+        }
+        if (!result_clean) {
+          showModalErr(ov, body,
+            "The AI returned an empty response.\n\nCommon causes:\n" +
+            "\u2022 No local model is loaded (Settings \u2192 AI Models)\n" +
+            "\u2022 The sidecar process crashed or is still loading\n" +
+            "\u2022 Context size is too small for the prompt\n\n" +
+            "Raw response: " + JSON.stringify(resp).slice(0, 300)
+          );
+          return;
+        }
+        showModalPreview(ov, body, result_clean, profile, savedSel, queue);
+      })
+      .catch(function (e) {
+        if (!ov.parentNode) return;
+        showModalErr(ov, body,
+          "Request failed: " + (e && e.message ? e.message : String(e)) +
+          "\n\nDebug:\n" +
+          "\u2022 Check the browser console for network errors\n" +
+          "\u2022 Verify Marinara server is running\n" +
+          "\u2022 Confirm the sidecar model is loaded\n" +
+          "\u2022 chat-id=" + (savedSel.cid || "null")
+        );
+      });
+  }
+
+  // ── Merge mode: rewrite N message-spans as one, split back by markers ──────
+  var MERGE_MARK_RE = /\s*\[\[\s*SECTION\s*\d+\s*\]\]\s*/gi;
+  function buildMergedText(segments) {
+    var out = "";
+    for (var i = 0; i < segments.length; i++) {
+      out += (i > 0 ? "\n[[SECTION " + (i + 1) + "]]\n" : "") + segments[i].text;
+    }
+    return out;
+  }
+
+  function doMergeRewrite(profile, segments) {
+    killPopup();
+    var cid = sel.cid || getChatId();
+    var anchorMid = segments[0].mid;
+    var merged = buildMergedText(segments);
+
+    var ov   = mkOv(10002);
+    var body = mkWin(ov, "560px", profile.name + " (" + segments.length + " merged) — Generating…");
+    var note = ap(body, mk("div", "", "Merging " + segments.length + " messages, rewriting as one, then splitting back."));
+    note.style.cssText = "font-size:11px;color:var(--primary);margin-bottom:10px;font-weight:600;";
+    ap(body, mk("div", "rwa-plbl", "Merged Selection"));
+    var selBox = mk("div", "rwa-prev rwa-shimmer", merged);
+    selBox.style.cssText = "margin-bottom:14px;white-space:pre-wrap;";
+    ap(body, selBox);
+    var loadRow = mk("div", ""); loadRow.style.cssText = "padding:8px 0 12px;";
+    ap(loadRow, mk("div", "rwa-pulse"));
+    var loadLbl = mk("div", "", "Rewriting…");
+    loadLbl.style.cssText = "font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted-foreground);margin-top:6px;text-align:center;";
+    ap(loadRow, loadLbl); ap(body, loadRow);
+    var ft = ap(body, mk("div", "rwa-foot"));
+    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+
+    var cardPromise = cfg.useCharCard ? fetchCharCard(cid) : Promise.resolve("");
+    var lorePromise = cfg.useLorebookEntries ? fetchLorebookEntries(cid) : Promise.resolve("");
+    var prevPromise = fetchPrevMessages(cid, anchorMid);
+
+    Promise.all([cardPromise, lorePromise, prevPromise])
+      .then(function (ctxResults) {
+        if (!ov.parentNode) return;
+        var safeMerged = merged.length > 12000 ? merged.slice(0, 12000) + "…" : merged;
+        var lengthNote = "";
+        if (cfg.lengthEnabled && cfg.lengthPct !== 0) {
+          var ow = wc(safeMerged);
+          var target = Math.max(1, Math.round(ow * (1 + cfg.lengthPct / 100)));
+          var lo = Math.max(1, Math.round(target * 0.85)), hi = Math.round(target * 1.15);
+          lengthNote = "\n\nLength: the original is " + ow + " words; rewrite to approximately " + target + " words (range " + lo + "–" + hi + ").";
+        }
+        var ctxBlock = (ctxResults[0] + ctxResults[1] + ctxResults[2]).replace(/^\n+/, "");
+        var markerNote = "\n\nThe passage contains " + (segments.length - 1) +
+          " markers like [[SECTION 2]], [[SECTION 3]] that separate parts which belong to different messages. " +
+          "Keep every [[SECTION n]] marker exactly as written, on its own line, in the same order. Do not add, remove, renumber, or move them.";
+        var userPrompt =
+          (ctxBlock ? ctxBlock + "\n\n" : "") +
+          "Task: " + profile.prompt + lengthNote + markerNote +
+          "\n\nRewrite only the text inside <rewrite_this>, preserving the [[SECTION n]] markers. Output the rewritten passage and nothing else.\n" +
+          "<rewrite_this>\n" + safeMerged + "\n</rewrite_this>";
+        logDbg("rewrite.merge.request", { messages: segments.length, mergedChars: merged.length });
+        return runInference(REWRITE_SYS + "\n- Preserve any [[SECTION n]] markers exactly, on their own lines, in order.", userPrompt);
+      })
+      .then(function (resp) {
+        if (!resp || !ov.parentNode) return;
+        if (resp.error) { showModalErr(ov, body, "Error: " + resp.error); return; }
+        var out = (typeof resp.result === "string" ? resp.result : "").trim();
+        if (!out) { showModalErr(ov, body, "The AI returned an empty response."); return; }
+        var pieces = out.split(MERGE_MARK_RE).map(function (p) { return p.trim(); });
+        var clean = pieces.length === segments.length && pieces.every(function (p) { return p.length > 0; });
+        logDbg("rewrite.merge.split", { expected: segments.length, got: pieces.length, clean: clean });
+        if (clean) {
+          showMergePreview(ov, body, profile, segments, pieces, cid);
+        } else {
+          // Markers didn't survive the rewrite — fall back to per-message so we
+          // never guess a split and corrupt messages.
+          ov.remove();
+          showToast(null, "Couldn't split cleanly — rewriting each message instead", "");
+          doRewrite(profile, { segments: segments, index: 0 });
+        }
+      })
+      .catch(function (e) {
+        if (ov.parentNode) showModalErr(ov, body, "Request failed: " + (e && e.message ? e.message : String(e)));
+      });
+  }
+
+  function applyMerged(segments, pieces, cid, i, onDone) {
+    if (i >= segments.length) { if (onDone) onDone(); return; }
+    doCommit(pieces[i], { text: segments[i].text, mid: segments[i].mid, cid: cid }, function () {
+      applyMerged(segments, pieces, cid, i + 1, onDone);
+    });
+  }
+
+  function showMergePreview(ov, body, profile, segments, pieces, cid) {
+    if (cfg.autoApply) {
+      ov.remove();
+      applyMerged(segments, pieces, cid, 0, function () { showToast(null, "✓ Applied to " + segments.length + " messages", "ok"); });
+      return;
+    }
+    body.innerHTML = "";
+    if (body._titleEl) body._titleEl.textContent = profile.name + " (" + segments.length + " merged) — Result";
+    var note = ap(body, mk("div", "", "Split cleanly into " + segments.length + " pieces — each goes back to its message."));
+    note.style.cssText = "font-size:11px;color:var(--primary);margin-bottom:10px;font-weight:600;";
+    ap(body, mk("div", "rwa-plbl", "Rewritten (by message)"));
+    var box = mk("div", "rwa-prev");
+    for (var i = 0; i < pieces.length; i++) {
+      var lbl = ap(box, mk("div", "rwa-plbl", "▸ Message " + (i + 1)));
+      lbl.style.cssText = "margin-top:" + (i ? "10px" : "0") + ";";
+      var pc = ap(box, mk("div", "", pieces[i]));
+      pc.style.cssText = "white-space:pre-wrap;font-size:12px;line-height:1.6;";
+    }
+    ap(body, box);
+    var ft = ap(body, mk("div", "rwa-foot"));
+    ap(ft, mkBtn("Accept All", "rwa-accept", function () {
+      applyMerged(segments, pieces, cid, 0, function () { ov.remove(); showToast(null, "✓ Applied to " + segments.length + " messages", "ok"); });
+    })).style.flex = "2";
+    ap(ft, mkBtn("Retry", null, function () { ov.remove(); doMergeRewrite(profile, segments); })).style.flex = "1";
+    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+  }
+
+  // ── Modal result preview ──────────────────────────────────────────────────
+  function showModalPreview(ov, body, result, profile, savedSel, queue) {
+    var total = queue ? queue.segments.length : 1;
+    var idx = queue ? queue.index : 0;
+    var hasNext = queue && idx + 1 < total;
+    function advance() {
+      if (hasNext) doRewrite(profile, { segments: queue.segments, index: idx + 1 });
+    }
+
+    if (cfg.autoApply) {
+      ov.remove();
+      // Chain the next message's apply onto this one's completion so the editor
+      // opens/saves sequentially rather than racing.
+      doCommit(result, savedSel, function () {
+        showToast(null, total > 1 ? "\u2713 Applied " + (idx + 1) + "/" + total : "\u2713 Applied", "ok");
+        advance();
+      });
+      return;
+    }
+
+    body.innerHTML = "";
+    if (body._titleEl) body._titleEl.textContent = profile.name + (total > 1 ? " (Msg " + (idx + 1) + "/" + total + ")" : "") + " \u2014 Result";
+
+    if (total > 1) {
+      var note = ap(body, mk("div", "", "Message " + (idx + 1) + " of " + total + " in this selection."));
+      note.style.cssText = "font-size:11px;color:var(--primary);margin-bottom:10px;font-weight:600;";
+    }
+    ap(body, mk("div", "rwa-plbl", "Original"));
+    var origBox = mk("div", "rwa-prev");
+    origBox.style.cssText = "max-height:90px;opacity:.65;margin-bottom:12px;";
+    origBox.textContent = savedSel.text;
+    ap(body, origBox);
+
+    ap(body, mk("div", "rwa-plbl", cfg.showDiff ? "Diff (green\u202fadd / red\u202frem)" : "Rewritten"));
+    var resultBox = mk("div", "rwa-prev");
+    resultBox.style.marginBottom = "4px";
+    ap(body, resultBox);
+
+    if (cfg.showDiff) {
+      renderDiff(resultBox, savedSel.text, result);
+    } else if (cfg.typewriter) {
+      typewriterFill(resultBox, result, function () { _twCancel = null; });
+    } else {
+      resultBox.textContent = result;
+    }
+
+    ap(body, mk("div", "rwa-wc", wcDiff(savedSel.text, result)));
+
+    var ft = ap(body, mk("div", "rwa-foot"));
+    ap(ft, mkBtn(hasNext ? "Accept & Next" : "Accept", "rwa-accept", function () {
+      doCommit(result, savedSel, function () { ov.remove(); advance(); });
+    })).style.flex = "2";
+    ap(ft, mkBtn("Retry", null, function () {
+      ov.remove();
+      doRewrite(profile, queue);
+    })).style.flex = "1";
+    if (hasNext) {
+      ap(ft, mkBtn("Skip", null, function () { ov.remove(); advance(); })).style.flex = "1";
+    }
+    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+  }
+
+  // ── Typewriter reveal (with cancel) ───────────────────────────────────────
+  function typewriterFill(el, text, onDone) {
+    var i = 0;
+    var cancelled = false;
+    var ids = [];
+    el.textContent = "";
+    _twCancel = function () { cancelled = true; ids.forEach(function (id) { clearTimeout(id); }); ids = []; };
+    function tick() {
+      if (cancelled) return;
+      if (i < text.length) {
+        el.textContent += text[i++];
+        el.scrollTop = el.scrollHeight;
+        ids.push(marinara.setTimeout(tick, 8));
+      } else {
+        _twCancel = null;
+        if (onDone) onDone();
+      }
+    }
+    tick();
+  }
+
+  // ── Commit — splice rewritten text into message ───────────────────────────
+  function doCommit(newText, savedSel, onDone) {
+    var mid = savedSel.mid;
+    var cid = savedSel.cid || getChatId();
+    if (!cid) {
+      showErr("Cannot detect active chat ID.\nTry clicking the chat in the sidebar first.");
+      return;
+    }
+
+    cachedMessages(cid)
+      .then(function (msgs) {
+        if (!Array.isArray(msgs)) {
+          throw new Error("Unexpected response from /chats/" + cid + "/messages (got: " + typeof msgs + ")");
+        }
+        var msg = null;
+        for (var i = 0; i < msgs.length; i++) {
+          if (msgs[i].id === mid) { msg = msgs[i]; break; }
+        }
+        if (!msg) {
+          throw new Error(
+            "Message not found.\n\nDebug:\n\u2022 message-id=" + mid +
+            "\n\u2022 chat-id=" + cid +
+            "\n\u2022 messages checked=" + msgs.length
+          );
+        }
+
+        var normOrig    = savedSel.text.trim().replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        var normContent = msg.content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        var updated = null;
+
+        var idx = normContent.indexOf(normOrig);
+        if (idx !== -1) {
+          updated = normContent.slice(0, idx) + newText + normContent.slice(idx + normOrig.length);
+        }
+
+        if (!updated) {
+          try {
+            var flexPat = new RegExp(
+              normOrig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\n/g, "\\s{1,4}")
+            );
+            var m = normContent.match(flexPat);
+            if (m && m.index !== undefined) {
+              updated = normContent.slice(0, m.index) + newText + normContent.slice(m.index + m[0].length);
+            }
+          } catch (e) {}
+        }
+
+        if (!updated) {
+          var anchorWords = normOrig.trim().split(/\s+/).filter(Boolean);
+          if (anchorWords.length >= 10) {
+            var AN = 5;
+            function trimPunct(w) { return w.replace(/^[^a-zA-Z\u00C0-\uFFFF]+|[^a-zA-Z\u00C0-\uFFFF]+$/g, ""); }
+            function escAnchor(w) { return trimPunct(w).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+            var IW = "[^a-zA-Z\u00C0-\uFFFF]{1,40}";
+            var head = anchorWords.slice(0, AN).map(escAnchor).filter(function (w) { return w.length >= 2; });
+            var tail = anchorWords.slice(-AN).map(escAnchor).filter(function (w) { return w.length >= 2; });
+            if (head.length >= 3 && tail.length >= 3) {
+              try {
+                var anchorPat = new RegExp(head.join(IW) + ".{0,600}?" + tail.join(IW));
+                var m2 = normContent.match(anchorPat);
+                if (m2 && m2.index !== undefined) {
+                  updated = normContent.slice(0, m2.index) + newText + normContent.slice(m2.index + m2[0].length);
+                }
+              } catch (e) {}
+            }
+          }
+        }
+
+        if (!updated) {
+          // Markdown-tolerant fallback: match the selection's words in order,
+          // allowing any markdown/whitespace/punctuation between them. Handles
+          // *emphasis*, line breaks, and DOM-vs-stored joining differences that
+          // the exact/whitespace/anchor passes miss.
+          var fuzzyWords = normOrig.split(/[^A-Za-z0-9\u00c0-\uffff]+/).filter(Boolean);
+          if (fuzzyWords.length >= 2 && fuzzyWords.length <= 1500) {
+            try {
+              var SEP = "[^A-Za-z0-9\u00c0-\uffff]{0,40}";
+              var fuzzyPat = new RegExp(
+                fuzzyWords.map(function (w) { return w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }).join(SEP)
+              );
+              var fm = normContent.match(fuzzyPat);
+              if (fm && fm.index !== undefined) {
+                // The match runs first word→last word, so emphasis markers
+                // hugging the span (e.g. *...* , **...** , _..._ , `...`) sit
+                // just outside it. Absorb them so the replacement doesn't
+                // orphan a stray marker.
+                var fStart = fm.index, fEnd = fm.index + fm[0].length;
+                while (fStart > 0 && "*_~`".indexOf(normContent.charAt(fStart - 1)) !== -1) fStart--;
+                while (fEnd < normContent.length && "*_~`".indexOf(normContent.charAt(fEnd)) !== -1) fEnd++;
+                updated = normContent.slice(0, fStart) + newText + normContent.slice(fEnd);
+              }
+            } catch (e) {}
+          }
+        }
+
+        if (!updated) {
+          showErr(
+            "Could not locate the selected text in the stored message.\n\n" +
+            "This can happen when the selection spans formatting or list markers.\n" +
+            "Tip: select within a single paragraph, and avoid grabbing the empty\n" +
+            "line between paragraphs."
+          );
+          return;
+        }
+
+        invalidateMsgCache();
+        prefillEditTextarea(mid, updated, function () {
+          var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
+          hist.unshift({ mid: mid, cid: cid, old: msg.content, when: Date.now() });
+          if (hist.length > depth) hist.length = depth;
+          saveH();
+          if (onDone) onDone();
+        });
+      })
+      .catch(function (e) {
+        showErr("Commit failed:\n" + (e && e.message ? e.message : String(e)));
+      });
+  }
+
+
+  // ── Undo ──────────────────────────────────────────────────────────────────
+  function doUndo() {
+    if (!hist.length) return;
+    var h = hist[0];
+    var ok = prefillEditTextarea(h.mid, h.old, function () {
+      hist.shift();
+      saveH();
+      killPopup();
+    });
+    if (!ok) {
+      hist.shift();
+      saveH();
+    }
+  }
+
+  // ── Custom prompt ─────────────────────────────────────────────────────────
+  function showCustom() {
+    hideTip();
+    var ov  = mkOv(10002);
+    var win = ap(ov, mk("div", "rwa-win"));
+    win.style.width = "440px";
+    ap(win, mk("div", "rwa-bar"));
+    var hdr = ap(win, mk("div", "rwa-hdr"));
+    ap(hdr, mk("div", "rwa-title", "\u2709\uFE0F Custom Prompt"));
+    ap(hdr, xBtn(function () { ov.remove(); }));
+    var body = ap(win, mk("div", "rwa-body"));
+
+    var info = mk("div", "", "Describe exactly what you want. Runs once and is saved for reuse.");
+    info.style.cssText = "font-size:11px;color:var(--muted-foreground);margin-bottom:10px;line-height:1.5;";
+    ap(body, info);
+
+    var ta = mk("textarea", "rwa-inp");
+    ta.placeholder = 'e.g. "Make Sarah sound bubbly instead of angry, and 30% longer"';
+    ta.style.cssText = "height:80px;resize:vertical;margin-bottom:6px;";
+    ap(body, ta);
+
+    if (customs.length) {
+      ap(body, mk("div", "rwa-lbl", "Past Prompts"));
+      var lw = mk("div", "");
+      lw.style.cssText = "max-height:130px;overflow-y:auto;margin-bottom:8px;";
+      ap(body, lw);
+      customs.forEach(function (c, i) {
+        var row = mk("div", "");
+        row.style.cssText = "display:flex;align-items:flex-start;gap:6px;padding:6px 8px;" +
+          "background:var(--secondary);border-radius:8px;margin-bottom:4px;border:1px solid var(--border);";
+        ap(lw, row);
+        var t = mk("div", "", c);
+        t.style.cssText = "flex:1;font-size:11px;color:var(--foreground);line-height:1.4;";
+        ap(row, t);
+        var useBtn = mkBtn("Use", null, function () { ta.value = c; });
+        useBtn.classList.add("rwa-btn-sm"); ap(row, useBtn);
+        ap(row, iconBtn(ICON.trash, "rwa-dng", function () {
+          customs.splice(i, 1); saveX(); ov.remove(); showCustom();
+        }, "Delete prompt"));
+      });
+    }
+
+    var ft = ap(body, mk("div", "rwa-foot"));
+    ap(ft, mkBtn("Run", "rwa-accept", function () {
+      var v = ta.value.trim();
+      if (!v) return;
+      if (customs.indexOf(v) === -1) {
+        customs.unshift(v);
+        if (customs.length > 8) customs.length = 8;
+        saveX();
+      }
+      ov.remove();
+      doRewrite({ id: "custom", name: "Custom", order: -1, prompt: v });
+    })).style.flex = "1";
+    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+  }
+
+  // ── Auto-profile ──────────────────────────────────────────────────────────
+  function generateAutoProfile(chatId, cb) {
+    marinara.apiFetch("/chats/" + chatId)
+      .then(function (chat) {
+        var ids = [];
+        try { ids = typeof chat.characterIds === "string" ? JSON.parse(chat.characterIds) : chat.characterIds || []; } catch (e) {}
+        if (!ids.length) { if (cb) cb(); return; }
+        return marinara.apiFetch("/characters/" + ids[0]).then(function (char) {
+          var data = {};
+          try { data = typeof char.data === "string" ? JSON.parse(char.data) : char.data || {}; } catch (e) {}
+          var personality = (data.personality || char.personality || "").slice(0, 200);
+          if (!personality) { if (cb) cb(); return; }
+          var desc = "Name: " + (data.name || char.name || "Unknown") + ". Personality: " + personality;
+          return runInference(
+            'Output ONLY a valid JSON object (no fences) with "name" (1-3 words, e.g. the character name + \'s Voice\') and "prompt" (an instruction to rewrite text matching this specific character\'s voice and personality).',
+            "Character: " + desc
+          ).then(function (resp) {
+            if (!resp || !resp.result) return;
+            var raw = resp.result.trim().replace(/^```(?:json)?|```$/gm, "").trim();
+            var d = JSON.parse(raw);
+            if (d.name && d.prompt) {
+              autoProfs[chatId] = { id: "auto-" + chatId, name: d.name, prompt: d.prompt, order: -1 };
+              saveA();
+            }
+          });
+        });
+      })
+      .catch(function () {})
+      .then(function () { if (cb) cb(); });
+  }
+
+  function watchForChatSwitch() {
+    // getChatId() reads the `marinara-active-chat-id` localStorage key, which
+    // Marinara updates on every switch. A MutationObserver here is brittle —
+    // it depends on guessing the sidebar element and on the switch mutating its
+    // subtree. Poll the id instead; it's cheap and selector-independent.
+    // ponytail: 1.5s poll, fine for a per-switch trigger; no event to hook.
+    var lastCid = getChatId();
+    marinara.setInterval(function () {
+      var newCid = getChatId();
+      if (!newCid || newCid === lastCid) return;
+      lastCid = newCid;
+      if (!cfg.autoProfileEnabled) return;
+      if (autoProfs[newCid]) return;
+      generateAutoProfile(newCid, null);
+    }, 1500);
+  }
+  watchForChatSwitch();
+
+  // ── Settings ──────────────────────────────────────────────────────────────
+  function exportProfiles() {
+    var data = { type: "rwa-profiles-export", version: 1, profiles: profiles, config: cfg, customs: customs };
+    var json = JSON.stringify(data, null, 2);
+    var blob = new Blob([json], { type: "application/json" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url; a.download = "rewrite-assistant-profiles.json"; a.click();
+    URL.revokeObjectURL(url);
+    showToast(null, "Profiles exported!", "ok");
+  }
+
+  function importProfiles(render) {
+    var inp = mk("input", "");
+    inp.type = "file"; inp.accept = ".json"; inp.style.cssText = "display:none;";
+    document.body.appendChild(inp);
+    inp.addEventListener("change", function () {
+      var file = inp.files && inp.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function (ev) {
+        try {
+          var data = JSON.parse(ev.target.result);
+          if (data.type !== "rwa-profiles-export") { showToast(null, "Not a valid export file."); return; }
+          if (Array.isArray(data.profiles)) { profiles = data.profiles; saveP(); }
+          if (data.config) { Object.keys(data.config).forEach(function (k) { if (cfg.hasOwnProperty(k)) cfg[k] = data.config[k]; }); saveC(); }
+          if (Array.isArray(data.customs)) { customs = data.customs; saveX(); }
+          showToast(null, "Profiles imported!", "ok");
+          render();
+        } catch (e) { showToast(null, "Import failed: invalid JSON."); }
+      };
+      reader.readAsText(file);
+      inp.remove();
+    });
+    inp.click();
+  }
+
+  function showSettings() {
+    hideTip();
+    var ov  = mkOv(10001);
+    var win = ap(ov, mk("div", "rwa-win"));
+    win.style.width = "680px";
+
+    function row(parent, label, ctrl) {
+      var r = mk("div", "rwa-setting-row");
+      ap(parent, r);
+      ap(r, mk("span", "", label));
+      ap(r, ctrl);
+    }
+    function ck(val, fn) {
+      var wrap = mk("label", "rwa-toggle-wrap");
+      var c = mk("input", "");
+      c.type = "checkbox"; c.checked = !!val;
+      c.style.cssText = "opacity:0;width:0;height:0;position:absolute;";
+      var sl = mk("span", "rwa-toggle-sl");
+      wrap.appendChild(c); wrap.appendChild(sl);
+      c.addEventListener("change", fn);
+      return wrap;
+    }
+
+    var active = "profiles";
+    function render() {
+      win.innerHTML = "";
+      ap(win, mk("div", "rwa-bar"));
+      var hdr = ap(win, mk("div", "rwa-hdr"));
+      var ht = ap(hdr, mk("div", ""));
+      ap(ht, mk("div", "rwa-title", "Rewrite Assistant"));
+      ap(ht, mk("div", "rwa-subtitle", "Settings"));
+      ap(hdr, xBtn(function () { ov.remove(); }));
+
+      var split = ap(win, mk("div", "rwa-split"));
+      var nav   = ap(split, mk("div", "rwa-nav"));
+      var pane  = ap(split, mk("div", "rwa-pane"));
+
+      function paneHead(p, title, desc) {
+        ap(p, mk("div", "rwa-pane-title", title));
+        if (desc) ap(p, mk("div", "rwa-pane-desc", desc));
+      }
+
+      var SECTIONS = [
+        ["profiles", "Profiles", secProfiles],
+        ["connection", "Connection", secConnection],
+        ["behaviour", "Behaviour", secBehaviour],
+        ["context", "Context", secContext],
+        ["autoprofile", "Auto-Profile", secAutoProfile],
+        ["characters", "Characters", secCharacters],
+        ["history", "History", secHistory],
+        ["backup", "Backup & Reset", secBackup]
+      ];
+      SECTIONS.forEach(function (s) {
+        var it = ap(nav, mk("div", "rwa-nav-item" + (s[0] === active ? " rwa-nav-active" : ""), s[1]));
+        it.addEventListener("click", function () { active = s[0]; render(); });
+      });
+      var cur = SECTIONS.filter(function (s) { return s[0] === active; })[0] || SECTIONS[0];
+      cur[2](pane);
+
+      ap(win, mk("div", "rwa-foot-note", "Alt+R on selected text opens the popup."));
+
+      function secProfiles(pane) {
+        var titleRow = mk("div", "");
+        titleRow.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:4px;";
+        ap(pane, titleRow);
+        var ttl  = ap(titleRow, mk("div", "rwa-pane-title", "Profiles"));
+        ttl.style.marginBottom = "0";
+        var cnt = ap(ttl, mk("span", "", " · " + profiles.length));
+        cnt.style.cssText = "color:var(--muted-foreground);font-weight:400;";
+        var acts = ap(titleRow, mk("div", ""));
+        acts.style.cssText = "display:flex;gap:6px;flex-shrink:0;";
+        ap(acts, actBtn(ICON.plus, "Add style", null, function () { showEdit(null, -1, render); }));
+        ap(acts, actBtn(ICON.spark, "AI architect", "rwa-accept", function () { showAI(render); }));
+        ap(pane, mk("div", "rwa-pane-desc", "Drag to reorder — sets the popup button order."));
+
+        profiles.slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); }).forEach(function (pr) {
+          var ri   = profiles.indexOf(pr);
+          var item = mk("div", "rwa-item");
+          item.setAttribute("draggable", "true");
+          ap(pane, item);
+          var hnd = ap(item, mk("span", "rwa-hnd")); hnd.innerHTML = svgEl(ICON.grip, 14);
+          ap(item, mk("span", "rwa-dot")).style.background = pr.color || "var(--primary)";
+          var inf = mk("div", "");
+          inf.style.cssText = "flex:1;min-width:0;";
+          ap(item, inf);
+          var nm = ap(inf, mk("div", "", pr.name));
+          nm.style.cssText = "font-weight:600;font-size:12px;color:var(--foreground);";
+          var pp = ap(inf, mk("div", "", pr.prompt));
+          pp.style.cssText = "font-size:10px;color:var(--muted-foreground);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+          ap(item, iconBtn(ICON.edit, null, function () { showEdit(pr, ri, render); }, "Edit " + pr.name));
+          ap(item, iconBtn(ICON.trash, "rwa-dng", function () {
+            if (confirm('Delete "' + pr.name + '"?')) { profiles.splice(ri, 1); saveP(); render(); }
+          }, "Delete " + pr.name));
+
+          item.addEventListener("dragstart", function () { dragId = pr.id; item.classList.add("rwa-drag"); });
+          item.addEventListener("dragend", function () {
+            item.classList.remove("rwa-drag");
+            pane.querySelectorAll(".rwa-item").forEach(function (x) { x.classList.remove("rwa-over"); });
+          });
+          item.addEventListener("dragover",  function (e) { e.preventDefault(); item.classList.add("rwa-over"); });
+          item.addEventListener("dragleave", function ()  { item.classList.remove("rwa-over"); });
+          item.addEventListener("drop", function (e) {
+            e.preventDefault(); item.classList.remove("rwa-over");
+            if (!dragId || dragId === pr.id) return;
+            var src = profiles.find(function (x) { return x.id === dragId; });
+            if (!src) return;
+            var tmp = src.order || 0; src.order = pr.order || 0; pr.order = tmp;
+            saveP(); render();
+          });
+        });
+      }
+
+      function secConnection(pane) {
+        var db = pane;
+        paneHead(pane, "Connection", "Where rewrites are generated. Direct API skips the Marinara sidecar, so Ollama won’t load a second model.");
+        var modeRow = mk("div", "rwa-setting-row");
+        ap(db, modeRow);
+        ap(modeRow, mk("span", "", "Model source:"));
+        var modeSel = mk("select", "rwa-sel");
+        [["sidecar", "Local Sidecar (default)"], ["direct", "Direct API (Ollama / llama.cpp)"]].forEach(function (opt) {
+          var o = mk("option", "", opt[1]); o.value = opt[0];
+          if ((cfg.connMode || "sidecar") === opt[0]) o.selected = true;
+          modeSel.appendChild(o);
+        });
+        ap(modeRow, modeSel);
+
+        // Direct-mode fields (URL, model, key, temp) — shown only when relevant.
+        var direct = mk("div", "");
+        ap(db, direct);
+        function txtRow(label, cfgKey, placeholder) {
+          var ti = mk("input", "rwa-inp"); ti.type = "text"; ti.placeholder = placeholder || "";
+          ti.value = cfg[cfgKey] || ""; ti.style.cssText = "flex:1;margin:0;padding:6px 10px;font-size:12px;";
+          ti.addEventListener("change", function () { cfg[cfgKey] = ti.value.trim(); saveC(); });
+          row(direct, label, ti);
+        }
+        txtRow("API URL:", "apiUrl", "http://127.0.0.1:11434/v1");
+        txtRow("Model name:", "apiModel", "llama3.1");
+        txtRow("API key (optional):", "apiKey", "leave blank for local");
+        var tr = mk("input", "rwa-inp"); tr.type = "number"; tr.min = "0"; tr.max = "2"; tr.step = "0.1";
+        tr.value = String(cfg.directTemp != null ? cfg.directTemp : 0.7);
+        tr.style.cssText = "width:64px;margin:0;padding:6px 10px;font-size:12px;";
+        tr.addEventListener("change", function () { cfg.directTemp = Math.max(0, Math.min(2, parseFloat(tr.value) || 0.7)); saveC(); });
+        row(direct, "Temperature:", tr);
+
+        var testWrap = mk("div", ""); testWrap.style.cssText = "margin-top:8px;";
+        ap(direct, testWrap);
+        var testStatus = mk("div", ""); testStatus.style.cssText = "font-size:11px;margin-top:6px;line-height:1.5;color:var(--muted-foreground);";
+        ap(testWrap, mkBtn("Test connection", null, function () {
+          testStatus.textContent = "Testing…"; testStatus.style.color = "var(--muted-foreground)";
+          runInference("You are a test.", "Reply with the single word: ok").then(function (resp) {
+            if (resp && resp.error) { testStatus.textContent = "✗ " + resp.error; testStatus.style.color = "var(--destructive, #ef4444)"; }
+            else { testStatus.textContent = "✓ Connected. Model replied: " + ((resp && resp.result) || "").slice(0, 60); testStatus.style.color = "var(--primary)"; }
+          });
+        }));
+        ap(testWrap, testStatus);
+
+        var note = mk("div", "", "Direct mode skips the Marinara sidecar, so Ollama doesn't load a second model. Ollama needs OLLAMA_ORIGINS=* set (env var) so the browser can reach it.");
+        note.style.cssText = "font-size:10px;color:var(--muted-foreground);margin-top:10px;line-height:1.5;";
+        ap(direct, note);
+
+        function syncMode() { direct.style.display = (cfg.connMode === "direct") ? "" : "none"; }
+        modeSel.addEventListener("change", function () { cfg.connMode = modeSel.value; saveC(); syncMode(); });
+        syncMode();
+
+        // Debug logging (applies to both modes)
+        var dbgSep = mk("div", "rwa-sep"); ap(db, dbgSep);
+        row(db, "Debug logging:", ck(cfg.debugEnabled, function (e) { cfg.debugEnabled = e.target.checked; saveC(); }));
+        var dbgBtns = mk("div", ""); dbgBtns.style.cssText = "display:flex;gap:8px;margin-top:2px;";
+        ap(db, dbgBtns);
+        ap(dbgBtns, mkBtn("Download log", null, downloadDebug)).style.flex = "1";
+        ap(dbgBtns, mkBtn("Clear", "rwa-dng", function () { dbg.length = 0; saveDbg(); showToast(null, "Debug log cleared", "ok"); })).style.flex = "0 0 auto";
+        var dbgNote = mk("div", "", "Captures the exact prompt sent and the raw model reply (last 100 events). “Download log” writes ME-rewrite-debug.json to your Downloads folder; also at window.__rwaDebug in the console.");
+        dbgNote.style.cssText = "font-size:10px;color:var(--muted-foreground);margin-top:8px;line-height:1.5;";
+        ap(db, dbgNote);
+      }
+
+      function secBehaviour(pane) {
+        var db = pane;
+        paneHead(pane, "Behaviour", "How the popup looks and applies rewrites.");
+        row(db, "Include character card in prompt:", ck(cfg.useCharCard, function (e) { cfg.useCharCard = e.target.checked; saveC(); }));
+        row(db, "Typewriter reveal on result:",      ck(cfg.typewriter,  function (e) { cfg.typewriter  = e.target.checked; saveC(); }));
+        row(db, "Show word diff in result:",         ck(cfg.showDiff,    function (e) { cfg.showDiff    = e.target.checked; saveC(); }));
+        row(db, "Auto-apply (skip preview modal):",  ck(cfg.autoApply,   function (e) { cfg.autoApply   = e.target.checked; saveC(); }));
+        row(db, "Leave editor open (save manually):",  ck(cfg.reviewBeforeApply, function (e) { cfg.reviewBeforeApply = e.target.checked; saveC(); }));
+        row(db, "Compact buttons:",                   ck(cfg.compact,    function (e) { cfg.compact     = e.target.checked; saveC(); }));
+        row(db, "Merge multi-message rewrites:",       ck(cfg.mergeMultiMsg, function (e) { cfg.mergeMultiMsg = e.target.checked; saveC(); }));
+        var mergeWarn = mk("div", "", "⚠ When a selection spans multiple messages, merge them into ONE rewrite (better cross-message flow), then split the result back by markers and insert each piece. The model can move or drop the split markers — especially small local models — or restructure the text; if the split isn't clean it falls back to rewriting each message separately. Best for structure-preserving edits (Grammar, Different Words); riskier for heavy transforms (Expand, Compress). Default off rewrites each message on its own.");
+        mergeWarn.style.cssText = "font-size:10px;color:var(--muted-foreground);margin:-2px 0 8px;line-height:1.5;";
+        ap(db, mergeWarn);
+        var posRow = mk("div", "rwa-setting-row");
+        ap(db, posRow);
+        ap(posRow, mk("span", "", "Popup position:"));
+        var posSel = mk("select", "rwa-sel");
+        [["auto","Auto"],["above","Above"],["below","Below"]].forEach(function (opt) {
+          var o = mk("option", "", opt[1]); o.value = opt[0];
+          if ((cfg.popupPos || "auto") === opt[0]) o.selected = true;
+          posSel.appendChild(o);
+        });
+        posSel.addEventListener("change", function () { cfg.popupPos = posSel.value; saveC(); });
+        ap(posRow, posSel);
+        function numRow(label, cfgKey, min, max) {
+          var ni = mk("input", "rwa-inp"); ni.type = "number"; ni.min = String(min); ni.max = String(max);
+          ni.value = String(cfg[cfgKey] !== undefined ? cfg[cfgKey] : min);
+          ni.style.cssText = "width:56px;margin:0;padding:6px 10px;font-size:12px;";
+          ni.addEventListener("change", function () { cfg[cfgKey] = Math.max(min, Math.min(max, parseInt(ni.value, 10) || min)); saveC(); });
+          row(db, label, ni);
+        }
+        numRow("Columns:", "cols", 1, 4);
+        numRow("Rows:", "rows", 1, 12);
+        numRow("Undo depth:", "historyDepth", 1, 20);
+      }
+
+      function secContext(pane) {
+        var db = pane;
+        paneHead(pane, "Context", "Extra reference the model sees alongside your selection.");
+        row(db, "Surrounding text:", ck(cfg.localContextEnabled, function (e) { cfg.localContextEnabled = e.target.checked; saveC(); }));
+        var wn = mk("input", "rwa-inp"); wn.type = "number"; wn.min = "50"; wn.max = "400";
+        wn.value = String(cfg.localContextWords || 150); wn.style.cssText = "width:56px;margin:0;padding:6px 10px;font-size:12px;";
+        wn.addEventListener("change", function () { cfg.localContextWords = Math.max(50, Math.min(400, parseInt(wn.value, 10) || 150)); saveC(); });
+        row(db, "Words per side:", wn);
+        row(db, "Lorebook entries:", ck(cfg.useLorebookEntries, function (e) { cfg.useLorebookEntries = e.target.checked; saveC(); }));
+        row(db, "Previous messages:", ck(cfg.usePrevMessages, function (e) { cfg.usePrevMessages = e.target.checked; saveC(); }));
+        var pn = mk("input", "rwa-inp"); pn.type = "number"; pn.min = "1"; pn.max = "4";
+        pn.value = String(cfg.prevMessageCount || 2); pn.style.cssText = "width:56px;margin:0;padding:6px 10px;font-size:12px;";
+        pn.addEventListener("change", function () { cfg.prevMessageCount = Math.max(1, Math.min(4, parseInt(pn.value, 10) || 2)); saveC(); });
+        row(db, "Msg count:", pn);
+      }
+
+      function secAutoProfile(pane) {
+        var db = pane;
+        paneHead(pane, "Auto-Profile", "Generate a character-voice profile automatically when you switch chats.");
+        var apInfo = mk("div", "", "Generates a character-voice profile when you switch chats. Each switch sends one model request.");
+        apInfo.style.cssText = "font-size:11px;color:var(--muted-foreground);margin-bottom:8px;line-height:1.5;";
+        ap(db, apInfo);
+        row(db, "Enable on chat switch:", ck(cfg.autoProfileEnabled, function (e) { cfg.autoProfileEnabled = e.target.checked; saveC(); }));
+        Object.keys(autoProfs).forEach(function (cid) {
+          var ap2 = autoProfs[cid];
+          var apRow = mk("div", "rwa-card");
+          ap(db, apRow);
+          var apIc = ap(apRow, mk("span", ""));
+          apIc.style.cssText = "color:var(--primary);display:inline-flex;flex-shrink:0;";
+          apIc.innerHTML = svgEl(ICON.spark, 13);
+          var apName = ap(apRow, mk("span", "", ap2.name));
+          apName.style.cssText = "flex:1;font-size:11px;color:var(--foreground);";
+          ap(apRow, iconBtn(ICON.trash, "rwa-dng", function () { delete autoProfs[cid]; saveA(); render(); }, "Remove " + ap2.name));
+        });
+      }
+
+      function secCharacters(pane) {
+        var db = pane;
+        paneHead(pane, "Characters", "Pick which character cards inform the rewrite voice.");
+        var hint = mk("div", "", "Leave all unchecked to use chat’s characters.");
+        hint.style.cssText = "font-size:10px;color:var(--muted-foreground);margin-bottom:6px;";
+        ap(db, hint);
+        var charListWrap = mk("div", "rwa-char-list");
+        ap(db, charListWrap);
+        if (_charListCache) { renderCharList(charListWrap, _charListCache); }
+        else {
+          var charLoadEl = ap(charListWrap, mk("div", "", "Loading…"));
+          charLoadEl.style.cssText = "font-size:10px;color:var(--muted-foreground);padding:2px 0;";
+          marinara.apiFetch("/characters").then(function (chars) {
+            _charListCache = chars; charListWrap.innerHTML = ""; renderCharList(charListWrap, chars);
+          }).catch(function () { charListWrap.innerHTML = ""; ap(charListWrap, mk("div", "", "Failed to load.")).style.cssText = "font-size:10px;color:var(--destructive);"; });
+        }
+      }
+
+      function secHistory(pane) {
+        var db = pane;
+        paneHead(pane, "History", "Recent rewrites you can undo from the popup.");
+        if (!hist.length) {
+          var nh = mk("div", "", "No rewrites yet.");
+          nh.style.cssText = "font-size:11px;color:var(--muted-foreground);"; ap(db, nh);
+        } else {
+          hist.forEach(function (h, i) {
+            var hi = ap(db, mk("div", "rwa-hist"));
+            ap(hi, mk("div", "rwa-badge", i === 0 ? "Most Recent" : "Previous"));
+            var pv = mk("div", "", (h.old || "").slice(0, 80) + (h.old && h.old.length > 80 ? "…" : ""));
+            pv.style.cssText = "font-size:11px;color:var(--foreground);"; ap(hi, pv);
+            if (h.when) { var wt = mk("div", "", new Date(h.when).toLocaleTimeString()); wt.style.cssText = "font-size:9px;color:var(--muted-foreground);margin-top:2px;"; ap(hi, wt); }
+          });
+        }
+      }
+
+      function secBackup(pane) {
+        var db = pane;
+        paneHead(pane, "Backup & Reset", "Move profiles and settings between instances, or restore defaults.");
+        var hint = mk("div", "", "Export saves profiles, settings, and custom prompts. Import merges from a previous export.");
+        hint.style.cssText = "font-size:11px;color:var(--muted-foreground);margin-bottom:10px;line-height:1.5;";
+        ap(db, hint);
+        var btnRow = mk("div", ""); btnRow.style.cssText = "display:flex;gap:8px;";
+        ap(db, btnRow);
+        ap(btnRow, mkBtn("Export", "rwa-accept", function () { exportProfiles(); })).style.flex = "1";
+        ap(btnRow, mkBtn("Import", null, function () { importProfiles(render); })).style.flex = "1";
+
+        ap(db, mk("div", "rwa-sep"));
+        ap(db, mkBtn("Reset all to defaults", "rwa-dng", function () {
+          if (confirm("Reset all profiles and settings to defaults?")) {
+            profiles = DEF_PROFILES.slice();
+            cfg = (function () { var m = {}; Object.keys(DEF_CFG).forEach(function (k) { m[k] = DEF_CFG[k]; }); return m; })();
+            hist = []; customs = []; autoProfs = {};
+            saveP(); saveC(); saveH(); saveX(); saveA(); render();
+          }
+        })).style.width = "100%";
+      }
+    }
+    render();
+  }
+
+  function renderCharList(wrap, chars) {
+    if (!Array.isArray(chars) || !chars.length) {
+      ap(wrap, mk("div", "", "No characters found.")).style.cssText = "font-size:10px;color:var(--muted-foreground);";
+      return;
+    }
+    chars.slice().sort(function (a, b) {
+      var na = "", nb = "";
+      try { na = (typeof a.data === "string" ? JSON.parse(a.data) : a.data || {}).name || a.name || ""; } catch(e) {}
+      try { nb = (typeof b.data === "string" ? JSON.parse(b.data) : b.data || {}).name || b.name || ""; } catch(e) {}
+      return na.localeCompare(nb);
+    }).forEach(function (char) {
+      var data = {};
+      try { data = typeof char.data === "string" ? JSON.parse(char.data) : char.data || {}; } catch (e) {}
+      var name = data.name || char.name || char.id;
+      var charRow = mk("div", "");
+      charRow.style.cssText = "display:flex;align-items:center;gap:8px;padding:4px 4px;border-radius:4px;cursor:pointer;";
+      charRow.addEventListener("mouseenter", function () { charRow.style.background = "var(--accent)"; });
+      charRow.addEventListener("mouseleave", function () { charRow.style.background = ""; });
+      var cb = mk("input", "");
+      cb.type = "checkbox";
+      cb.checked = (cfg.charCardIds || []).indexOf(char.id) !== -1;
+      cb.style.cssText = "width:14px;height:14px;accent-color:var(--primary);cursor:pointer;flex-shrink:0;";
+      ap(charRow, cb);
+      var lbl = ap(charRow, mk("span", "", name));
+      lbl.style.cssText = "font-size:11px;color:var(--foreground);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+      cb.addEventListener("change", function () {
+        var ids = (cfg.charCardIds || []).slice();
+        if (cb.checked) { if (ids.indexOf(char.id) === -1) ids.push(char.id); }
+        else { ids = ids.filter(function (x) { return x !== char.id; }); }
+        cfg.charCardIds = ids;
+        saveC();
+      });
+      charRow.addEventListener("click", function (e) {
+        if (e.target !== cb) { cb.checked = !cb.checked; cb.dispatchEvent(new Event("change")); }
+      });
+      ap(wrap, charRow);
+    });
+  }
+
+  // ── Edit profile ──────────────────────────────────────────────────────────
+  function showEdit(profile, idx, onDone) {
+    var ov   = mkOv(10002);
+    var body = mkWin(ov, "400px", (profile ? "Edit" : "New") + " Style");
+
+    ap(body, mk("div", "rwa-lbl", "Name"));
+    var ni = mk("input", "rwa-inp");
+    ni.placeholder = "e.g. Pirate Speak";
+    ni.value = profile ? profile.name : "";
+    ap(body, ni);
+
+    ap(body, mk("div", "rwa-lbl", "Instruction"));
+    var pi = mk("textarea", "rwa-inp");
+    pi.placeholder = "Rewrite the following text...";
+    pi.style.cssText = "height:110px;resize:vertical;";
+    pi.value = profile ? profile.prompt : "";
+    ap(body, pi);
+
+    ap(body, mk("div", "rwa-lbl", "Accent colour (optional)"));
+    var colorRow = mk("div", "");
+    colorRow.style.cssText = "display:flex;align-items:center;gap:10px;margin-bottom:10px;";
+    ap(body, colorRow);
+    var ci = mk("input", "");
+    ci.type = "color";
+    var _defPri = getComputedStyle(document.documentElement).getPropertyValue("--primary").trim() || "#b57edc";
+        ci.value = (profile && profile.color) ? profile.color : _defPri;
+    ci.style.cssText = "width:40px;height:28px;padding:2px;cursor:pointer;border:none;background:none;border-radius:4px;";
+    ap(colorRow, ci);
+    var colorHint = mk("span", "", "Theme accent = default");
+    colorHint.style.cssText = "font-size:10px;color:var(--muted-foreground);";
+    ap(colorRow, colorHint);
+    var resetColor = mkBtn("Reset", null, function () { ci.value = getComputedStyle(document.documentElement).getPropertyValue("--primary").trim() || "#b57edc"; });
+    resetColor.classList.add("rwa-btn-sm");
+    ap(colorRow, resetColor);
+
+    var ft = ap(body, mk("div", "rwa-foot"));
+    ap(ft, mkBtn("Save", "rwa-accept", function () {
+      var n = ni.value.trim(), p = pi.value.trim();
+      if (!n || !p) return;
+      var chosenColor = ci.value !== (getComputedStyle(document.documentElement).getPropertyValue("--primary").trim() || "#b57edc") ? ci.value : null;
+      var e = {
+        id:     profile ? profile.id : Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        name:   n,
+        prompt: p,
+        order:  profile ? (profile.order || 0) : profiles.length,
+        color:  chosenColor,
+      };
+      if (idx >= 0) profiles[idx] = e; else profiles.push(e);
+      saveP(); ov.remove(); onDone();
+    })).style.flex = "1";
+    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+  }
+
+  // ── AI Architect ──────────────────────────────────────────────────────────
+  function showAI(onDone) {
+    var ov   = mkOv(10002);
+    var body = mkWin(ov, "440px", "\u2728 AI Prompt Architect");
+    var info = mk("div", "", "Describe the rewrite style. The AI will generate a name and instruction prompt.");
+    info.style.cssText = "font-size:12px;color:var(--muted-foreground);margin-bottom:12px;line-height:1.5;";
+    ap(body, info);
+    var ta = mk("textarea", "rwa-inp");
+    ta.placeholder = 'e.g. "A grumpy old sailor with a thick accent"';
+    ta.style.cssText = "height:75px;resize:none;";
+    ap(body, ta);
+    var st = mk("div", "");
+    st.style.cssText = "font-size:11px;color:var(--muted-foreground);min-height:16px;margin-bottom:8px;";
+    ap(body, st);
+    var ft = ap(body, mk("div", "rwa-foot"));
+    var gb = ap(ft, mkBtn("Generate", "rwa-accept", function () {
+      var d = ta.value.trim();
+      if (!d) return;
+      gb.disabled = true; gb.textContent = "Thinking\u2026"; st.textContent = "";
+      runInference(
+        'Output ONLY valid JSON (no fences) with keys "name" (1-3 words) and "prompt" (starts with "Rewrite the following text").',
+        "Create a rewrite style for: " + d
+      )
+        .then(function (resp) {
+          if (resp && resp.error) throw new Error(resp.error);
+          if (!resp || !resp.result) throw new Error("Empty response from AI");
+          var data = JSON.parse(resp.result.trim().replace(/^```(?:json)?|```$/gm, "").trim());
+          if (!data.name || !data.prompt) throw new Error("AI response missing 'name' or 'prompt' keys");
+          profiles.push({
+            id: Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+            name: data.name, prompt: data.prompt, order: profiles.length
+          });
+          saveP(); ov.remove(); onDone();
+        })
+        .catch(function (e) {
+          st.textContent = "Failed: " + (e && e.message ? e.message : String(e));
+          gb.disabled = false; gb.textContent = "Retry";
+        });
+    }));
+    gb.style.flex = "1";
+    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+  }
+
+  // ── Selection listeners ───────────────────────────────────────────────────
+  // A rewrite can only splice into ONE message, but a drag can cross message
+  // boundaries (and grouped messages render as several elements sharing one id).
+  // Clamp the selection to the anchor message's element block so we never try to
+  // locate cross-message text in a single stored message.
+  function selectionTextInMessage(range, mid) {
+    var segs = document.querySelectorAll('[data-message-id="' + mid + '"]');
+    if (!segs.length) return range.toString().trim();
+    // Clamp to the rendered content blocks, not the message element — the
+    // element also wraps the author/timestamp header, which isn't in stored
+    // content and would break the splice match.
+    var contents = [];
+    for (var i = 0; i < segs.length; i++) {
+      var cs = segs[i].querySelectorAll(".mari-message-content");
+      for (var j = 0; j < cs.length; j++) contents.push(cs[j]);
+    }
+    var startEl = contents.length ? contents[0] : segs[0];
+    var endEl = contents.length ? contents[contents.length - 1] : segs[segs.length - 1];
+    try {
+      var bound = document.createRange();
+      bound.setStartBefore(startEl);
+      bound.setEndAfter(endEl);
+      var clamped = range.cloneRange();
+      if (range.compareBoundaryPoints(Range.START_TO_START, bound) < 0) {
+        clamped.setStart(bound.startContainer, bound.startOffset);
+      }
+      if (range.compareBoundaryPoints(Range.END_TO_END, bound) > 0) {
+        clamped.setEnd(bound.endContainer, bound.endOffset);
+      }
+      return clamped.toString().trim();
+    } catch (e) {
+      return range.toString().trim();
+    }
+  }
+
+  // A single Marinara turn can render as SEVERAL message bubbles, each its own
+  // stored message. Collect one {mid, text} per message the selection touches,
+  // in document order, so a cross-message drag becomes a list to rewrite in turn.
+  function collectSelectionSegments(range) {
+    var idEls = document.querySelectorAll("[data-message-id]");
+    var order = [], seen = {};
+    for (var i = 0; i < idEls.length; i++) {
+      var el = idEls[i];
+      try { if (!range.intersectsNode(el)) continue; } catch (e) { continue; }
+      var mid = el.getAttribute("data-message-id");
+      if (seen[mid]) continue;
+      seen[mid] = 1; order.push(mid);
+    }
+    var segs = [];
+    for (var k = 0; k < order.length; k++) {
+      var t = selectionTextInMessage(range, order[k]);
+      if (t && t.length >= 2) segs.push({ mid: order[k], text: t });
+    }
+    return segs;
+  }
+
+  marinara.on(document, "mouseup", function (e) {
+    if (e.target && !document.body.contains(e.target)) return;
+    if (popup && popup.contains(e.target)) return;
+    var ov = document.querySelector(".rwa-ov");
+    if (ov && ov.contains(e.target)) return;
+
+    marinara.setTimeout(function () {
+      var s   = window.getSelection();
+      var txt = s ? s.toString().trim() : "";
+      if (!txt || txt.length < 2) { killPopup(); return; }
+      var msgEl = e.target && e.target.closest ? e.target.closest("[data-message-id]") : null;
+      if (!msgEl) { killPopup(); return; }
+      try {
+        var range = s.getRangeAt(0);
+        var segs = collectSelectionSegments(range);
+        if (!segs.length) { killPopup(); return; }
+        showPopup(range.getBoundingClientRect(), segs);
+      } catch (err) {}
+    }, 150);
+  });
+
+  marinara.on(document, "keydown", function (e) {
+    if (!e.altKey || (e.key !== "r" && e.key !== "R")) return;
+    var s = window.getSelection(), txt = s ? s.toString().trim() : "";
+    if (!txt || txt.length < 2) return;
+    try {
+      var range = s.getRangeAt(0);
+      var sn    = range.startContainer;
+      var node  = sn.nodeType === 3 ? sn.parentElement : sn;
+      if (!node || !node.closest("[data-message-id]")) return;
+      var segs = collectSelectionSegments(range);
+      if (segs.length) showPopup(range.getBoundingClientRect(), segs);
+    } catch (err) {}
+  });
+
+  // ── Cleanup registration ──────────────────────────────────────────────────
+  marinara.onCleanup(function () {
+    if (popup) { popup.remove(); popup = null; }
+    if (_tip) { _tip.remove(); _tip = null; }
+    document.querySelectorAll(".rwa-ov").forEach(function (el) { el.remove(); });
+  });
+})(marinara);
+

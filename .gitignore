@@ -1,0 +1,7 @@
+# Personal debug export (may contain prompt/reply data)
+ME-rewrite-debug.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+node_modules/
