@@ -51,4 +51,24 @@ for (let i = 0; i < 250; i++) push({ i });
 assert.equal(dbg.length, 100);
 assert.equal(dbg[0].i, 150);          // oldest dropped, newest kept
 assert.equal(dbg[99].i, 249);
+// ── Drift guards: the shipped source must still contain the fixes ──
+import { readFileSync as _rf } from "node:fs";
+const _SRC = _rf(new URL("./extension.js", import.meta.url), "utf8");
+assert.ok(_SRC.includes('(msg.content || "")'), "drift: null-guard on msg.content missing");
+assert.ok(!/data\.config = cfg\b/.test(_SRC), "drift: export assigns raw cfg (apiKey leak)");
+assert.ok(_SRC.includes("found = true"), "drift: found-flag commit gating missing");
+assert.ok(_SRC.includes("seqOk"), "drift: merge marker ordering (seqOk) missing");
+assert.ok(/normOrig\.length \* 1\.5/.test(_SRC), "drift: anchor 1.5x over-replace cap missing");
+// Phase 1-5 drift guards
+assert.ok(_SRC.includes("function nthIndexOf"), "drift: nthIndexOf missing");
+assert.ok(_SRC.includes("function doRedo"), "drift: doRedo missing");
+assert.ok(_SRC.includes('connMode === "extender"'), "drift: extender branch missing");
+assert.ok(_SRC.includes("_autoInFlight"), "drift: _autoInFlight guard missing");
+assert.ok(_SRC.includes('"u"'), "drift: u-flag (surrogate safety) on match regex missing");
+assert.ok(_SRC.includes("selectionOccurrence"), "drift: selectionOccurrence missing");
+assert.ok(_SRC.includes("fetchExtenderMemory"), "drift: fetchExtenderMemory missing");
+assert.ok(_SRC.includes("fetchSpeakerNote"), "drift: fetchSpeakerNote missing");
+const _LOADER = _rf(new URL("./loader.js", import.meta.url), "utf8");
+assert.ok(_LOADER.includes("allowRemote"), "drift: loader.js allowRemote gate missing");
+console.log("drift-guard assertions passed");
 console.log("selfcheck: debug-buffer assertions passed");

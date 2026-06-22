@@ -1,4 +1,4 @@
-// Rewrite Assistant v4 — Marinara Engine Extension (UI Overhaul)
+// Rewrite Assistant v4.1 — Marinara Engine Extension (UI Overhaul)
 (function (marinara) {
   "use strict";
 
@@ -7,6 +7,7 @@
   var K_PROF  = NS + "-p";
   var K_CFG   = NS + "-c";
   var K_HIST  = NS + "-h";
+  var K_REDO  = NS + "-r";
   var K_CUST  = NS + "-x";
   var K_AUTO  = NS + "-a";
   var K_DBG   = NS + "-dbg";
@@ -18,6 +19,8 @@
       if (!_quotaWarned) { _quotaWarned = true; showToast(null, "Storage full \u2014 changes may not persist"); }
     }
   }
+  function loadArr(k, def) { var v = load(k); return Array.isArray(v) ? v : def; }
+  function loadObj(k, def) { var v = load(k); return (v && typeof v === "object" && !Array.isArray(v)) ? v : def; }
 
   // Prompts are terse, imperative operations. Shared rules (preserve POV, tense,
   // facts, voice; output only the rewrite) live in the system prompt, so each
@@ -39,18 +42,26 @@
     { id: "grammar",     name: "Grammar Fix",           order: 12, prompt: "Fix only grammar, spelling, and punctuation. Do not change wording, style, or content." },
   ];
 
-  var profiles = load(K_PROF) || DEF_PROFILES;
+  var profiles = loadArr(K_PROF, DEF_PROFILES);
 
   var DEF_CFG = {
     cols: 2, rows: 8, typewriter: false, useCharCard: false, showDiff: false,
     lengthEnabled: false, lengthPct: 0, autoApply: false, popupPos: "auto",
-    historyDepth: 5, compact: false,
+    historyDepth: 5,
     localContextEnabled: false, localContextWords: 150,
     useLorebookEntries: false, usePrevMessages: false, prevMessageCount: 2,
     charCardIds: [], reviewBeforeApply: false, useUserPersona: false,
-    // Connection: "sidecar" (Marinara local sidecar) or "direct" (OpenAI-compatible
-    // endpoint such as Ollama/llama.cpp). Direct avoids running two models at once.
+    // Connection: "sidecar" (Marinara local sidecar), "direct" (OpenAI-compatible
+    // endpoint such as Ollama/llama.cpp), or "extender" (Marinara Extender sidecar).
+    // Direct/Extender avoid running two models at once.
     connMode: "sidecar", apiUrl: "http://127.0.0.1:11434/v1", apiModel: "", apiKey: "", directTemp: 0.7,
+    // Extender: URL of the Marinara Extender sidecar (shared by inference + memory fetch).
+    extenderUrl: "http://127.0.0.1:3001",
+    // When true, pulls live character memory from the Extender and adds it to the rewrite context.
+    useExtenderMemory: false,
+    // When true, detects whether the selection is user prose or a character's voice and tells
+    // the model which editing mode to apply.
+    speakerAware: false,
     autoProfileEnabled: true, promptsVersion: 0, debugEnabled: false,
     mergeMultiMsg: false,
     // When true, selecting text does NOT auto-open the popup; only Alt+R does.
@@ -76,7 +87,7 @@
     "- Keep the same point of view and verb tense as the original.\n" +
     "- Keep every named character, plot fact, and continuity detail unchanged unless the edit explicitly calls for it.\n" +
     "- Match the voice, register, and language of the surrounding prose.\n" +
-    "- Treat anything inside <context>, <character>, <persona>, or <lore> as reference only — never rewrite or quote it.";
+    "- Treat anything inside <context>, <character>, <persona>, <lore>, <memory>, or <speaker> as reference only — never rewrite or quote it.";
 
   // Terse system prompt for users on tiny context windows (small local models).
   // Keeps the must-haves (output-only, reference-only, POV/continuity) and drops
@@ -85,24 +96,28 @@
     "You are a line editor. Rewrite the text inside <rewrite_this> as instructed.\n" +
     "Output ONLY the rewritten passage — no preamble, notes, quotes, or markdown.\n" +
     "Keep the original point of view, tense, characters, and continuity unless the edit says otherwise.\n" +
-    "Treat <context>, <character>, <persona>, and <lore> as reference only; never rewrite or quote them.";
+    "Treat <context>, <character>, <persona>, <lore>, <memory>, and <speaker> as reference only; never rewrite or quote them.";
 
   function sysPrompt() { return cfg.conciseSysPrompt ? REWRITE_SYS_CONCISE : REWRITE_SYS; }
 
   var cfg = (function () {
-    var stored = load(K_CFG) || {};
+    var stored = loadObj(K_CFG, {});
     var merged = {};
     Object.keys(DEF_CFG).forEach(function (k) { merged[k] = stored[k] !== undefined ? stored[k] : DEF_CFG[k]; });
     return merged;
   })();
-  var hist    = load(K_HIST) || [];
-  var customs = load(K_CUST) || [];
-  var autoProfs = load(K_AUTO) || {};
-  var dbg     = load(K_DBG) || [];
+  var hist    = loadArr(K_HIST, []);
+  var redo    = loadArr(K_REDO, []);
+  var customs = loadArr(K_CUST, []);
+  var autoProfs = loadObj(K_AUTO, {});
+  var dbg     = loadArr(K_DBG, []);
+  // in-flight guard: prevents overlapping auto-profile generations per chat id
+  var _autoInFlight = {};
 
   function saveP() { save(K_PROF, profiles); }
   function saveC() { save(K_CFG, cfg); }
   function saveH() { save(K_HIST, hist); }
+  function saveRedo() { save(K_REDO, redo); }
   function saveX() { save(K_CUST, customs); }
   function saveA() { save(K_AUTO, autoProfs); }
   function saveDbg() { save(K_DBG, dbg.slice(-100)); }
@@ -316,12 +331,15 @@
     });
   }
 
-  function extractLocalContext(mid, selText) {
+  // N12: added `occ` param (0-based occurrence index) so repeated phrases use the
+  // correct instance. Falls back to indexOf if nthIndexOf misses. Pass 0 if unknown.
+  function extractLocalContext(mid, selText, occ) {
     var msgEl = document.querySelector('[data-message-id="' + mid + '"]');
     if (!msgEl) return "";
     var fullText = (msgEl.textContent || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
     var normSel  = selText.trim();
-    var idx      = fullText.indexOf(normSel);
+    var idx      = nthIndexOf(fullText, normSel, occ || 0);
+    if (idx === -1) idx = fullText.indexOf(normSel); // fallback to first occurrence
     var words    = Math.max(20, Math.min(400, cfg.localContextWords || 150));
 
     var allMsgs = Array.from(document.querySelectorAll("[data-message-id]"));
@@ -350,7 +368,140 @@
     return parts.length ? "\n\n<context note=\"Surrounding prose — reference only, do not rewrite.\">\n" + parts.join("\n\n") + "\n</context>" : "";
   }
 
-  function wc(s) { return s.trim().split(/\s+/).filter(Boolean).length; }
+  // ── Marinara Extender: character-memory fetch ─────────────────────────────
+  // Fetches live character memory from the Extender sidecar's /api/memory-block
+  // endpoint, or falls back to lorebook entries tagged "marinara extender".
+  // Returns a fenced <memory> string (or "" if nothing found / feature disabled).
+
+  var _extenderLbCache = null; // { ids: {id:true,...}, ts: number } lorebook ID cache
+
+  function extractMemoryContent(block) {
+    if (!block || typeof block !== "string") return "";
+    // Prefer the <memory>…</memory> section after a blank line
+    var idx = block.indexOf("\n\n<memory>");
+    var mem = idx === -1 ? "" : block.slice(idx + 2).trim();
+    if (!mem) { var m = block.match(/<memory>[\s\S]*<\/memory>/i); mem = m ? m[0] : ""; }
+    return mem.replace(/^<memory>\s*/i, "").replace(/\s*<\/memory>$/i, "").trim();
+  }
+
+  function fenceMemory(inner) {
+    return inner
+      ? "\n\n<memory note=\"Character & world memory — reference only, do not rewrite.\">\n" + inner + "\n</memory>"
+      : "";
+  }
+
+  function fetchExtenderLorebookIds() {
+    // Cache for 60 s so repeated rewrite calls within a session avoid re-fetching.
+    if (_extenderLbCache && Date.now() - _extenderLbCache.ts < 60000) {
+      return Promise.resolve(_extenderLbCache.ids);
+    }
+    return marinara.apiFetch("/lorebooks").then(function (resp) {
+      var list = Array.isArray(resp) ? resp : ((resp && (resp.lorebooks || resp.data)) || []);
+      var ids = {};
+      list.forEach(function (lb) {
+        var name = (lb && (lb.name || (lb.data && lb.data.name))) || "";
+        if (typeof name === "string" && name.trim().toLowerCase().indexOf("marinara extender") === 0) {
+          ids[String(lb.id)] = true;
+        }
+      });
+      _extenderLbCache = { ids: ids, ts: Date.now() };
+      return ids;
+    }).catch(function () { return {}; });
+  }
+
+  function rawScan(cid) {
+    // Fetch all lorebook entries for the chat so the fallback can filter.
+    return marinara.apiFetch("/lorebook-entries?chatId=" + encodeURIComponent(cid || ""))
+      .then(function (resp) {
+        return Array.isArray(resp) ? resp : ((resp && (resp.entries || resp.data)) || []);
+      }).catch(function () { return []; });
+  }
+
+  function fetchExtenderMemoryViaScan(cid) {
+    return Promise.all([rawScan(cid), fetchExtenderLorebookIds()]).then(function (r) {
+      var entries = r[0], extIds = r[1];
+      var mem = entries.filter(function (e) {
+        return extIds[String(e.lorebookId)] && !/instruction/i.test(String(e.name || ""));
+      }).map(function (e) {
+        var c = String(e.content || "");
+        return extractMemoryContent(c) || c.trim();
+      }).filter(Boolean).join("\n\n");
+      return fenceMemory(mem);
+    }).catch(function () { return ""; });
+  }
+
+  function getFirstCharacterId(cid) {
+    return marinara.apiFetch("/chats/" + encodeURIComponent(cid || ""))
+      .then(function (resp) {
+        // Marinara chat object shape: characters array or characterId field
+        var chars = resp && (resp.characters || resp.characterIds);
+        if (Array.isArray(chars) && chars.length) return String(chars[0].id || chars[0]);
+        return (resp && resp.characterId) ? String(resp.characterId) : "";
+      }).catch(function () { return ""; });
+  }
+
+  function fetchExtenderMemory(cid) {
+    if (!cfg.useExtenderMemory || !cid) return Promise.resolve("");
+    var base = (cfg.extenderUrl || "").trim().replace(/\/+$/, "");
+    if (!base) {
+      // No Extender URL — fall back to lorebook scan immediately
+      return fetchExtenderMemoryViaScan(cid);
+    }
+    return getFirstCharacterId(cid).then(function (charId) {
+      if (!charId) return fetchExtenderMemoryViaScan(cid);
+      var ctrl = new AbortController();
+      var to = setTimeout(function () { ctrl.abort(); }, 4000);
+      var url = base + "/api/memory-block?characterId=" + encodeURIComponent(charId) + "&chatId=" + encodeURIComponent(cid);
+      return fetch(url, { signal: ctrl.signal })
+        .then(function (res) { return res.ok ? res.json() : null; })
+        .then(function (j) {
+          clearTimeout(to);
+          var inner = j ? extractMemoryContent(j.memoryBlock || "") : "";
+          if (inner) { logDbg("extender.memory.source", { via: "api" }); return fenceMemory(inner); }
+          return fetchExtenderMemoryViaScan(cid);
+        })
+        .catch(function () {
+          clearTimeout(to);
+          logDbg("extender.memory.source", { via: "scan-fallback" });
+          return fetchExtenderMemoryViaScan(cid);
+        });
+    });
+  }
+
+  // ── Speaker-aware editing ─────────────────────────────────────────────────
+  // Detects whether the selected passage is the user's own prose or a character's
+  // voice, and injects a <speaker> note so the model edits in the right register.
+  var SPEAKER_USER =
+    "\n\n<speaker note=\"reference only\">\nThis passage is the author's/user's own narration or input, not a story character's speech. Edit it as the author's prose. Do not answer in a character's voice, adopt a persona or pronouns, or add roleplay or commentary.\n</speaker>";
+  var SPEAKER_CHAR =
+    "\n\n<speaker note=\"reference only\">\nThis passage is written in the responding character's voice. Preserve that character's voice, register, and language; do not switch to the author's or editor's voice.\n</speaker>";
+
+  function fetchSpeakerNote(cid, mid) {
+    if (!cfg.speakerAware || !cid || !mid) return Promise.resolve("");
+    return cachedMessages(cid).then(function (msgs) {
+      if (!Array.isArray(msgs)) return "";
+      var role = "";
+      for (var i = 0; i < msgs.length; i++) {
+        if (msgs[i].id === mid) { role = (msgs[i].role || "").toLowerCase(); break; }
+      }
+      if (role === "user") return SPEAKER_USER;
+      return role ? SPEAKER_CHAR : "";
+    }).catch(function () { return ""; });
+  }
+
+  function wc(s) {
+    var words = s.trim().split(/\s+/).filter(Boolean);
+    // ponytail: light CJK/no-space heuristic — if whitespace-delimited word count
+    // is suspiciously low relative to character length, estimate chars/2 instead.
+    if (words.length < 3 && s.trim().length > 10) return Math.ceil(s.trim().length / 2);
+    return words.length;
+  }
+  // Index of the n-th (0-based) non-overlapping occurrence of needle in haystack, or -1.
+  function nthIndexOf(hay, needle, n) {
+    var idx = hay.indexOf(needle);
+    for (var k = 0; k < n && idx !== -1; k++) idx = hay.indexOf(needle, idx + needle.length);
+    return idx;
+  }
   function wcDiff(a, b) {
     var d = wc(b) - wc(a), p = wc(a) ? Math.round((d / wc(a)) * 100) : 0;
     return (d >= 0 ? "+" : "") + d + " words (" + (p >= 0 ? "+" : "") + p + "%)";
@@ -430,6 +581,7 @@
     edit:  '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
     trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
     undo:  '<path d="M9 14 4 9l5-5"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/>',
+    redo:  '<path d="m15 14 5-5-5-5"/><path d="M4 20v-7a4 4 0 0 1 4-4h12"/>',
     gear:  '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
     spark: '<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/>',
     plus:  '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
@@ -437,6 +589,8 @@
     grip:  '<path d="M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01"/>',
     chevron: '<polyline points="18 15 12 9 6 15"/>',
     pin:   '<line x1="12" y1="17" x2="12" y2="22"/><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6z"/>',
+    eye:   '<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/>',
+    eyeoff:'<path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><path d="M6.61 6.61A18.5 18.5 0 0 0 1 12s4 8 11 8a9.12 9.12 0 0 0 5.39-1.61"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>',
   };
   function svgEl(paths, size) {
     var s = size || 16;
@@ -463,6 +617,7 @@
   var dragId = null;
   var _twCancel = null;
   var _movingPopup = false;  // set during a corner-grabber drag to suppress dismiss
+  var _dragCleanup = null;   // N11: cleanup fn to remove drag listeners on killPopup
   var _ctxOff = {};          // per-popup overrides: context sources excluded via the dots
 
   // ── Styles ────────────────────────────────────────────────────────────────
@@ -489,13 +644,15 @@
     ".rwa-auto{display:flex;align-items:center;gap:6px;width:100%;background:color-mix(in srgb,var(--primary) 12%,transparent);border:1px solid color-mix(in srgb,var(--primary) 32%,transparent);border-radius:8px;padding:8px 12px;color:var(--primary);font:600 11.5px/1 inherit;cursor:pointer;text-align:left;overflow:hidden;transition:background .12s;}" +
     ".rwa-auto:hover{background:color-mix(in srgb,var(--primary) 18%,transparent);}" +
     ".rwa-auto svg{width:14px;height:14px;flex-shrink:0;}" +
-    ".rwa-btn{background:var(--secondary);border:1px solid var(--border);color:var(--foreground);padding:6px 12px;" +
+    ".rwa-btn{display:inline-flex;align-items:center;justify-content:center;height:26px;box-sizing:border-box;" +
+    "background:var(--secondary);border:1px solid var(--border);color:var(--foreground);padding:0 12px;" +
     "border-radius:8px;font:600 11px/1 inherit;cursor:pointer;white-space:nowrap;" +
     "transition:all .15s;}" +
+    ".rwa-sq{width:26px;padding:0;flex:0 0 auto;color:var(--muted-foreground);}" +
     ".rwa-btn:hover{background:var(--accent);border-color:var(--primary);}" +
     ".rwa-btn:disabled{opacity:.35;cursor:not-allowed;}" +
     ".rwa-btn svg{width:15px;height:15px;display:block;}" +
-    ".rwa-btn-sm{padding:5px 10px;font-size:11px;display:inline-flex;align-items:center;gap:5px;line-height:1;}" +
+    ".rwa-btn-sm{height:26px;padding:0 10px;font-size:11px;display:inline-flex;align-items:center;gap:5px;line-height:1;}" +
     ".rwa-btn-sm svg{width:13px;height:13px;}" +
     ".rwa-accept{background:var(--primary)!important;color:var(--primary-foreground)!important;border-color:transparent!important;font-weight:600;}" +
     ".rwa-accept:hover{filter:brightness(1.1);}" +
@@ -510,7 +667,9 @@
     "border-top:1px solid var(--border);margin-top:0;transition:opacity .15s;}" +
     ".rwa-slider-lbl{font-size:9px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;" +
     "color:var(--muted-foreground);white-space:nowrap;}" +
-    ".rwa-slider-val{font-size:10px;font-weight:700;color:var(--primary);min-width:38px;text-align:right;}" +
+    ".rwa-slider-val{font-size:10px;font-weight:700;color:var(--primary);min-width:38px;text-align:right;cursor:text;}" +
+    ".rwa-len-inp{width:54px;font:700 10px/1 inherit;color:var(--primary);background:var(--secondary);border:1px solid var(--primary);border-radius:5px;padding:2px 4px;text-align:right;outline:none;-moz-appearance:textfield;box-sizing:border-box;}" +
+    ".rwa-len-inp::-webkit-inner-spin-button,.rwa-len-inp::-webkit-outer-spin-button{-webkit-appearance:none;margin:0;}" +
     ".rwa-range{flex:1;accent-color:var(--primary);cursor:pointer;height:3px;}" +
     ".rwa-toggle-wrap{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0;cursor:pointer;}" +
     ".rwa-toggle-wrap input{opacity:0;width:0;height:0;position:absolute;}" +
@@ -582,8 +741,14 @@
     "border-radius:8px;padding:8px 12px;margin-bottom:6px;}" +
     ".rwa-badge{display:inline-block;font-size:9px;font-weight:600;background:var(--primary);" +
     "color:var(--primary-foreground);padding:2px 8px;border-radius:999px;margin-bottom:4px;}" +
-    ".rwa-setting-row{display:flex;align-items:center;gap:12px;margin-bottom:10px;font-size:12px;color:var(--foreground);}" +
-    ".rwa-setting-row span{flex:1;}" +
+    ".rwa-setting-row{display:flex;align-items:center;gap:12px;margin-bottom:9px;font-size:12px;color:var(--foreground);}" +
+    ".rwa-setting-row>span{flex:1;}" +
+    ".rwa-row-lbl{flex:1;min-width:0;}" +
+    ".rwa-row-title{font-size:12px;color:var(--foreground);}" +
+    ".rwa-row-help{font-size:10px;color:var(--muted-foreground);line-height:1.4;margin-top:2px;}" +
+    ".rwa-dep{margin-left:13px;border-left:1px solid var(--border);padding-left:11px;}" +
+    ".rwa-grp{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted-foreground);margin:14px 0 9px;padding-top:13px;border-top:1px solid var(--border);}" +
+    ".rwa-grp-first{border-top:0;padding-top:0;margin-top:2px;}" +
     ".rwa-split{display:flex;height:440px;max-height:72vh;}" +
     ".rwa-nav{width:158px;flex-shrink:0;border-right:1px solid var(--border);padding:8px;display:flex;flex-direction:column;gap:4px;overflow-y:auto;}" +
     ".rwa-nav-item{padding:8px 12px;border-radius:8px;font-size:12.5px;color:var(--muted-foreground);cursor:pointer;user-select:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background .12s,color .12s;}" +
@@ -629,19 +794,22 @@
   function killPopup() {
     hideTip();
     if (_twCancel) { _twCancel(); _twCancel = null; }
+    if (_dragCleanup) { _dragCleanup(); _dragCleanup = null; } // N11: remove any in-flight drag listeners
     if (popup) { popup.remove(); popup = null; }
   }
 
   function showPopup(rect, segments) {
+    _movingPopup = false; // N11: defensive reset so a previous stuck drag doesn't swallow this selection
     killPopup();
     _ctxOff = {};
     var cid = getChatId();
-    // segments: [{mid, text}] in document order. sel.text/mid mirror the first
-    // segment so single-message helpers (Custom Prompt, undo) keep working.
+    // segments: [{mid, text, occ}] in document order. sel.text/mid/occ mirror the
+    // first segment so single-message helpers (Custom Prompt, undo) keep working.
     sel = {
       segments: segments,
       text: segments[0].text,
       mid: segments[0].mid,
+      occ: segments[0].occ || 0,
       cid: cid,
     };
 
@@ -649,7 +817,8 @@
     var rowCount  = Math.max(1, cfg.rows || 6);
     var estWidth  = Math.max(200, colCount * 115) + 20;
     var panelRows = 2 + (cfg.localContextEnabled ? 1 : 0) + (cfg.useUserPersona ? 1 : 0) +
-      (cfg.useCharCard ? 1 : 0) + (cfg.useLorebookEntries ? 1 : 0) + (cfg.usePrevMessages ? 1 : 0);
+      (cfg.useCharCard ? 1 : 0) + (cfg.useLorebookEntries ? 1 : 0) + (cfg.usePrevMessages ? 1 : 0) +
+      (cfg.useExtenderMemory ? 1 : 0);
     var estHeight = rowCount * 34 - 4 + 140 + (cfg.ctxCollapsed ? 0 : panelRows * 16);
 
     var lft = rect.left;
@@ -696,7 +865,7 @@
 
     // ── Context cost panel: selection (instant) + each enabled source (async,
     // cached). Empty dot = fetch pending; green dot = counted. Total updates live.
-    var partsToks = { sel: selTok, local: 0, persona: 0, card: 0, lore: 0, prev: 0 };
+    var partsToks = { sel: selTok, local: 0, persona: 0, card: 0, lore: 0, prev: 0, memory: 0 };
     var ctxPanel = ap(p, mk("div", "rwa-ctx"));
     ctxPanel.style.cssText = "padding:2px 12px 4px;font-size:10px;color:var(--muted-foreground);line-height:1.6;";
     function setCollapsed(on) {
@@ -750,12 +919,12 @@
       var t = partsToks.sel +
         (_ctxOff.local ? 0 : partsToks.local) + (_ctxOff.persona ? 0 : partsToks.persona) +
         (_ctxOff.card ? 0 : partsToks.card) + (_ctxOff.lore ? 0 : partsToks.lore) +
-        (_ctxOff.prev ? 0 : partsToks.prev);
+        (_ctxOff.prev ? 0 : partsToks.prev) + (_ctxOff.memory ? 0 : partsToks.memory);
       if (ctxRows.total) { ctxRows.total.val.textContent = "~" + t + " tok"; ctxRows.total.val.style.fontWeight = "700"; }
     }
     addCtxRow("sel", "Selected text", false); fillCtxRow("sel", partsToks.sel);
     if (cfg.localContextEnabled) {
-      partsToks.local = tokest(extractLocalContext(sel.mid, sel.text));
+      partsToks.local = tokest(extractLocalContext(sel.mid, sel.text, sel.occ)); // N12: pass occ
       addCtxRow("local", "Surrounding", false, "local"); fillCtxRow("local", partsToks.local);
     }
     var asyncSrc = [];
@@ -763,14 +932,36 @@
     if (cfg.useCharCard)        { addCtxRow("card", "Character", true, "card");        asyncSrc.push(["card", "card"]); }
     if (cfg.useLorebookEntries) { addCtxRow("lore", "Lorebook", true, "lore");         asyncSrc.push(["lore", "lore"]); }
     if (cfg.usePrevMessages)    { addCtxRow("prev", "Prev messages", true, "prev");    asyncSrc.push(["prev", "prev"]); }
-    addCtxRow("total", "Total", asyncSrc.length > 0); updateTotal();
+    // Memory row: async, independent of fetchContextParts (uses fetchExtenderMemory).
+    // Shown whenever cfg.useExtenderMemory is on — same gate as the rewrite path.
+    // Speaker note is a tiny constant hint (~20 tok) with no per-popup exclusion and
+    // no variable cost worth surfacing; it is not shown as a panel row.
+    var hasMemory = !!cfg.useExtenderMemory;
+    if (hasMemory) { addCtxRow("memory", "Extender memory", true, "memory"); }
+    addCtxRow("total", "Total", asyncSrc.length > 0 || hasMemory); updateTotal();
     if (asyncSrc.length && cid) {
+      var myPopup = popup; // N15: capture at call time; bail if a newer popup has replaced this one
       fetchContextParts(cid, sel.mid).then(function (parts) {
-        if (!popup) return;
+        if (!popup || popup !== myPopup) return; // stale fetch — popup was killed or replaced
         asyncSrc.forEach(function (s) { partsToks[s[0]] = tokest(parts[s[1]]); fillCtxRow(s[0], partsToks[s[0]]); });
-        if (ctxRows.total) { ctxRows.total.loaded = true; paintDot(ctxRows.total.dot, "on"); }
+        if (!hasMemory && ctxRows.total) { ctxRows.total.loaded = true; paintDot(ctxRows.total.dot, "on"); }
         updateTotal();
       }).catch(function () {});
+    }
+    if (hasMemory && cid) {
+      var myPopupMem = popup; // capture for staleness check
+      fetchExtenderMemory(cid).then(function (memText) {
+        if (!popup || popup !== myPopupMem) return;
+        partsToks.memory = tokest(memText);
+        fillCtxRow("memory", partsToks.memory);
+        if (ctxRows.total) { ctxRows.total.loaded = true; paintDot(ctxRows.total.dot, "on"); }
+        updateTotal();
+      }).catch(function () {
+        if (!popup || popup !== myPopupMem) return;
+        fillCtxRow("memory", 0);
+        if (ctxRows.total) { ctxRows.total.loaded = true; paintDot(ctxRows.total.dot, "on"); }
+        updateTotal();
+      });
     }
     setCollapsed(!!cfg.ctxCollapsed); // apply persisted collapse state + chevron icon
 
@@ -807,7 +998,7 @@
         sel.text = v;
         if (sel.segments && sel.segments[0]) sel.segments[0].text = v;
         partsToks.sel = tokest(v); fillCtxRow("sel", partsToks.sel);
-        if (cfg.localContextEnabled) { partsToks.local = tokest(extractLocalContext(sel.mid, v)); fillCtxRow("local", partsToks.local); }
+        if (cfg.localContextEnabled) { partsToks.local = tokest(extractLocalContext(sel.mid, v, sel.occ)); fillCtxRow("local", partsToks.local); } // N12: pass occ
         updateTotal();
         ov.remove();
         showToast(null, "Selection set to ~" + partsToks.sel + " tok", "ok");
@@ -833,9 +1024,8 @@
       p.insertBefore(ab, grid);
     }
 
-    profiles.slice().filter(function (pr) { return !pr.hidden; }).sort(function (a, b) { return (a.order || 0) - (b.order || 0); }).forEach(function (pr) {
-      var label = cfg.compact ? pr.name.slice(0, 2).toUpperCase() : pr.name;
-      var b = mk("button", "rwa-pb", label);
+    profiles.slice().filter(function (pr) { return !pr.hidden; }).sort(function (a, b) { return ((a.order || 0) - (b.order || 0)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0); }).forEach(function (pr) { // N18: stable tiebreaker by id
+      var b = mk("button", "rwa-pb", pr.name);
       b.addEventListener("mouseenter", function () { showTip(b, pr.name + ": " + pr.prompt + "  (instruction ~" + tokest(pr.prompt) + " tok)"); });
       b.addEventListener("mouseleave", hideTip);
       b.addEventListener("click", function (e) { e.stopPropagation(); hideTip(); doRewrite(pr); });
@@ -850,10 +1040,12 @@
     ap(slRow, togWrap);
     ap(slRow, mk("span", "rwa-slider-lbl", "LENGTH"));
     var range = mk("input", "rwa-range");
-    range.type = "range"; range.min = "-99"; range.max = "200";
+    range.type = "range"; range.min = "-99";
+    range.max = String(Math.max(200, cfg.lengthPct || 0));
     range.value = String(cfg.lengthPct || 0);
     ap(slRow, range);
     var valLbl = ap(slRow, mk("span", "rwa-slider-val", formatPct(cfg.lengthPct || 0)));
+    valLbl.title = "Click to type an exact percentage";
     function updateSlider() {
       var on = !!cfg.lengthEnabled;
       slRow.style.opacity = on ? "1" : "0.45";
@@ -865,6 +1057,34 @@
       valLbl.textContent = formatPct(cfg.lengthPct);
       saveC();
     });
+    // Click the readout to type an exact value (can exceed the slider's 200% range).
+    function commitLen(v) {
+      v = Math.max(-99, Math.min(1000, Math.round(isNaN(v) ? 0 : v)));
+      cfg.lengthPct = v;
+      if (v > parseInt(range.max, 10)) range.max = String(v);
+      range.value = String(v);
+      valLbl.textContent = formatPct(v);
+      saveC();
+    }
+    valLbl.addEventListener("click", function () {
+      if (!cfg.lengthEnabled) return;
+      var inp = mk("input", "rwa-len-inp");
+      inp.type = "number"; inp.min = "-99"; inp.max = "1000";
+      inp.value = String(cfg.lengthPct || 0);
+      slRow.replaceChild(inp, valLbl);
+      inp.focus(); inp.select();
+      var closed = false;
+      function done(apply) {
+        if (closed) return; closed = true;
+        if (apply) commitLen(parseInt(inp.value, 10));
+        if (inp.parentNode === slRow) slRow.replaceChild(valLbl, inp);
+      }
+      inp.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") { e.preventDefault(); done(true); }
+        else if (e.key === "Escape") { e.preventDefault(); done(false); }
+      });
+      inp.addEventListener("blur", function () { done(true); });
+    });
     togInp.addEventListener("change", function () {
       cfg.lengthEnabled = togInp.checked;
       saveC();
@@ -872,52 +1092,63 @@
     });
 
     var ft = ap(p, mk("div", "rwa-foot"));
-    var ub = mkBtn("", null, doUndo);
+    var ub = mkBtn("", "rwa-sq", doUndo);
     ub.innerHTML = svgEl(ICON.undo); ub.setAttribute("aria-label", "Undo last rewrite");
-    ub.style.cssText = "flex:0 0 auto;padding:6px 10px;color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;";
     if (!hist.length) ub.disabled = true;
     ap(ft, ub);
+    var rb2 = mkBtn("", "rwa-sq", doRedo);
+    rb2.innerHTML = svgEl(ICON.redo); rb2.setAttribute("aria-label", "Redo last undo");
+    if (!redo.length) rb2.disabled = true;
+    ap(ft, rb2);
     var single = segments.length === 1;
-    var tb = mkBtn("", null, function () { if (single) showTrim(); });
+    var tb = mkBtn("", "rwa-sq", function () { if (single) showTrim(); });
     tb.innerHTML = svgEl(ICON.edit);
     tb.setAttribute("aria-label", single ? "Trim selection before sending" : "Trim unavailable for multi-message selections");
     tb.title = single ? "Trim the selection before sending" : "Trimming works on single-message selections only — select within one message.";
-    tb.style.cssText = "flex:0 0 auto;padding:6px 10px;color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;" +
-      (single ? "" : "opacity:.4;cursor:not-allowed;");
+    if (!single) { tb.style.opacity = ".4"; tb.style.cursor = "not-allowed"; }
     ap(ft, tb);
     ap(ft, mkBtn("Custom prompt", null, showCustom)).style.flex = "1";
-    var pb2 = mkBtn("", null, function () {
+    var pb2 = mkBtn("", "rwa-sq", function () {
       cfg.pinnedPos = cfg.pinnedPos ? null : { left: p.style.left, top: p.style.top };
       saveC(); paintPin();
     });
     pb2.innerHTML = svgEl(ICON.pin);
     function paintPin() {
       var on = !!cfg.pinnedPos;
-      pb2.style.cssText = "flex:0 0 auto;padding:6px 10px;color:" + (on ? "var(--primary)" : "var(--muted-foreground)") + ";display:inline-flex;align-items:center;justify-content:center;";
+      pb2.style.color = on ? "var(--primary)" : "";
       pb2.setAttribute("aria-label", on ? "Unpin (popup follows your selection)" : "Pin popup to this spot");
       pb2.title = on ? "Pinned here — new selections open the popup at this spot. Click to unpin." : "Pin the popup to this spot.";
     }
     paintPin();
     ap(ft, pb2);
-    var gb = mkBtn("", null, showSettings);
+    var gb = mkBtn("", "rwa-sq", showSettings);
     gb.innerHTML = svgEl(ICON.gear); gb.setAttribute("aria-label", "Settings");
-    gb.style.cssText = "flex:0 0 auto;padding:6px 10px;color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;";
     ap(ft, gb);
 
     // Corner grabbers (bottom-left/right): drag to move the popup.
+    // N11 fix: (a) store handler refs and remove them in killPopup via _dragCleanup;
+    // (b) only set _movingPopup after actual movement so a grip click doesn't swallow
+    //     the next text selection; (c) showPopup resets _movingPopup defensively.
     function startDrag(e) {
       e.preventDefault(); e.stopPropagation();
       var sx = e.clientX, sy = e.clientY, r = p.getBoundingClientRect(), ox = r.left, oy = r.top;
+      var moved = false; // track whether the mouse actually moved
       function mv(ev) {
+        moved = true;
         var nx = Math.max(4, Math.min(ox + (ev.clientX - sx), window.innerWidth - p.offsetWidth - 4));
         var ny = Math.max(4, Math.min(oy + (ev.clientY - sy), window.innerHeight - p.offsetHeight - 4));
         p.style.left = nx + "px"; p.style.top = ny + "px";
       }
       function up() {
-        _movingPopup = true;
-        if (cfg.pinnedPos) { cfg.pinnedPos = { left: p.style.left, top: p.style.top }; saveC(); }
+        if (moved) _movingPopup = true; // only suppress selection if the grip was actually dragged
+        if (moved && cfg.pinnedPos) { cfg.pinnedPos = { left: p.style.left, top: p.style.top }; saveC(); }
         document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up, true);
+        _dragCleanup = null;
       }
+      // Store a cleanup fn so killPopup can remove these listeners even if up() never fires.
+      _dragCleanup = function () {
+        document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up, true);
+      };
       document.addEventListener("mousemove", mv);
       document.addEventListener("mouseup", up, true); // capture: runs before the selection handler
     }
@@ -1027,12 +1258,31 @@
     // Roleplay editor (ConversationMessage) renders the textarea inside the
     // message list, OUTSIDE the id node. Pick the message-list textarea that
     // isn't the composer (the composer has a placeholder; the editor doesn't).
+    // N6 fix: before returning the scroller fallback, verify the candidate
+    // textarea is a descendant of this message's DOM element (or that no other
+    // message's editor is open). If the textarea belongs to a different mid,
+    // return null so waitForTextarea keeps waiting for the correct editor to open
+    // rather than writing the new text into the wrong message.
     var scroller = document.querySelector(".mari-messages-scroll") ||
                    document.querySelector("[data-chat-scroll]");
     if (scroller) {
       var tas = scroller.querySelectorAll("textarea");
-      for (var i = 0; i < tas.length; i++) { if (!tas[i].placeholder) return tas[i]; }
-      if (tas.length) return tas[0];
+      for (var i = 0; i < tas.length; i++) {
+        var ta = tas[i];
+        if (ta.placeholder) continue; // skip the message composer
+        // Only accept this textarea if it is inside the element for `mid`, or if
+        // there is no [data-message-id] ancestor at all (some editors mount outside
+        // any message node). This prevents grabbing message N's still-closing
+        // editor when applying chained auto-apply to message N+1.
+        var ownerMsg = ta.closest ? ta.closest("[data-message-id]") : null;
+        if (ownerMsg && ownerMsg.getAttribute("data-message-id") !== mid) {
+          // Belongs to a different message — refuse it, keep waiting.
+          continue;
+        }
+        return ta;
+      }
+      // If every non-placeholder textarea belongs to a different mid, return null
+      // (do not fall through to the first textarea regardless of owner).
     }
     return null;
   }
@@ -1143,35 +1393,47 @@
   // ── Rewrite — opens generation modal ─────────────────────────────────────
   // ── Inference: route to local sidecar or a direct OpenAI-compatible endpoint ─
   // Resolves to { result: string } or { error: string } so callers stay identical.
-  function runInference(systemPrompt, userPrompt) {
-    var mode = cfg.connMode === "direct" ? "direct" : "sidecar";
+  function runInference(systemPrompt, userPrompt, signal) {
+    var mode = (cfg.connMode === "direct" || cfg.connMode === "extender") ? cfg.connMode : "sidecar";
     var started = Date.now();
     var p;
     if (mode === "sidecar") {
       logDbg("inference.request", { mode: mode, system: systemPrompt, user: userPrompt });
+      // apiFetch spreads options into the native fetch, so `signal` is honoured —
+      // cancelling aborts the sidecar request, not just the UI.
       p = marinara.apiFetch("/sidecar/tracker", {
         method: "POST",
         body: JSON.stringify({ systemPrompt: systemPrompt, userPrompt: userPrompt }),
+        signal: signal,
       });
     } else {
+      // Direct mode: OpenAI-compatible endpoint (Ollama, llama.cpp, etc.)
+      // Extender mode: Marinara Extender sidecar — same OpenAI-compatible protocol,
+      //   but uses cfg.extenderUrl, auto-appends /v1, sends no model/auth fields
+      //   (the Extender uses its own configured model).
+      var isExtender = (mode === "extender");
+      var rawBase = isExtender ? (cfg.extenderUrl || "http://127.0.0.1:3001") : (cfg.apiUrl || "");
       // Accept bare host, ".../v1", or a full ".../chat/completions" paste.
-      var base = (cfg.apiUrl || "").trim().replace(/\/+$/, "").replace(/\/chat\/completions$/, "");
-      if (!base) return Promise.resolve({ error: "No API URL set (Settings → Connection)." });
-      if (!cfg.apiModel) return Promise.resolve({ error: "No model name set (Settings → Connection)." });
+      var base = rawBase.trim().replace(/\/+$/, "").replace(/\/chat\/completions$/, "");
+      if (isExtender && !/\/v1$/.test(base)) base += "/v1";
+      if (!base) return Promise.resolve({ error: isExtender ? "No Extender URL set (Settings → Connection)." : "No API URL set (Settings → Connection)." });
+      if (!isExtender && !cfg.apiModel) return Promise.resolve({ error: "No model name set (Settings → Connection)." });
       var endpoint = base + "/chat/completions";
       var temp = typeof cfg.directTemp === "number" ? cfg.directTemp : 0.7;
-      logDbg("inference.request", { mode: mode, endpoint: endpoint, model: cfg.apiModel, temperature: temp, system: systemPrompt, user: userPrompt });
+      logDbg("inference.request", { mode: mode, endpoint: endpoint, model: isExtender ? "(extender)" : cfg.apiModel, temperature: temp, system: systemPrompt, user: userPrompt });
       var headers = { "Content-Type": "application/json" };
-      if (cfg.apiKey) headers["Authorization"] = "Bearer " + cfg.apiKey;
+      if (cfg.apiKey && !isExtender) headers["Authorization"] = "Bearer " + cfg.apiKey;
+      var reqBody = {
+        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+        temperature: temp,
+        stream: false,
+      };
+      if (!isExtender) reqBody.model = cfg.apiModel; // Extender uses its own configured model
       p = fetch(endpoint, {
         method: "POST",
         headers: headers,
-        body: JSON.stringify({
-          model: cfg.apiModel,
-          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
-          temperature: temp,
-          stream: false,
-        }),
+        body: JSON.stringify(reqBody),
+        signal: signal,
       })
         .then(function (r) {
           return r.json().catch(function () { return {}; }).then(function (j) { return { status: r.status, json: j }; });
@@ -1181,12 +1443,18 @@
           if (j.error) return { error: j.error.message || j.error.type || JSON.stringify(j.error) };
           if (!o.status || o.status >= 400) return { error: "HTTP " + o.status + " from endpoint." };
           var msg = j.choices && j.choices[0] && j.choices[0].message;
-          return { result: msg && typeof msg.content === "string" ? msg.content : "" };
+          return { result: msg && typeof msg.content === "string" ? (msg.content || "") : "" };
         })
         .catch(function (e) {
+          // A user-cancelled request rejects with an AbortError — that's not a
+          // failure to report, so swallow it as an explicit aborted outcome.
+          if ((signal && signal.aborted) || (e && e.name === "AbortError")) return { aborted: true };
           return {
-            error: "Direct API request failed: " + (e && e.message ? e.message : String(e)) +
-              "\n\nIf using Ollama, the browser is blocked by CORS — set OLLAMA_ORIGINS=* (env var) and restart Ollama.",
+            error: (isExtender ? "Extender request failed: " : "Direct API request failed: ") +
+              (e && e.message ? e.message : String(e)) +
+              (isExtender
+                ? "\n\nIs the Marinara Extender sidecar running? Check the Extender server URL in Settings → Connection."
+                : "\n\nIf using Ollama, the browser is blocked by CORS — set OLLAMA_ORIGINS=* (env var) and restart Ollama."),
           };
         });
     }
@@ -1198,6 +1466,14 @@
         result: resp && typeof resp.result === "string" ? resp.result : null,
       });
       return resp;
+    }).catch(function (e) {
+      // Sidecar mode aborts by rejecting the apiFetch promise. Treat a cancel as
+      // an aborted outcome; let genuine errors propagate to the caller's .catch.
+      if ((signal && signal.aborted) || (e && e.name === "AbortError")) {
+        logDbg("inference.aborted", { mode: mode, ms: Date.now() - started });
+        return { aborted: true };
+      }
+      throw e;
     });
   }
 
@@ -1237,14 +1513,16 @@
     // queue: { segments:[{mid,text}], index }. Built from sel on first call so a
     // multi-message selection is rewritten one message at a time.
     if (!queue) {
-      var segs = (sel.segments && sel.segments.length) ? sel.segments : [{ mid: sel.mid, text: sel.text }];
+      var segs = (sel.segments && sel.segments.length) ? sel.segments : [{ mid: sel.mid, text: sel.text, occ: sel.occ || 0 }];
       queue = { segments: segs, index: 0 };
     }
     var seg = queue.segments[queue.index];
     var total = queue.segments.length;
-    var savedSel = { text: seg.text, mid: seg.mid, cid: sel.cid };
+    var savedSel = { text: seg.text, mid: seg.mid, cid: sel.cid, occ: seg.occ || 0 };
     killPopup();
     if (!savedSel.cid) savedSel.cid = getChatId();
+
+    var controller = new AbortController();
 
     var ov   = mkOv(10002);
     var counter = total > 1 ? " (Msg " + (queue.index + 1) + "/" + total + ")" : "";
@@ -1269,17 +1547,25 @@
     ap(body, loadRow);
 
     var ft = ap(body, mk("div", "rwa-foot"));
-    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+    ap(ft, mkBtn("Cancel", null, function () { controller.abort(); ov.remove(); })).style.flex = "1";
 
-    var localCtx = (cfg.localContextEnabled && !_ctxOff.local) ? extractLocalContext(savedSel.mid, savedSel.text) : "";
+    var localCtx = (cfg.localContextEnabled && !_ctxOff.local) ? extractLocalContext(savedSel.mid, savedSel.text, savedSel.occ) : ""; // N12: pass occ
 
-    fetchContextParts(savedSel.cid, savedSel.mid)
-      .then(function (parts) {
+    // Extender memory and speaker note are fetched in parallel with context parts.
+    var memPromise = fetchExtenderMemory(savedSel.cid);
+    var speakerPromise = fetchSpeakerNote(savedSel.cid, savedSel.mid);
+
+    Promise.all([fetchContextParts(savedSel.cid, savedSel.mid), memPromise, speakerPromise])
+      .then(function (resolved) {
+        var parts = resolved[0];
         // Respect per-popup dot overrides — an excluded source is dropped here.
         var cardCtx = _ctxOff.card ? "" : parts.card;
         var loreCtx = _ctxOff.lore ? "" : parts.lore;
         var prevCtx = _ctxOff.prev ? "" : parts.prev;
         var personaCtx = _ctxOff.persona ? "" : parts.persona;
+        // Extender memory respects the memory-row exclusion dot (_ctxOff.memory).
+        var memCtx = _ctxOff.memory ? "" : resolved[1];
+        var speakerCtx = resolved[2];
         if (!ov.parentNode) return;
         var safeText = savedSel.text.length > 10000 ? savedSel.text.slice(0, 10000) + "\u2026" : savedSel.text;
 
@@ -1295,15 +1581,13 @@
             target + " words (range " + lo + "\u2013" + hi + ").";
         }
 
-        // Order matters: reference context first, then the operation, then the
-        // target span last and clearly fenced (research: small models lose the
-        // instruction when it sits above a wall of context).
-        var ctxBlock = (cardCtx + personaCtx + loreCtx + localCtx + prevCtx).replace(/^\n+/, "");
+        // Order: speaker first, then card -> memory -> persona -> lore -> local -> prev.
+        var ctxBlock = (speakerCtx + cardCtx + memCtx + personaCtx + loreCtx + localCtx + prevCtx).replace(/^\n+/, "");
         logDbg("rewrite.assemble", {
           profile: profile.name, profileId: profile.id, selChars: savedSel.text.length,
           lengthNote: lengthNote || null,
-          ctxChars: { character: cardCtx.length, persona: personaCtx.length, lore: loreCtx.length, surrounding: localCtx.length, prevMessages: prevCtx.length },
-          ctxEnabled: { charCard: !!cfg.useCharCard, userPersona: !!cfg.useUserPersona, lorebook: !!cfg.useLorebookEntries, surrounding: !!cfg.localContextEnabled, prevMessages: !!cfg.usePrevMessages },
+          ctxChars: { speaker: speakerCtx.length, character: cardCtx.length, memory: memCtx.length, persona: personaCtx.length, lore: loreCtx.length, surrounding: localCtx.length, prevMessages: prevCtx.length },
+          ctxEnabled: { charCard: !!cfg.useCharCard, userPersona: !!cfg.useUserPersona, lorebook: !!cfg.useLorebookEntries, surrounding: !!cfg.localContextEnabled, prevMessages: !!cfg.usePrevMessages, extenderMemory: !!cfg.useExtenderMemory, speakerAware: !!cfg.speakerAware },
         });
         var userPrompt =
           (ctxBlock ? ctxBlock + "\n\n" : "") +
@@ -1319,16 +1603,18 @@
         _lastCost = { sel: selTok, total: totalTok, prompt: Math.max(0, totalTok - selTok) };
         if (ov.parentNode) ap(body, costLine(_lastCost));
 
-        return runInference(sys, userPrompt);
+        return runInference(sys, userPrompt, controller.signal);
       })
       .then(function (resp) {
-        if (!resp || !ov.parentNode) return;
+        if (!resp || resp.aborted || !ov.parentNode) return;
         if (resp.error) {
           var hint = cfg.connMode === "direct"
             ? "Check Settings \u2192 Connection \u2014 API URL and model name must point to a running server."
+            : cfg.connMode === "extender"
+            ? "Check Settings \u2192 Connection \u2014 Extender server URL must point to a running Marinara Extender."
             : "Check Settings \u2192 AI Models \u2014 a local model must be loaded.";
           showModalErr(ov, body,
-            (cfg.connMode === "direct" ? "Direct API error: " : "Sidecar error: ") + resp.error +
+            (cfg.connMode === "direct" ? "Direct API error: " : cfg.connMode === "extender" ? "Extender error: " : "Sidecar error: ") + resp.error +
             "\n\n" + hint + "\n\nRaw: " +
             JSON.stringify(resp).slice(0, 300)
           );
@@ -1369,7 +1655,11 @@
   }
 
   // ── Merge mode: rewrite N message-spans as one, split back by markers ──────
+  // MERGE_MARK_RE: canonical pattern source only. Never use this shared instance
+  // directly in .split/.test/.exec — the `g` flag makes lastIndex stateful.
+  // Each call site must construct its own fresh RegExp (see markRe() below).
   var MERGE_MARK_RE = /\s*\[\[\s*SECTION\s*\d+\s*\]\]\s*/gi;
+  function markRe() { return new RegExp(MERGE_MARK_RE.source, MERGE_MARK_RE.flags); }
   function buildMergedText(segments) {
     var out = "";
     for (var i = 0; i < segments.length; i++) {
@@ -1380,6 +1670,7 @@
 
   function doMergeRewrite(profile, segments) {
     killPopup();
+    var controller = new AbortController();
     var cid = sel.cid || getChatId();
     var anchorMid = segments[0].mid;
     var merged = buildMergedText(segments);
@@ -1398,15 +1689,29 @@
     loadLbl.style.cssText = "font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted-foreground);margin-top:6px;text-align:center;";
     ap(loadRow, loadLbl); ap(body, loadRow);
     var ft = ap(body, mk("div", "rwa-foot"));
-    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+    ap(ft, mkBtn("Cancel", null, function () { controller.abort(); ov.remove(); })).style.flex = "1";
 
-    var cardPromise = cfg.useCharCard ? fetchCharCard(cid) : Promise.resolve("");
-    var lorePromise = cfg.useLorebookEntries ? fetchLorebookEntries(cid) : Promise.resolve("");
-    var prevPromise = fetchPrevMessages(cid, anchorMid);
+    // N5 fix: route merge context assembly through fetchContextParts (same path
+    // as doRewrite) so _ctxOff exclusions and persona/surrounding context are
+    // honoured. Previously merge fetched card/lore/prev independently and ignored
+    // _ctxOff entirely, so excluded sources were sent anyway. The [[SECTION n]]
+    // marker prompt logic below is unchanged — only context assembly changes.
+    var localCtxMerge = (cfg.localContextEnabled && !_ctxOff.local) ? extractLocalContext(anchorMid, segments[0].text, segments[0].occ || 0) : ""; // N12: pass occ
 
-    Promise.all([cardPromise, lorePromise, prevPromise])
-      .then(function (ctxResults) {
+    var memPromiseMerge = fetchExtenderMemory(cid);
+    var speakerPromiseMerge = fetchSpeakerNote(cid, anchorMid);
+
+    Promise.all([fetchContextParts(cid, anchorMid), memPromiseMerge, speakerPromiseMerge])
+      .then(function (mergedResolved) {
+        var ctxResults = mergedResolved[0];
         if (!ov.parentNode) return;
+        // Respect per-popup dot overrides — matches doRewrite's exclusion logic.
+        var cardCtxM    = _ctxOff.card    ? "" : ctxResults.card;
+        var loreCtxM    = _ctxOff.lore    ? "" : ctxResults.lore;
+        var prevCtxM    = _ctxOff.prev    ? "" : ctxResults.prev;
+        var personaCtxM = _ctxOff.persona ? "" : ctxResults.persona;
+        var memCtxM = _ctxOff.memory ? "" : mergedResolved[1];
+        var speakerCtxM = mergedResolved[2];
         var safeMerged = merged.length > 12000 ? merged.slice(0, 12000) + "…" : merged;
         var lengthNote = "";
         if (cfg.lengthEnabled && cfg.lengthPct !== 0) {
@@ -1415,7 +1720,8 @@
           var lo = Math.max(1, Math.round(target * 0.85)), hi = Math.round(target * 1.15);
           lengthNote = "\n\nLength: the original is " + ow + " words; rewrite to approximately " + target + " words (range " + lo + "–" + hi + ").";
         }
-        var ctxBlock = (ctxResults[0] + ctxResults[1] + ctxResults[2]).replace(/^\n+/, "");
+        // Order: speaker first, then card -> memory -> persona -> lore -> local -> prev.
+        var ctxBlock = (speakerCtxM + cardCtxM + memCtxM + personaCtxM + loreCtxM + localCtxMerge + prevCtxM).replace(/^\n+/, "");
         var markerNote = "\n\nThe passage contains " + (segments.length - 1) +
           " markers like [[SECTION 2]], [[SECTION 3]] that separate parts which belong to different messages. " +
           "Keep every [[SECTION n]] marker exactly as written, on its own line, in the same order. Do not add, remove, renumber, or move them.";
@@ -1425,16 +1731,25 @@
           "\n\nRewrite only the text inside <rewrite_this>, preserving the [[SECTION n]] markers. Output the rewritten passage and nothing else.\n" +
           "<rewrite_this>\n" + safeMerged + "\n</rewrite_this>";
         logDbg("rewrite.merge.request", { messages: segments.length, mergedChars: merged.length });
-        return runInference(sysPrompt() + "\n- Preserve any [[SECTION n]] markers exactly, on their own lines, in order.", userPrompt);
+        return runInference(sysPrompt() + "\n- Preserve any [[SECTION n]] markers exactly, on their own lines, in order.", userPrompt, controller.signal);
       })
       .then(function (resp) {
-        if (!resp || !ov.parentNode) return;
+        if (!resp || resp.aborted || !ov.parentNode) return;
         if (resp.error) { showModalErr(ov, body, "Error: " + resp.error); return; }
         var out = (typeof resp.result === "string" ? resp.result : "").trim();
         if (!out) { showModalErr(ov, body, "The AI returned an empty response."); return; }
-        var pieces = out.split(MERGE_MARK_RE).map(function (p) { return p.trim(); });
-        var clean = pieces.length === segments.length && pieces.every(function (p) { return p.length > 0; });
-        logDbg("rewrite.merge.split", { expected: segments.length, got: pieces.length, clean: clean });
+        var pieces = out.split(markRe()).map(function (p) { return p.trim(); });
+        // Verify the markers are not just the right COUNT but the right NUMBERS in
+        // order: buildMergedText emits [[SECTION 2]]..[[SECTION n]] between segments,
+        // so a correct rewrite has markers numbered exactly 2,3,...,segments.length.
+        // Right-count-but-wrong-position markers would otherwise commit to wrong msgs.
+        var markerNums = (out.match(markRe()) || []).map(function (mk) {
+          var d = mk.match(/\d+/); return d ? parseInt(d[0], 10) : NaN;
+        });
+        var seqOk = markerNums.length === segments.length - 1 &&
+          markerNums.every(function (n, i) { return n === i + 2; });
+        var clean = pieces.length === segments.length && pieces.every(function (p) { return p.length > 0; }) && seqOk;
+        logDbg("rewrite.merge.split", { expected: segments.length, got: pieces.length, seqOk: seqOk, clean: clean });
         if (clean) {
           showMergePreview(ov, body, profile, segments, pieces, cid);
         } else {
@@ -1453,6 +1768,12 @@
   function applyMerged(segments, pieces, cid, i, onDone) {
     if (i >= segments.length) { if (onDone) onDone(); return; }
     doCommit(pieces[i], { text: segments[i].text, mid: segments[i].mid, cid: cid }, function () {
+      // N8 fix: invalidate the message cache before recursing to the next segment.
+      // doCommit already invalidates after its own match, but in chained auto-apply
+      // the next call to doCommit may re-read the cached (pre-edit) content before
+      // Marinara's store update flushes. Invalidating here ensures each chained
+      // commit reads fresh data from the API rather than the stale cached baseline.
+      invalidateMsgCache();
       applyMerged(segments, pieces, cid, i + 1, onDone);
     });
   }
@@ -1558,6 +1879,9 @@
 
   // ── Typewriter reveal (with cancel) ───────────────────────────────────────
   function typewriterFill(el, text, onDone) {
+    // N16: cancel any prior in-flight reveal so overlapping result modals don't
+    // orphan their timer chains (one global slot means only the latest can run).
+    if (_twCancel) { _twCancel(); _twCancel = null; }
     var i = 0;
     var cancelled = false;
     var ids = [];
@@ -1604,58 +1928,73 @@
         }
 
         var normOrig    = savedSel.text.trim().replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-        var normContent = msg.content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        var normContent = (msg.content || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
         var updated = null;
+        var found = false;
 
-        var idx = normContent.indexOf(normOrig);
+        var occ = (savedSel && typeof savedSel.occ === "number") ? savedSel.occ : 0;
+        var idx = nthIndexOf(normContent, normOrig, occ);
+        if (idx === -1 && occ > 0) idx = normContent.indexOf(normOrig);
         if (idx !== -1) {
           updated = normContent.slice(0, idx) + newText + normContent.slice(idx + normOrig.length);
+          found = true;
         }
 
-        if (!updated) {
+        if (!found) {
           try {
             var flexPat = new RegExp(
-              normOrig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\n/g, "\\s{1,4}")
+              normOrig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\n/g, "\\s{1,4}"),
+              "u"
             );
             var m = normContent.match(flexPat);
             if (m && m.index !== undefined) {
               updated = normContent.slice(0, m.index) + newText + normContent.slice(m.index + m[0].length);
+              found = true;
             }
           } catch (e) {}
         }
 
-        if (!updated) {
+        if (!found) {
           var anchorWords = normOrig.trim().split(/\s+/).filter(Boolean);
           if (anchorWords.length >= 10) {
             var AN = 5;
             function trimPunct(w) { return w.replace(/^[^a-zA-Z\u00C0-\uFFFF]+|[^a-zA-Z\u00C0-\uFFFF]+$/g, ""); }
             function escAnchor(w) { return trimPunct(w).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-            var IW = "[^a-zA-Z\u00C0-\uFFFF]{1,40}";
+            var IW = "[^a-zA-Z\u00C0-\uFFFF]{1,16}"; // ponytail: cap separator backtracking (gap is [\s\S]{0,600}?, tighten per-separator cost)
             var head = anchorWords.slice(0, AN).map(escAnchor).filter(function (w) { return w.length >= 2; });
             var tail = anchorWords.slice(-AN).map(escAnchor).filter(function (w) { return w.length >= 2; });
             if (head.length >= 3 && tail.length >= 3) {
               try {
-                var anchorPat = new RegExp(head.join(IW) + ".{0,600}?" + tail.join(IW));
+                var anchorPat = new RegExp(head.join(IW) + "[\\s\\S]{0,600}?" + tail.join(IW), "u");
                 var m2 = normContent.match(anchorPat);
-                if (m2 && m2.index !== undefined) {
+                // Reject spans that balloon past ~1.5x the selection: on repetitive
+                // prose the lazy gap can run to a later recurrence of the tail words
+                // and replace far more than the user selected.
+                if (m2 && m2.index !== undefined && m2[0].length <= Math.max(40, normOrig.length * 1.5)) {
                   updated = normContent.slice(0, m2.index) + newText + normContent.slice(m2.index + m2[0].length);
+                  found = true;
                 }
               } catch (e) {}
             }
           }
         }
 
-        if (!updated) {
+        if (!found) {
           // Markdown-tolerant fallback: match the selection's words in order,
           // allowing any markdown/whitespace/punctuation between them. Handles
           // *emphasis*, line breaks, and DOM-vs-stored joining differences that
           // the exact/whitespace/anchor passes miss.
-          var fuzzyWords = normOrig.split(/[^A-Za-z0-9\u00c0-\uffff]+/).filter(Boolean);
-          if (fuzzyWords.length >= 2 && fuzzyWords.length <= 1500) {
+          var fuzzyWords = normOrig.split(/[^A-Za-z0-9\u00c0-\uffff]+/u).filter(Boolean);
+          // ponytail: cap word count (60) and the inter-word gap ({0,8}). This is
+          // the last-resort pass; an unbounded word count with {0,40} gaps could
+          // stall the tab on long selections that fail every earlier pass. Raise
+          // the caps only if real selections start missing.
+          if (fuzzyWords.length >= 2 && fuzzyWords.length <= 60) {
             try {
-              var SEP = "[^A-Za-z0-9\u00c0-\uffff]{0,40}";
+              var SEP = "[^A-Za-z0-9\u00c0-\uffff]{0,8}";
               var fuzzyPat = new RegExp(
-                fuzzyWords.map(function (w) { return w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }).join(SEP)
+                fuzzyWords.map(function (w) { return w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }).join(SEP),
+                "u"
               );
               var fm = normContent.match(fuzzyPat);
               if (fm && fm.index !== undefined) {
@@ -1664,15 +2003,20 @@
                 // just outside it. Absorb them so the replacement doesn't
                 // orphan a stray marker.
                 var fStart = fm.index, fEnd = fm.index + fm[0].length;
-                while (fStart > 0 && "*_~`".indexOf(normContent.charAt(fStart - 1)) !== -1) fStart--;
-                while (fEnd < normContent.length && "*_~`".indexOf(normContent.charAt(fEnd)) !== -1) fEnd++;
+                // Cap at 2 chars so a run like *** or ~~~ (thematic break) is
+                // never fully consumed; the longest real emphasis prefix is ** or __.
+                var _eMax = 2;
+                while (_eMax-- > 0 && fStart > 0 && "*_~`".indexOf(normContent.charAt(fStart - 1)) !== -1) fStart--;
+                _eMax = 2;
+                while (_eMax-- > 0 && fEnd < normContent.length && "*_~`".indexOf(normContent.charAt(fEnd)) !== -1) fEnd++;
                 updated = normContent.slice(0, fStart) + newText + normContent.slice(fEnd);
+                found = true;
               }
             } catch (e) {}
           }
         }
 
-        if (!updated) {
+        if (!found) {
           showErr(
             "Could not locate the selected text in the stored message.\n\n" +
             "This can happen when the selection spans formatting or list markers.\n" +
@@ -1685,8 +2029,10 @@
         invalidateMsgCache();
         prefillEditTextarea(mid, updated, function () {
           var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
-          hist.unshift({ mid: mid, cid: cid, old: msg.content, when: Date.now() });
+          hist.unshift({ mid: mid, cid: cid, old: msg.content, post: updated, when: Date.now() });
           if (hist.length > depth) hist.length = depth;
+          // A fresh rewrite invalidates the redo timeline.
+          if (redo.length) { redo.length = 0; saveRedo(); }
           saveH();
           if (onDone) onDone();
         });
@@ -1701,14 +2047,42 @@
   function doUndo() {
     if (!hist.length) return;
     var h = hist[0];
+    var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
     var ok = prefillEditTextarea(h.mid, h.old, function () {
       hist.shift();
+      saveH();
+      // Make the undone rewrite redoable (only if we captured its post-state).
+      if (h.post != null) { redo.unshift(h); if (redo.length > depth) redo.length = depth; saveRedo(); }
+      killPopup();
+    });
+    if (!ok) {
+      // Message isn't in the DOM (scrolled out of the virtualized list). Keep the
+      // entry — discarding it would lose the only copy of the pre-rewrite text
+      // without restoring anything.
+      showToast(null, "Can't undo — scroll to the message first, then retry");
+    }
+  }
+
+  // ── Redo ──────────────────────────────────────────────────────────────────
+  // Mirrors undo: re-apply the post-rewrite content and move the entry back
+  // onto the undo stack. Same data-loss guard as doUndo — on failure to open
+  // the editor, do not discard the redo entry.
+  function doRedo() {
+    if (!redo.length) return;
+    var r = redo[0];
+    if (r.post == null) { redo.shift(); saveRedo(); return; }
+    var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
+    var ok = prefillEditTextarea(r.mid, r.post, function () {
+      redo.shift();
+      saveRedo();
+      hist.unshift(r);
+      if (hist.length > depth) hist.length = depth;
       saveH();
       killPopup();
     });
     if (!ok) {
-      hist.shift();
-      saveH();
+      // Same guard as doUndo: do not discard the redo entry on failure.
+      showToast(null, "Can't redo — scroll to the message first, then retry");
     }
   }
 
@@ -1806,6 +2180,7 @@
 
   // ── Auto-profile ──────────────────────────────────────────────────────────
   function generateAutoProfile(chatId, cb) {
+    _autoInFlight[chatId] = true;
     marinara.apiFetch("/chats/" + chatId)
       .then(function (chat) {
         var ids = [];
@@ -1832,7 +2207,7 @@
         });
       })
       .catch(function () {})
-      .then(function () { if (cb) cb(); });
+      .then(function () { delete _autoInFlight[chatId]; if (cb) cb(); });
   }
 
   function watchForChatSwitch() {
@@ -1848,6 +2223,7 @@
       lastCid = newCid;
       if (!cfg.autoProfileEnabled) return;
       if (autoProfs[newCid]) return;
+      if (_autoInFlight[newCid]) return; // in-flight guard: skip if generation already running
       generateAutoProfile(newCid, null);
     }, 1500);
   }
@@ -1859,7 +2235,7 @@
     var data = { type: "rwa-profiles-export", version: 1 };
     var picked = [];
     if (opts.profiles)  { data.profiles = profiles;        picked.push("profiles"); }
-    if (opts.config)    { data.config = cfg;               picked.push("settings"); }
+    if (opts.config)    { var safeCfg = {}; Object.keys(cfg).forEach(function (k) { if (k !== "apiKey") safeCfg[k] = cfg[k]; }); data.config = safeCfg; picked.push("settings"); }
     if (opts.customs)   { data.customs = customs;          picked.push("custom prompts"); }
     if (opts.autoProfs) { data.autoProfiles = autoProfs;   picked.push("auto-profiles"); }
     if (!picked.length) { showToast(null, "Select at least one thing to export."); return; }
@@ -1876,19 +2252,85 @@
     var inp = mk("input", "");
     inp.type = "file"; inp.accept = ".json"; inp.style.cssText = "display:none;";
     document.body.appendChild(inp);
+    // N17: if the OS picker is cancelled (no `change` fires) the input leaks.
+    // A one-shot `focus` handler on window fires when the picker closes; remove
+    // the input shortly after if no `change` has fired yet.
+    var changed = false;
+    window.addEventListener("focus", function onFocus() {
+      window.removeEventListener("focus", onFocus);
+      marinara.setTimeout(function () { if (!changed && inp.parentNode) inp.remove(); }, 300);
+    }, { once: true });
     inp.addEventListener("change", function () {
+      changed = true;
       var file = inp.files && inp.files[0];
-      if (!file) return;
+      if (!file) { inp.remove(); return; }
       var reader = new FileReader();
       reader.onload = function (ev) {
         try {
           var data = JSON.parse(ev.target.result);
           if (data.type !== "rwa-profiles-export") { showToast(null, "Not a valid export file."); return; }
-          if (Array.isArray(data.profiles)) { profiles = data.profiles; saveP(); }
-          if (data.config) { Object.keys(data.config).forEach(function (k) { if (cfg.hasOwnProperty(k)) cfg[k] = data.config[k]; }); saveC(); }
-          if (Array.isArray(data.customs)) { customs = data.customs; saveX(); }
-          if (data.autoProfiles && typeof data.autoProfiles === "object") { autoProfs = data.autoProfiles; saveA(); }
-          showToast(null, "Imported!", "ok");
+          // N9 fix: validate shape before importing to prevent wrong-typed values
+          // from reaching code that expects specific types (e.g. charCardIds.join,
+          // historyDepth arithmetic, profile fields). Track dropped entries for toast.
+          var dropped = 0;
+
+          // profiles/customs: must be arrays; entries must be objects with string
+          // id, name, prompt (the three required profile fields).
+          function validProfileEntry(e) {
+            return e && typeof e === "object" && !Array.isArray(e) &&
+                   typeof e.id === "string" && typeof e.name === "string" && typeof e.prompt === "string";
+          }
+          if (Array.isArray(data.profiles)) {
+            var before = data.profiles.length;
+            profiles = data.profiles.filter(validProfileEntry);
+            dropped += before - profiles.length;
+            saveP();
+          }
+          if (Array.isArray(data.customs)) {
+            var before2 = data.customs.length;
+            // customs are plain prompt strings — accept only non-empty strings.
+            customs = data.customs.filter(function (e) {
+              return typeof e === "string" && e.trim().length > 0;
+            });
+            dropped += before2 - customs.length;
+            saveX();
+          }
+          // autoProfs: must be a plain object (not array); each entry needs string name+prompt.
+          if (data.autoProfiles && typeof data.autoProfiles === "object" && !Array.isArray(data.autoProfiles)) {
+            var cleanAuto = {};
+            Object.keys(data.autoProfiles).forEach(function (k) {
+              var e = data.autoProfiles[k];
+              if (e && typeof e === "object" && typeof e.name === "string" && typeof e.prompt === "string") {
+                cleanAuto[k] = e;
+              } else {
+                dropped++;
+              }
+            });
+            autoProfs = cleanAuto;
+            saveA();
+          }
+          // config: for each imported key that exists in DEF_CFG, only assign if
+          // typeof matches the default's type (or both are arrays). Skip mismatches.
+          if (data.config && typeof data.config === "object" && !Array.isArray(data.config)) {
+            Object.keys(data.config).forEach(function (k) {
+              if (!cfg.hasOwnProperty(k)) return;
+              var defVal = DEF_CFG[k];
+              var impVal = data.config[k];
+              // Array-typed defaults: accept only arrays.
+              if (Array.isArray(defVal)) {
+                if (Array.isArray(impVal)) { cfg[k] = impVal; } else { dropped++; }
+              } else if (typeof impVal === typeof defVal) {
+                cfg[k] = impVal;
+              } else {
+                dropped++;
+              }
+            });
+            saveC();
+          }
+          var msg = dropped > 0
+            ? "Imported (" + dropped + " malformed " + (dropped === 1 ? "entry" : "entries") + " dropped)"
+            : "Imported!";
+          showToast(null, msg, "ok");
           render();
         } catch (e) { showToast(null, "Import failed: invalid JSON."); }
       };
@@ -1904,11 +2346,36 @@
     var win = ap(ov, mk("div", "rwa-win"));
     win.style.width = "680px";
 
-    function row(parent, label, ctrl) {
+    function row(parent, label, ctrl, help) {
       var r = mk("div", "rwa-setting-row");
       ap(parent, r);
-      ap(r, mk("span", "", label));
+      var lc = ap(r, mk("div", "rwa-row-lbl"));
+      ap(lc, mk("div", "rwa-row-title", label));
+      if (help) ap(lc, mk("div", "rwa-row-help", help));
       ap(r, ctrl);
+      return r;
+    }
+    // Section header with a divider above it (except the first in a pane).
+    function grp(parent, text) {
+      var first = !parent.querySelector(".rwa-grp");
+      ap(parent, mk("div", "rwa-grp" + (first ? " rwa-grp-first" : ""), text));
+    }
+    // Indented sub-row that dims + disables its control when the parent is off.
+    function depRow(parent, label, ctrl, isOn) {
+      var r = row(parent, label, ctrl);
+      r.classList.add("rwa-dep");
+      function sync(on) { r.style.opacity = on ? "1" : ".45"; if (ctrl.disabled !== undefined) ctrl.disabled = !on; }
+      sync(isOn);
+      return sync;
+    }
+    // Stacked field: label (+ helper) above a full-width input. For text inputs.
+    function field(parent, label, input, help) {
+      var f = ap(parent, mk("div", "")); f.style.cssText = "margin-bottom:10px;";
+      ap(f, mk("div", "rwa-row-title", label)).style.marginBottom = help ? "2px" : "5px";
+      if (help) ap(f, mk("div", "rwa-row-help", help)).style.marginBottom = "5px";
+      input.style.width = "100%"; input.style.margin = "0";
+      ap(f, input);
+      return f;
     }
     function ck(val, fn) {
       var wrap = mk("label", "rwa-toggle-wrap");
@@ -1921,7 +2388,7 @@
       return wrap;
     }
 
-    var active = "profiles";
+    var active = "styles";
     function render() {
       win.innerHTML = "";
       ap(win, mk("div", "rwa-bar"));
@@ -1941,14 +2408,11 @@
       }
 
       var SECTIONS = [
-        ["profiles", "Profiles", secProfiles],
+        ["styles", "Styles", secStyles],
         ["connection", "Connection", secConnection],
-        ["behaviour", "Behaviour", secBehaviour],
         ["context", "Context", secContext],
-        ["autoprofile", "Auto-Profile", secAutoProfile],
-        ["characters", "Characters", secCharacters],
-        ["history", "History", secHistory],
-        ["backup", "Backup & Reset", secBackup]
+        ["popup", "Popup", secPopup],
+        ["data", "Data", secData]
       ];
       SECTIONS.forEach(function (s) {
         var it = ap(nav, mk("div", "rwa-nav-item" + (s[0] === active ? " rwa-nav-active" : ""), s[1]));
@@ -1959,11 +2423,11 @@
 
       ap(win, mk("div", "rwa-foot-note", "Alt+R on selected text opens the popup."));
 
-      function secProfiles(pane) {
+      function secStyles(pane) {
         var titleRow = mk("div", "");
         titleRow.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:4px;";
         ap(pane, titleRow);
-        var ttl  = ap(titleRow, mk("div", "rwa-pane-title", "Profiles"));
+        var ttl  = ap(titleRow, mk("div", "rwa-pane-title", "Styles"));
         ttl.style.marginBottom = "0";
         var cnt = ap(ttl, mk("span", "", " · " + profiles.length));
         cnt.style.cssText = "color:var(--muted-foreground);font-weight:400;";
@@ -1984,7 +2448,7 @@
           });
         });
 
-        profiles.slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); }).forEach(function (pr) {
+        profiles.slice().sort(function (a, b) { return ((a.order || 0) - (b.order || 0)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0); }).forEach(function (pr) { // N18: stable tiebreaker by id
           var ri   = profiles.indexOf(pr);
           var item = mk("div", "rwa-item");
           item._q = ((pr.name || "") + " " + (pr.prompt || "")).toLowerCase();
@@ -2003,13 +2467,14 @@
           var pp = ap(inf, mk("div", "", pr.prompt));
           pp.style.cssText = "font-size:10px;color:var(--muted-foreground);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
           function applyHidden() { item.style.opacity = pr.hidden ? ".5" : ""; }
-          var hideWrap = mk("label", ""); hideWrap.style.cssText = "display:flex;align-items:center;gap:3px;font-size:9px;color:var(--muted-foreground);flex:0 0 auto;cursor:pointer;";
-          hideWrap.title = "Hide this profile's button from the main popup (keeps the profile here).";
-          var hideCb = mk("input", ""); hideCb.type = "checkbox"; hideCb.checked = !!pr.hidden;
-          hideCb.style.cssText = "width:13px;height:13px;accent-color:var(--primary);cursor:pointer;";
-          hideCb.addEventListener("change", function () { pr.hidden = hideCb.checked; saveP(); applyHidden(); });
-          ap(hideWrap, hideCb); ap(hideWrap, mk("span", "", "hide"));
-          ap(item, hideWrap);
+          var hideBtn = iconBtn(pr.hidden ? ICON.eyeoff : ICON.eye, null, function () {
+            pr.hidden = !pr.hidden; saveP(); applyHidden();
+            hideBtn.innerHTML = svgEl(pr.hidden ? ICON.eyeoff : ICON.eye);
+            hideBtn.title = (pr.hidden ? "Hidden from popup — click to show" : "Shown in popup — click to hide");
+            hideBtn.setAttribute("aria-label", (pr.hidden ? "Show " : "Hide ") + pr.name + " in popup");
+          }, (pr.hidden ? "Show " : "Hide ") + pr.name + " in popup");
+          hideBtn.title = pr.hidden ? "Hidden from popup — click to show" : "Shown in popup — click to hide";
+          ap(item, hideBtn);
           applyHidden();
           ap(item, iconBtn(ICON.edit, null, function () { showEdit(pr, ri, render); }, "Edit " + pr.name));
           ap(item, iconBtn(ICON.trash, "rwa-dng", function () {
@@ -2032,63 +2497,69 @@
             saveP(); render();
           });
         });
+
+        // Auto-match: generate a character-voice style on chat switch.
+        grp(pane, "Auto-match character voice");
+        row(pane, "Generate on chat switch",
+          ck(cfg.autoProfileEnabled, function (e) { cfg.autoProfileEnabled = e.target.checked; saveC(); }),
+          "Builds a style from the character's voice — one model request per switch.");
+        Object.keys(autoProfs).forEach(function (cid) {
+          var ap2 = autoProfs[cid];
+          var apRow = mk("div", "rwa-card");
+          ap(pane, apRow);
+          var apIc = ap(apRow, mk("span", ""));
+          apIc.style.cssText = "color:var(--primary);display:inline-flex;flex-shrink:0;";
+          apIc.innerHTML = svgEl(ICON.spark, 13);
+          var apName = ap(apRow, mk("span", "", ap2.name));
+          apName.style.cssText = "flex:1;font-size:11px;color:var(--foreground);";
+          ap(apRow, iconBtn(ICON.trash, "rwa-dng", function () { delete autoProfs[cid]; saveA(); render(); }, "Remove " + ap2.name));
+        });
       }
 
       function secConnection(pane) {
         var db = pane;
-        paneHead(pane, "Connection", "Where rewrites are generated. Direct API skips the Marinara sidecar, so Ollama won’t load a second model.");
-        var modeRow = mk("div", "rwa-setting-row");
-        ap(db, modeRow);
-        ap(modeRow, mk("span", "", "Model source:"));
+        paneHead(pane, "Connection", "Where rewrites are generated.");
         var modeSel = mk("select", "rwa-sel");
-        [["sidecar", "Local Sidecar (default)"], ["direct", "Direct API (Ollama / llama.cpp)"]].forEach(function (opt) {
+        [["sidecar", "Local Sidecar (default)"], ["direct", "Direct API (Ollama / llama.cpp)"], ["extender", "Marinara Extender (one sidecar)"]].forEach(function (opt) {
           var o = mk("option", "", opt[1]); o.value = opt[0];
           if ((cfg.connMode || "sidecar") === opt[0]) o.selected = true;
           modeSel.appendChild(o);
         });
-        ap(modeRow, modeSel);
+        row(db, "Model source", modeSel, "Direct API skips the Marinara sidecar, so Ollama won’t load a second model.");
 
         // Direct-mode fields (URL, model, key, temp) — shown only when relevant.
         var direct = mk("div", "");
         ap(db, direct);
-        function txtRow(label, cfgKey, placeholder) {
-          var ti = mk("input", "rwa-inp"); ti.type = "text"; ti.placeholder = placeholder || "";
-          ti.value = cfg[cfgKey] || ""; ti.style.cssText = "flex:1;margin:0;padding:6px 10px;font-size:12px;";
-          ti.addEventListener("change", function () { cfg[cfgKey] = ti.value.trim(); saveC(); });
-          row(direct, label, ti);
-        }
-        // API URL with click-to-fill presets for popular local endpoints.
+
+        // Endpoint
+        ap(direct, mk("div", "rwa-grp", "Endpoint"));
         var urlInp = mk("input", "rwa-inp"); urlInp.type = "text"; urlInp.placeholder = "http://localhost:11434/v1";
-        urlInp.value = cfg.apiUrl || ""; urlInp.style.cssText = "flex:1;margin:0;padding:6px 10px;font-size:12px;";
+        urlInp.value = cfg.apiUrl || ""; urlInp.style.cssText = "padding:6px 10px;font-size:12px;";
         urlInp.addEventListener("change", function () { cfg.apiUrl = urlInp.value.trim(); saveC(); });
-        row(direct, "API URL:", urlInp);
+        field(direct, "API URL", urlInp, "Click a preset to fill, or type your own. Most local servers expose /v1; confirm the port.");
         var presets = [
           ["Ollama", "http://localhost:11434/v1"], ["LM Studio", "http://localhost:1234/v1"],
           ["llama.cpp", "http://localhost:8080/v1"], ["KoboldCpp", "http://localhost:5001/v1"],
           ["Jan", "http://localhost:1337/v1"], ["text-gen-webui", "http://localhost:5000/v1"],
           ["vLLM", "http://localhost:8000/v1"],
         ];
-        var presetWrap = mk("div", ""); presetWrap.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;margin:2px 0 4px;";
+        var presetWrap = mk("div", ""); presetWrap.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;margin:-4px 0 10px;";
         presets.forEach(function (pr) {
           var chip = mk("button", "", pr[0]);
           chip.title = "Set API URL to " + pr[1];
-          chip.style.cssText = "font-size:10px;padding:2px 8px;border:1px solid var(--border,rgba(127,127,127,.3));border-radius:10px;background:transparent;color:var(--muted-foreground);cursor:pointer;";
+          chip.style.cssText = "font-size:10px;padding:2px 8px;border:1px solid var(--border,rgba(127,127,127,.3));border-radius:8px;background:transparent;color:var(--muted-foreground);cursor:pointer;";
           chip.addEventListener("click", function (e) { e.stopPropagation(); urlInp.value = pr[1]; cfg.apiUrl = pr[1]; saveC(); });
           ap(presetWrap, chip);
         });
         ap(direct, presetWrap);
-        var presetNote = mk("div", "", "Common local endpoints — click to fill. Most expose an OpenAI-compatible API at /v1; default ports vary, so confirm yours in the server's settings.");
-        presetNote.style.cssText = "font-size:9px;color:var(--muted-foreground);margin:0 0 8px;line-height:1.5;";
-        ap(direct, presetNote);
-        // Model name + a Discover button that lists models from the endpoint.
+
+        // Model
+        ap(direct, mk("div", "rwa-grp", "Model"));
         var modelInp = mk("input", "rwa-inp"); modelInp.type = "text"; modelInp.placeholder = "llama3.1";
-        modelInp.value = cfg.apiModel || ""; modelInp.style.cssText = "flex:1;margin:0;padding:6px 10px;font-size:12px;";
+        modelInp.value = cfg.apiModel || ""; modelInp.style.cssText = "padding:6px 10px;font-size:12px;";
         modelInp.addEventListener("change", function () { cfg.apiModel = modelInp.value.trim(); saveC(); });
-        row(direct, "Model name:", modelInp);
-        var discRow = mk("div", "rwa-setting-row"); ap(direct, discRow);
-        ap(discRow, mk("span", "", "Discover models:"));
-        var discWrap = mk("div", ""); discWrap.style.cssText = "display:flex;gap:6px;flex:1;align-items:center;";
-        ap(discRow, discWrap);
+        field(direct, "Model name", modelInp);
+        var discWrap = mk("div", ""); discWrap.style.cssText = "display:flex;gap:6px;align-items:center;";
         var discSel = mk("select", "rwa-sel"); discSel.style.cssText = "flex:1;"; discSel.style.display = "none";
         var discBtn = mkBtn("Discover", null, function () {
           discBtn.textContent = "…";
@@ -2113,72 +2584,101 @@
           if (!discSel.value) return;
           cfg.apiModel = discSel.value; modelInp.value = discSel.value; saveC();
         });
-        txtRow("API key (optional):", "apiKey", "leave blank for local");
+        field(direct, "Discover models", discWrap, "List the models the endpoint reports, then pick one.");
+
+        // Authentication & tuning
+        ap(direct, mk("div", "rwa-grp", "Authentication & tuning"));
+        var keyInp = mk("input", "rwa-inp"); keyInp.type = "text"; keyInp.placeholder = "leave blank for local";
+        keyInp.value = cfg.apiKey || ""; keyInp.style.cssText = "padding:6px 10px;font-size:12px;";
+        keyInp.addEventListener("change", function () { cfg.apiKey = keyInp.value.trim(); saveC(); });
+        field(direct, "API key", keyInp, "Optional — most local servers ignore it.");
         var tr = mk("input", "rwa-inp"); tr.type = "number"; tr.min = "0"; tr.max = "2"; tr.step = "0.1";
         tr.value = String(cfg.directTemp != null ? cfg.directTemp : 0.7);
         tr.style.cssText = "width:64px;margin:0;padding:6px 10px;font-size:12px;";
         tr.addEventListener("change", function () { cfg.directTemp = Math.max(0, Math.min(2, parseFloat(tr.value) || 0.7)); saveC(); });
-        row(direct, "Temperature:", tr);
+        row(direct, "Temperature", tr, "0–2. Lower stays closer to the original.");
 
-        var testWrap = mk("div", ""); testWrap.style.cssText = "margin-top:8px;";
-        ap(direct, testWrap);
-        var testStatus = mk("div", ""); testStatus.style.cssText = "font-size:11px;margin-top:6px;line-height:1.5;color:var(--muted-foreground);";
-        ap(testWrap, mkBtn("Test connection", null, function () {
+        var testStatus = mk("div", ""); testStatus.style.cssText = "font-size:11px;margin-top:8px;line-height:1.5;color:var(--muted-foreground);";
+        var testBtn = mkBtn("Test connection", null, function () {
           testStatus.textContent = "Testing…"; testStatus.style.color = "var(--muted-foreground)";
           runInference("You are a test.", "Reply with the single word: ok").then(function (resp) {
             if (resp && resp.error) { testStatus.textContent = "✗ " + resp.error; testStatus.style.color = "var(--destructive, #ef4444)"; }
             else { testStatus.textContent = "✓ Connected. Model replied: " + ((resp && resp.result) || "").slice(0, 60); testStatus.style.color = "var(--primary)"; }
           });
-        }));
-        ap(testWrap, testStatus);
-
-        var note = mk("div", "", "Direct mode skips the Marinara sidecar, so Ollama doesn't load a second model. Ollama needs OLLAMA_ORIGINS=* set (env var) so the browser can reach it.");
-        note.style.cssText = "font-size:10px;color:var(--muted-foreground);margin-top:10px;line-height:1.5;";
+        });
+        ap(direct, testBtn).style.width = "100%";
+        ap(direct, testStatus);
+        var note = mk("div", "", "Ollama needs OLLAMA_ORIGINS=* (env var) so the browser can reach it.");
+        note.style.cssText = "font-size:10px;color:var(--muted-foreground);margin-top:8px;line-height:1.5;";
         ap(direct, note);
 
-        function syncMode() { direct.style.display = (cfg.connMode === "direct") ? "" : "none"; }
+        // Extender-mode fields (URL, temperature, test) — shown only for extender mode.
+        var extender = mk("div", "");
+        ap(db, extender);
+        ap(extender, mk("div", "rwa-grp", "Extender server"));
+        var exuInp = mk("input", "rwa-inp"); exuInp.type = "text"; exuInp.placeholder = "http://127.0.0.1:3001";
+        exuInp.value = cfg.extenderUrl || ""; exuInp.style.cssText = "padding:6px 10px;font-size:12px;";
+        exuInp.addEventListener("change", function () { cfg.extenderUrl = exuInp.value.trim(); saveC(); });
+        field(extender, "Extender server URL", exuInp, "URL of the Marinara Extender sidecar. Routes rewrites through its model — no separate Ollama needed.");
+        var extr = mk("input", "rwa-inp"); extr.type = "number"; extr.min = "0"; extr.max = "2"; extr.step = "0.1";
+        extr.value = String(cfg.directTemp != null ? cfg.directTemp : 0.7);
+        extr.style.cssText = "width:64px;margin:0;padding:6px 10px;font-size:12px;";
+        extr.addEventListener("change", function () { cfg.directTemp = Math.max(0, Math.min(2, parseFloat(extr.value) || 0.7)); saveC(); });
+        row(extender, "Temperature", extr, "0–2. Shared with Direct API mode.");
+        var exTestStatus = mk("div", ""); exTestStatus.style.cssText = "font-size:11px;margin-top:8px;line-height:1.5;color:var(--muted-foreground);";
+        var exTestBtn = mkBtn("Test connection", null, function () {
+          exTestStatus.textContent = "Testing…"; exTestStatus.style.color = "var(--muted-foreground)";
+          runInference("You are a test.", "Reply with the single word: ok").then(function (resp) {
+            if (resp && resp.error) { exTestStatus.textContent = "✗ " + resp.error; exTestStatus.style.color = "var(--destructive, #ef4444)"; }
+            else { exTestStatus.textContent = "✓ Connected. Extender replied: " + ((resp && resp.result) || "").slice(0, 60); exTestStatus.style.color = "var(--primary)"; }
+          });
+        });
+        ap(extender, exTestBtn).style.width = "100%";
+        ap(extender, exTestStatus);
+
+        function syncMode() {
+          direct.style.display   = (cfg.connMode === "direct")   ? "" : "none";
+          extender.style.display = (cfg.connMode === "extender") ? "" : "none";
+        }
         modeSel.addEventListener("change", function () { cfg.connMode = modeSel.value; saveC(); syncMode(); });
         syncMode();
 
+        // Prompt economy (applies to both modes).
+        grp(db, "Prompt");
+        row(db, "Shorter instructions", ck(cfg.conciseSysPrompt, function (e) { cfg.conciseSysPrompt = e.target.checked; saveC(); }),
+          "Sends a terser system prompt — helps small models stay on task.");
+
         // Debug logging (applies to both modes)
-        var dbgSep = mk("div", "rwa-sep"); ap(db, dbgSep);
-        row(db, "Debug logging:", ck(cfg.debugEnabled, function (e) { cfg.debugEnabled = e.target.checked; saveC(); }));
+        grp(db, "Debug");
+        row(db, "Debug logging", ck(cfg.debugEnabled, function (e) { cfg.debugEnabled = e.target.checked; saveC(); }),
+          "Captures the exact prompt and raw reply (last 100 events).");
         var dbgBtns = mk("div", ""); dbgBtns.style.cssText = "display:flex;gap:8px;margin-top:2px;";
         ap(db, dbgBtns);
         ap(dbgBtns, mkBtn("Download log", null, downloadDebug)).style.flex = "1";
         ap(dbgBtns, mkBtn("Clear", "rwa-dng", function () { dbg.length = 0; saveDbg(); showToast(null, "Debug log cleared", "ok"); })).style.flex = "0 0 auto";
-        var dbgNote = mk("div", "", "Captures the exact prompt sent and the raw model reply (last 100 events). “Download log” writes ME-rewrite-debug.json to your Downloads folder; also at window.__rwaDebug in the console.");
+        var dbgNote = mk("div", "", "Writes ME-rewrite-debug.json to Downloads (also at window.__rwaDebug). The API key is redacted.");
         dbgNote.style.cssText = "font-size:10px;color:var(--muted-foreground);margin-top:8px;line-height:1.5;";
         ap(db, dbgNote);
+
+        // Loader: remote auto-update opt-in.
+        // Written directly to localStorage (not cfg) because the loader bundle
+        // reads this key standalone before extension.js is loaded.
+        grp(db, "Loader");
+        var remoteOn = (function () { try { return localStorage.getItem("rwa-loader-allow-remote") === "1"; } catch (e) { return false; } })();
+        row(db, "Allow remote auto-update (loader)",
+          ck(remoteOn, function (e) {
+            try { localStorage.setItem("rwa-loader-allow-remote", e.target.checked ? "1" : "0"); } catch (err) {}
+          }),
+          "Fetches extension code from GitHub on each Marinara load (falls back after local sidecar fails). ⚠️ Runs remote code — only enable if you trust the configured GitHub URL."
+        );
+        var loaderNote = mk("div", "", "Off by default. When off, only the local Extender sidecar and the last-cached copy are used. Change the REMOTE URL in loader.js to point at your own repo before enabling.");
+        loaderNote.style.cssText = "font-size:10px;color:var(--muted-foreground);margin-top:4px;line-height:1.5;";
+        ap(db, loaderNote);
       }
 
-      function secBehaviour(pane) {
+      function secPopup(pane) {
         var db = pane;
-        paneHead(pane, "Behaviour", "How the popup looks and applies rewrites.");
-        row(db, "Include character card in prompt:", ck(cfg.useCharCard, function (e) { cfg.useCharCard = e.target.checked; saveC(); }));
-        row(db, "Include your persona (on your own messages):", ck(cfg.useUserPersona, function (e) { cfg.useUserPersona = e.target.checked; saveC(); }));
-        row(db, "Typewriter reveal on result:",      ck(cfg.typewriter,  function (e) { cfg.typewriter  = e.target.checked; saveC(); }));
-        row(db, "Show word diff in result:",         ck(cfg.showDiff,    function (e) { cfg.showDiff    = e.target.checked; saveC(); }));
-        row(db, "Auto-apply (skip preview modal):",  ck(cfg.autoApply,   function (e) { cfg.autoApply   = e.target.checked; saveC(); }));
-        row(db, "Manual trigger only (Alt+R, no popup on select):", ck(cfg.manualTriggerOnly, function (e) { cfg.manualTriggerOnly = e.target.checked; saveC(); }));
-        row(db, "Concise system prompt (save tokens on small models):", ck(cfg.conciseSysPrompt, function (e) { cfg.conciseSysPrompt = e.target.checked; saveC(); }));
-        row(db, "Leave editor open (save manually):",  ck(cfg.reviewBeforeApply, function (e) { cfg.reviewBeforeApply = e.target.checked; saveC(); }));
-        row(db, "Compact buttons:",                   ck(cfg.compact,    function (e) { cfg.compact     = e.target.checked; saveC(); }));
-        row(db, "Merge multi-message rewrites:",       ck(cfg.mergeMultiMsg, function (e) { cfg.mergeMultiMsg = e.target.checked; saveC(); }));
-        var mergeWarn = mk("div", "", "⚠ When a selection spans multiple messages, merge them into ONE rewrite (better cross-message flow), then split the result back by markers and insert each piece. The model can move or drop the split markers — especially small local models — or restructure the text; if the split isn't clean it falls back to rewriting each message separately. Best for structure-preserving edits (Grammar, Different Words); riskier for heavy transforms (Expand, Compress). Default off rewrites each message on its own.");
-        mergeWarn.style.cssText = "font-size:10px;color:var(--muted-foreground);margin:-2px 0 8px;line-height:1.5;";
-        ap(db, mergeWarn);
-        var posRow = mk("div", "rwa-setting-row");
-        ap(db, posRow);
-        ap(posRow, mk("span", "", "Popup position:"));
-        var posSel = mk("select", "rwa-sel");
-        [["auto","Auto"],["above","Above"],["below","Below"]].forEach(function (opt) {
-          var o = mk("option", "", opt[1]); o.value = opt[0];
-          if ((cfg.popupPos || "auto") === opt[0]) o.selected = true;
-          posSel.appendChild(o);
-        });
-        posSel.addEventListener("change", function () { cfg.popupPos = posSel.value; saveC(); });
-        ap(posRow, posSel);
+        paneHead(pane, "Popup", "How the popup looks and applies rewrites.");
         function numRow(label, cfgKey, min, max) {
           var ni = mk("input", "rwa-inp"); ni.type = "number"; ni.min = String(min); ni.max = String(max);
           ni.value = String(cfg[cfgKey] !== undefined ? cfg[cfgKey] : min);
@@ -2186,52 +2686,68 @@
           ni.addEventListener("change", function () { cfg[cfgKey] = Math.max(min, Math.min(max, parseInt(ni.value, 10) || min)); saveC(); });
           row(db, label, ni);
         }
-        numRow("Columns:", "cols", 1, 4);
-        numRow("Rows:", "rows", 1, 12);
-        numRow("Undo depth:", "historyDepth", 1, 20);
+        grp(db, "Layout");
+        var posSel = mk("select", "rwa-sel");
+        [["auto","Auto"],["above","Above"],["below","Below"]].forEach(function (opt) {
+          var o = mk("option", "", opt[1]); o.value = opt[0];
+          if ((cfg.popupPos || "auto") === opt[0]) o.selected = true;
+          posSel.appendChild(o);
+        });
+        posSel.addEventListener("change", function () { cfg.popupPos = posSel.value; saveC(); });
+        row(db, "Popup position", posSel);
+        numRow("Mode button columns", "cols", 1, 4);
+        numRow("Mode button rows", "rows", 1, 12);
+
+        grp(db, "Applying rewrites");
+        row(db, "Open on Alt+R only", ck(cfg.manualTriggerOnly, function (e) { cfg.manualTriggerOnly = e.target.checked; saveC(); }),
+          "Don't pop up when you select text — press Alt+R instead.");
+        row(db, "Auto-apply", ck(cfg.autoApply, function (e) { cfg.autoApply = e.target.checked; saveC(); }),
+          "Skip the preview and replace the text immediately.");
+        row(db, "Place in editor, don't save", ck(cfg.reviewBeforeApply, function (e) { cfg.reviewBeforeApply = e.target.checked; saveC(); }),
+          "Drop the rewrite into the message editor so you confirm and save it yourself (Ctrl+Enter).");
+        row(db, "Typewriter reveal", ck(cfg.typewriter, function (e) { cfg.typewriter = e.target.checked; saveC(); }));
+        row(db, "Show word diff", ck(cfg.showDiff, function (e) { cfg.showDiff = e.target.checked; saveC(); }));
+        row(db, "Merge multi-message", ck(cfg.mergeMultiMsg, function (e) { cfg.mergeMultiMsg = e.target.checked; saveC(); }),
+          "One rewrite for the whole span, then split back — better flow, but small models may misalign it (falls back to per-message).");
       }
 
       function secContext(pane) {
         var db = pane;
-        paneHead(pane, "Context", "Extra reference the model sees alongside your selection.");
-        row(db, "Surrounding text:", ck(cfg.localContextEnabled, function (e) { cfg.localContextEnabled = e.target.checked; saveC(); }));
+        paneHead(pane, "Context", "What the model sees besides your selection. More context fits better but costs tokens.");
+        grp(db, "Character");
+        row(db, "Character card", ck(cfg.useCharCard, function (e) { cfg.useCharCard = e.target.checked; saveC(); }),
+          "Include the character's card so the rewrite matches their voice.");
+        row(db, "Your persona", ck(cfg.useUserPersona, function (e) { cfg.useUserPersona = e.target.checked; saveC(); }),
+          "On your own messages, include your persona card.");
+
+        grp(db, "Conversation");
         var wn = mk("input", "rwa-inp"); wn.type = "number"; wn.min = "50"; wn.max = "400";
         wn.value = String(cfg.localContextWords || 150); wn.style.cssText = "width:56px;margin:0;padding:6px 10px;font-size:12px;";
         wn.addEventListener("change", function () { cfg.localContextWords = Math.max(50, Math.min(400, parseInt(wn.value, 10) || 150)); saveC(); });
-        row(db, "Words per side:", wn);
-        row(db, "Lorebook entries:", ck(cfg.useLorebookEntries, function (e) { cfg.useLorebookEntries = e.target.checked; saveC(); }));
-        row(db, "Previous messages:", ck(cfg.usePrevMessages, function (e) { cfg.usePrevMessages = e.target.checked; saveC(); }));
+        var syncWords = null;
+        row(db, "Surrounding text", ck(cfg.localContextEnabled, function (e) { cfg.localContextEnabled = e.target.checked; saveC(); if (syncWords) syncWords(e.target.checked); }),
+          "Send text on either side of your selection for continuity.");
+        syncWords = depRow(db, "Words per side", wn, cfg.localContextEnabled);
+
         var pn = mk("input", "rwa-inp"); pn.type = "number"; pn.min = "1"; pn.max = "4";
         pn.value = String(cfg.prevMessageCount || 2); pn.style.cssText = "width:56px;margin:0;padding:6px 10px;font-size:12px;";
         pn.addEventListener("change", function () { cfg.prevMessageCount = Math.max(1, Math.min(4, parseInt(pn.value, 10) || 2)); saveC(); });
-        row(db, "Msg count:", pn);
-      }
+        var syncPrev = null;
+        row(db, "Lorebook entries", ck(cfg.useLorebookEntries, function (e) { cfg.useLorebookEntries = e.target.checked; saveC(); }),
+          "Pull in active lorebook entries for the scene.");
+        row(db, "Previous messages", ck(cfg.usePrevMessages, function (e) { cfg.usePrevMessages = e.target.checked; saveC(); if (syncPrev) syncPrev(e.target.checked); }),
+          "Send the messages just before the selection.");
+        syncPrev = depRow(db, "How many", pn, cfg.usePrevMessages);
 
-      function secAutoProfile(pane) {
-        var db = pane;
-        paneHead(pane, "Auto-Profile", "Generate a character-voice profile automatically when you switch chats.");
-        var apInfo = mk("div", "", "Generates a character-voice profile when you switch chats. Each switch sends one model request.");
-        apInfo.style.cssText = "font-size:11px;color:var(--muted-foreground);margin-bottom:8px;line-height:1.5;";
-        ap(db, apInfo);
-        row(db, "Enable on chat switch:", ck(cfg.autoProfileEnabled, function (e) { cfg.autoProfileEnabled = e.target.checked; saveC(); }));
-        Object.keys(autoProfs).forEach(function (cid) {
-          var ap2 = autoProfs[cid];
-          var apRow = mk("div", "rwa-card");
-          ap(db, apRow);
-          var apIc = ap(apRow, mk("span", ""));
-          apIc.style.cssText = "color:var(--primary);display:inline-flex;flex-shrink:0;";
-          apIc.innerHTML = svgEl(ICON.spark, 13);
-          var apName = ap(apRow, mk("span", "", ap2.name));
-          apName.style.cssText = "flex:1;font-size:11px;color:var(--foreground);";
-          ap(apRow, iconBtn(ICON.trash, "rwa-dng", function () { delete autoProfs[cid]; saveA(); render(); }, "Remove " + ap2.name));
-        });
-      }
+        grp(db, "Marinara Extender");
+        row(db, "Extender memory", ck(cfg.useExtenderMemory, function (e) { cfg.useExtenderMemory = e.target.checked; saveC(); }),
+          "Pulls live character memory from the Extender sidecar — adds it to the rewrite context. Falls back to lorebook scan if the server is down or URL is blank.");
+        row(db, "Speaker-aware editing", ck(cfg.speakerAware, function (e) { cfg.speakerAware = e.target.checked; saveC(); }),
+          "Detects whether the selection is the author's prose or a character's voice, and tells the model which mode to edit in. Recommended for roleplay chats.");
 
-      function secCharacters(pane) {
-        var db = pane;
-        paneHead(pane, "Characters", "Pick which character cards inform the rewrite voice.");
-        var hint = mk("div", "", "Leave all unchecked to use chat’s characters.");
-        hint.style.cssText = "font-size:10px;color:var(--muted-foreground);margin-bottom:6px;";
+        grp(db, "Specific characters");
+        var hint = mk("div", "", "Pick which character cards inform the voice. Leave all unchecked to use the chat’s own.");
+        hint.style.cssText = "font-size:10px;color:var(--muted-foreground);margin:-3px 0 7px;";
         ap(db, hint);
         var charSearch = mk("input", "rwa-inp"); charSearch.type = "text"; charSearch.placeholder = "Search characters…";
         charSearch.style.cssText = "width:100%;margin:0 0 8px;padding:6px 10px;font-size:12px;";
@@ -2254,9 +2770,16 @@
         }
       }
 
-      function secHistory(pane) {
+      function secData(pane) {
         var db = pane;
-        paneHead(pane, "History", "Recent rewrites you can undo from the popup.");
+        paneHead(pane, "Data", "History, backup, and reset.");
+
+        grp(db, "History");
+        var ud = mk("input", "rwa-inp"); ud.type = "number"; ud.min = "1"; ud.max = "20";
+        ud.value = String(cfg.historyDepth !== undefined ? cfg.historyDepth : 5);
+        ud.style.cssText = "width:56px;margin:0;padding:6px 10px;font-size:12px;";
+        ud.addEventListener("change", function () { cfg.historyDepth = Math.max(1, Math.min(20, parseInt(ud.value, 10) || 5)); saveC(); });
+        row(db, "Undo depth", ud, "How many past rewrites you can step back through.");
         if (!hist.length) {
           var nh = mk("div", "", "No rewrites yet.");
           nh.style.cssText = "font-size:11px;color:var(--muted-foreground);"; ap(db, nh);
@@ -2269,16 +2792,13 @@
             if (h.when) { var wt = mk("div", "", new Date(h.when).toLocaleTimeString()); wt.style.cssText = "font-size:9px;color:var(--muted-foreground);margin-top:2px;"; ap(hi, wt); }
           });
         }
-      }
 
-      function secBackup(pane) {
-        var db = pane;
-        paneHead(pane, "Backup & Reset", "Move profiles and settings between instances, or restore defaults.");
-        var hint = mk("div", "", "Choose what to export below, or import to merge from a previous export. Files are JSON — the only format that can be re-imported.");
-        hint.style.cssText = "font-size:11px;color:var(--muted-foreground);margin-bottom:10px;line-height:1.5;";
+        grp(db, "Backup");
+        var hint = mk("div", "", "Choose what to export, or import to merge from a previous export. Files are JSON — the only format that can be re-imported.");
+        hint.style.cssText = "font-size:11px;color:var(--muted-foreground);margin:-3px 0 10px;line-height:1.5;";
         ap(db, hint);
         var exOpts = { profiles: true, config: true, customs: true, autoProfs: true };
-        [["profiles", "Profiles (" + profiles.length + ")"], ["config", "Settings"],
+        [["profiles", "Styles (" + profiles.length + ")"], ["config", "Settings"],
          ["customs", "Custom prompts (" + customs.length + ")"],
          ["autoProfs", "Auto-profiles (" + Object.keys(autoProfs).length + ")"]].forEach(function (o) {
           var rrow = mk("label", ""); rrow.style.cssText = "display:flex;align-items:center;gap:8px;font-size:11px;color:var(--foreground);margin:3px 0;cursor:pointer;";
@@ -2292,9 +2812,9 @@
         ap(btnRow, mkBtn("Export selected", "rwa-accept", function () { exportProfiles(exOpts); })).style.flex = "1";
         ap(btnRow, mkBtn("Import", null, function () { importProfiles(render); })).style.flex = "1";
 
-        ap(db, mk("div", "rwa-sep"));
+        grp(db, "Reset");
         ap(db, mkBtn("Reset all to defaults", "rwa-dng", function () {
-          if (confirm("Reset all profiles and settings to defaults?")) {
+          if (confirm("Reset all styles and settings to defaults?")) {
             profiles = DEF_PROFILES.slice();
             cfg = (function () { var m = {}; Object.keys(DEF_CFG).forEach(function (k) { m[k] = DEF_CFG[k]; }); return m; })();
             hist = []; customs = []; autoProfs = {};
@@ -2477,6 +2997,26 @@
     }
   }
 
+  // How many times the selected text already appears in this message BEFORE the
+  // selection start — i.e. which occurrence the user picked — so doCommit can
+  // splice the intended one when a phrase repeats. Returns 0 when undeterminable.
+  function selectionOccurrence(range, mid, segText) {
+    try {
+      var needle = (segText || "").trim();
+      if (!needle) return 0;
+      var contents = document.querySelectorAll('[data-message-id="' + mid + '"] .mari-message-content');
+      var startEl = contents.length ? contents[0] : document.querySelector('[data-message-id="' + mid + '"]');
+      if (!startEl) return 0;
+      var pre = document.createRange();
+      pre.setStartBefore(startEl);
+      pre.setEnd(range.startContainer, range.startOffset);
+      var before = pre.toString().replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      var n = 0, i = 0;
+      while ((i = before.indexOf(needle, i)) !== -1) { n++; i += needle.length; }
+      return n;
+    } catch (e) { return 0; }
+  }
+
   // A single Marinara turn can render as SEVERAL message bubbles, each its own
   // stored message. Collect one {mid, text} per message the selection touches,
   // in document order, so a cross-message drag becomes a list to rewrite in turn.
@@ -2493,7 +3033,7 @@
     var segs = [];
     for (var k = 0; k < order.length; k++) {
       var t = selectionTextInMessage(range, order[k]);
-      if (t && t.length >= 2) segs.push({ mid: order[k], text: t });
+      if (t && t.length >= 2) segs.push({ mid: order[k], text: t, occ: selectionOccurrence(range, order[k], t) });
     }
     return segs;
   }
