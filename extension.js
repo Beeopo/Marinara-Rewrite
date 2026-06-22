@@ -11,6 +11,7 @@
   var K_CUST  = NS + "-x";
   var K_AUTO  = NS + "-a";
   var K_DBG   = NS + "-dbg";
+  var K_LEDGER = NS + "-ledger";
 
   var _quotaWarned = false;
   function load(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
@@ -55,6 +56,9 @@
     // endpoint such as Ollama/llama.cpp), or "extender" (Marinara Extender sidecar).
     // Direct/Extender avoid running two models at once.
     connMode: "sidecar", apiUrl: "http://127.0.0.1:11434/v1", apiModel: "", apiKey: "", directTemp: 0.7,
+    // Model context window (tokens). Selections larger than ~1/6 of this are
+    // windowed into slices and rewritten via the Ledger Pattern, not truncated.
+    ctxTokens: 8192,
     // Extender: URL of the Marinara Extender sidecar (shared by inference + memory fetch).
     extenderUrl: "http://127.0.0.1:3001",
     // When true, pulls live character memory from the Extender and adds it to the rewrite context.
@@ -1522,6 +1526,13 @@
     killPopup();
     if (!savedSel.cid) savedSel.cid = getChatId();
 
+    // Large selection → window it through the Ledger Pattern instead of one
+    // truncated call. doLedgerRewrite advances the queue itself once it commits.
+    if (tokest(savedSel.text) > sliceBudget()) {
+      doLedgerRewrite(profile, savedSel, queue);
+      return;
+    }
+
     var controller = new AbortController();
 
     var ov   = mkOv(10002);
@@ -1666,6 +1677,174 @@
       out += (i > 0 ? "\n[[SECTION " + (i + 1) + "]]\n" : "") + segments[i].text;
     }
     return out;
+  }
+
+  // ── Ledger Pattern (large-text rewrites) ───────────────────────────────────
+  // A selection too big for one prompt is windowed into slices (~1/6 of the model
+  // context), rewritten one at a time against a durable, resumable ledger, then
+  // assembled and spliced in one go — instead of truncating. Ported from
+  // TCLowe1982's Marinara-Rewrite fork; uses our tokest/sysPrompt/occ helpers.
+  function sliceBudget() { return Math.max(256, Math.floor((cfg.ctxTokens || 8192) / 6)); }
+  function splitToSize(text, maxChars) {
+    var sentences = text.match(/[^.!?]*[.!?]+\s*|[^.!?]+$/g) || [text];
+    var out = [], cur = "";
+    sentences.forEach(function (s) {
+      while (s.length > maxChars) { if (cur) { out.push(cur); cur = ""; } out.push(s.slice(0, maxChars)); s = s.slice(maxChars); }
+      if (cur && (cur + s).length > maxChars) { out.push(cur); cur = s; } else { cur += s; }
+    });
+    if (cur) out.push(cur);
+    return out.length ? out : [text];
+  }
+  function windowText(text, maxTokens) {
+    var maxChars = Math.max(400, maxTokens * 4);
+    var units = [], sepRe = /\n[ \t]*\n[ \t\n]*/g, last = 0, mm;
+    while ((mm = sepRe.exec(text)) !== null) { units.push({ text: text.slice(last, mm.index), sep: mm[0] }); last = sepRe.lastIndex; }
+    units.push({ text: text.slice(last), sep: "" });
+    var slices = [];
+    units.forEach(function (u) {
+      if (u.text.length <= maxChars) { slices.push(u); return; }
+      var parts = splitToSize(u.text, maxChars);
+      for (var i = 0; i < parts.length; i++) slices.push({ text: parts[i], sep: i === parts.length - 1 ? u.sep : "" });
+    });
+    return slices.filter(function (s) { return s.text.length || s.sep.length; });
+  }
+  function stripWrapQuotes(s) {
+    var openQ = s.match(/^["“‘«]/), closeQ = s.match(/["”’»]$/);
+    if (openQ && closeQ) {
+      var pairs = { '"': '"', "“": "”", "‘": "’", "«": "»" };
+      if (pairs[openQ[0]] === closeQ[0]) return s.slice(1, -1);
+    }
+    return s;
+  }
+  function strHash(s) { var h = 5381; for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
+  function ledgerKey(mid, text) { return (mid || "?") + ":" + strHash(text || ""); }
+  function loadLedgers() { return loadObj(K_LEDGER, {}); }
+  function loadLedger(key) { return loadLedgers()[key] || null; }
+  function saveLedger(key, obj) {
+    var all = loadLedgers(); all[key] = obj;
+    var keys = Object.keys(all);
+    if (keys.length > 12) {
+      keys.sort(function (a, b) { return (all[a].createdAt || 0) - (all[b].createdAt || 0); });
+      while (keys.length > 12) delete all[keys.shift()];
+    }
+    save(K_LEDGER, all);
+  }
+  function clearLedger(key) { var all = loadLedgers(); delete all[key]; save(K_LEDGER, all); }
+
+  function ledgerContextNote(ledger, i) {
+    var before = i > 0 ? ledger.slices[i - 1].text : "";
+    var after  = i < ledger.slices.length - 1 ? ledger.slices[i + 1].text : "";
+    var parts = [];
+    if (before) parts.push("Preceding section (end): …" + before.slice(-300));
+    if (after)  parts.push("Following section (start): " + after.slice(0, 300) + "…");
+    return parts.length
+      ? "<context note=\"Surrounding sections — reference only, do not rewrite.\">\n" + parts.join("\n\n") + "\n</context>"
+      : "";
+  }
+
+  function doLedgerRewrite(profile, savedSel, queue) {
+    killPopup();
+    if (!savedSel.cid) savedSel.cid = getChatId();
+    var key = ledgerKey(savedSel.mid, savedSel.text);
+    var ledger = loadLedger(key);
+    // Reuse an existing run only if it matches this selection + profile.
+    if (!ledger || ledger.profileId !== profile.id || ledger.orig !== savedSel.text) {
+      var win = windowText(savedSel.text, sliceBudget());
+      ledger = {
+        key: key, mid: savedSel.mid, cid: savedSel.cid, occ: savedSel.occ || 0,
+        profileId: profile.id, orig: savedSel.text,
+        slices: win.map(function (s) { return { text: s.text, sep: s.sep, result: null, status: "pending" }; }),
+        createdAt: Date.now(),
+      };
+      saveLedger(key, ledger);
+    }
+    logDbg("ledger.start", { mid: savedSel.mid, slices: ledger.slices.length, sliceBudget: sliceBudget() });
+    openLedgerModal(profile, savedSel, ledger, queue);
+  }
+
+  function openLedgerModal(profile, savedSel, ledger, queue) {
+    var total = ledger.slices.length;
+    var controller = new AbortController();
+    var ov = mkOv(10002);
+    var body = mkWin(ov, "560px", profile.name + " — Ledger rewrite (" + total + " slices)");
+    var note = ap(body, mk("div", "", "Large selection — windowed into " + total + " slices, rewritten one at a time. Progress is saved as it goes, so you can close and resume."));
+    note.style.cssText = "font-size:11px;color:var(--primary);margin-bottom:10px;font-weight:600;";
+    var listWrap = mk("div", "rwa-prev");
+    listWrap.style.cssText = "max-height:300px;overflow-y:auto;margin-bottom:8px;";
+    ap(body, listWrap);
+    var statusLine = ap(body, mk("div", "rwa-wc", ""));
+    var ft = ap(body, mk("div", "rwa-foot"));
+    var acceptBtn = mkBtn("Accept all & apply", "rwa-accept", function () { assembleAndCommit(); });
+    acceptBtn.style.flex = "2"; ap(ft, acceptBtn);
+    ap(ft, mkBtn("Cancel", null, function () { controller.abort(); ov.remove(); })).style.flex = "1";
+    function nextPending() { for (var i = 0; i < ledger.slices.length; i++) if (ledger.slices[i].status === "pending") return i; return -1; }
+    function updateStatus() {
+      var done = 0, pend = 0, err = 0;
+      ledger.slices.forEach(function (s) { if (s.status === "done") done++; else if (s.status === "pending" || s.status === "running") pend++; else if (s.status === "error") err++; });
+      statusLine.textContent = done + "/" + total + " done" + (pend ? ", " + pend + " pending" : "") + (err ? ", " + err + " error" : "");
+      acceptBtn.disabled = pend > 0;
+    }
+    function renderList() {
+      listWrap.innerHTML = "";
+      ledger.slices.forEach(function (sl, i) {
+        var row = ap(listWrap, mk("div", ""));
+        row.style.cssText = "padding:6px 0;border-bottom:1px solid var(--border);";
+        var hdr = ap(row, mk("div", ""));
+        hdr.style.cssText = "display:flex;align-items:center;gap:8px;font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted-foreground);";
+        var badge = sl.status === "done" ? "✓ done" : sl.status === "skipped" ? "skipped" : sl.status === "error" ? "✗ error" : sl.status === "running" ? "rewriting…" : "pending";
+        ap(hdr, mk("span", "", "Slice " + (i + 1) + "/" + total + " · " + badge));
+        var acts = ap(hdr, mk("span", "")); acts.style.cssText = "margin-left:auto;display:flex;gap:4px;";
+        var rb = mkBtn("Retry", null, function () { processSlice(i, true); }); rb.classList.add("rwa-btn-sm"); ap(acts, rb);
+        var sb = mkBtn(sl.status === "skipped" ? "Unskip" : "Skip", null, function () {
+          if (sl.status === "skipped") { sl.status = sl.result != null ? "done" : "pending"; } else { sl.status = "skipped"; }
+          saveLedger(ledger.key, ledger); renderList(); updateStatus();
+        });
+        sb.classList.add("rwa-btn-sm"); ap(acts, sb);
+        var prev = ap(row, mk("div", "", sl.result != null ? sl.result : sl.text));
+        prev.style.cssText = "font-size:11px;line-height:1.5;white-space:pre-wrap;margin-top:4px;max-height:80px;overflow:hidden;color:" + (sl.result != null ? "var(--foreground)" : "var(--muted-foreground)") + ";";
+      });
+    }
+    function processSlice(i, single) {
+      if (!ov.parentNode) return;
+      var sl = ledger.slices[i];
+      sl.status = "running"; renderList(); updateStatus();
+      var ow = wc(sl.text), lengthNote = "";
+      if (cfg.lengthEnabled && cfg.lengthPct !== 0) {
+        var target = Math.max(1, Math.round(ow * (1 + cfg.lengthPct / 100)));
+        var lo = Math.max(1, Math.round(target * 0.85)), hi = Math.round(target * 1.15);
+        lengthNote = "\n\nLength: the original is " + ow + " words; rewrite to approximately " + target + " words (range " + lo + "–" + hi + ").";
+      }
+      var ctxNote = ledgerContextNote(ledger, i);
+      var userPrompt = (ctxNote ? ctxNote + "\n\n" : "") +
+        "Task: " + profile.prompt + lengthNote +
+        "\n\nThis is one section of a longer passage. Rewrite only the text inside <rewrite_this>, keeping continuity with the surrounding sections. Output the rewritten passage and nothing else.\n" +
+        "<rewrite_this>\n" + sl.text + "\n</rewrite_this>";
+      runInference(sysPrompt(), userPrompt, controller.signal).then(function (resp) {
+        if (!ov.parentNode || !resp || resp.aborted) return;
+        if (resp.error) { sl.status = "error"; saveLedger(ledger.key, ledger); renderList(); updateStatus(); return; }
+        var clean = stripWrapQuotes((typeof resp.result === "string" ? resp.result : "").trim());
+        if (!clean) { sl.status = "error"; saveLedger(ledger.key, ledger); renderList(); updateStatus(); return; }
+        sl.result = clean; sl.status = "done"; saveLedger(ledger.key, ledger);
+        renderList(); updateStatus();
+        if (!single) { var n = nextPending(); if (n !== -1) processSlice(n, false); }
+      });
+    }
+    function assembleAndCommit() {
+      // Join in order: rewritten result where done, original text where skipped.
+      var assembled = ledger.slices.map(function (s) {
+        return (s.status === "done" && s.result != null ? s.result : s.text) + s.sep;
+      }).join("");
+      logDbg("ledger.assemble", { mid: ledger.mid, slices: total, chars: assembled.length });
+      ov.remove();
+      doCommit(assembled, { text: ledger.orig, mid: ledger.mid, cid: ledger.cid, occ: ledger.occ || 0 }, function () {
+        clearLedger(ledger.key);
+        showToast(null, "✓ Applied (" + total + " slices)", "ok");
+        if (queue && queue.index + 1 < queue.segments.length) doRewrite(profile, { segments: queue.segments, index: queue.index + 1 });
+      });
+    }
+    renderList(); updateStatus();
+    var first = nextPending();
+    if (first !== -1) processSlice(first, false);
   }
 
   function doMergeRewrite(profile, segments) {
@@ -2597,6 +2776,10 @@
         tr.style.cssText = "width:64px;margin:0;padding:6px 10px;font-size:12px;";
         tr.addEventListener("change", function () { cfg.directTemp = Math.max(0, Math.min(2, parseFloat(tr.value) || 0.7)); saveC(); });
         row(direct, "Temperature", tr, "0–2. Lower stays closer to the original.");
+        var ctxInD = mk("input", "rwa-inp"); ctxInD.type = "number"; ctxInD.min = "1024"; ctxInD.max = "1000000";
+        ctxInD.value = String(cfg.ctxTokens || 8192); ctxInD.style.cssText = "width:90px;margin:0;padding:6px 10px;font-size:12px;";
+        ctxInD.addEventListener("change", function () { cfg.ctxTokens = Math.max(1024, Math.min(1000000, parseInt(ctxInD.value, 10) || 8192)); saveC(); });
+        row(direct, "Model context size", ctxInD, "Tokens. Selections over ~1/6 of this are split into slices (Ledger Pattern) instead of truncated.");
 
         var testStatus = mk("div", ""); testStatus.style.cssText = "font-size:11px;margin-top:8px;line-height:1.5;color:var(--muted-foreground);";
         var testBtn = mkBtn("Test connection", null, function () {
@@ -2625,6 +2808,10 @@
         extr.style.cssText = "width:64px;margin:0;padding:6px 10px;font-size:12px;";
         extr.addEventListener("change", function () { cfg.directTemp = Math.max(0, Math.min(2, parseFloat(extr.value) || 0.7)); saveC(); });
         row(extender, "Temperature", extr, "0–2. Shared with Direct API mode.");
+        var ctxInE = mk("input", "rwa-inp"); ctxInE.type = "number"; ctxInE.min = "1024"; ctxInE.max = "1000000";
+        ctxInE.value = String(cfg.ctxTokens || 8192); ctxInE.style.cssText = "width:90px;margin:0;padding:6px 10px;font-size:12px;";
+        ctxInE.addEventListener("change", function () { cfg.ctxTokens = Math.max(1024, Math.min(1000000, parseInt(ctxInE.value, 10) || 8192)); saveC(); });
+        row(extender, "Model context size", ctxInE, "Tokens. Selections over ~1/6 of this are split into slices (Ledger Pattern).");
         var exTestStatus = mk("div", ""); exTestStatus.style.cssText = "font-size:11px;margin-top:8px;line-height:1.5;color:var(--muted-foreground);";
         var exTestBtn = mkBtn("Test connection", null, function () {
           exTestStatus.textContent = "Testing…"; exTestStatus.style.color = "var(--muted-foreground)";

@@ -8,7 +8,8 @@ control, the Marinara Extender integration, and a hardening pass.
 **Credits.** Several features originated in **MrsKieu1102's** r-w-a v2-3 build and were reworked to fit here —
 user-persona / voice-matching context, local model discovery, the edit-only (manual) trigger, speaker-aware
 editing, and redo. The **Marinara Extender** integration (memory source + connection mode), cancellable rewrites,
-the auto-update loader and build pipeline, and the splice-reliability fixes came from **TCLowe1982's**
+the large-text Ledger Pattern, the auto-update loader and build pipeline, and the splice-reliability fixes came
+from **TCLowe1982's**
 [Marinara-Rewrite fork](https://github.com/TCLowe1982/Marinara-Rewrite) (TCLowe ported speaker-aware editing and
 redo from MrsKieu1102's build). Thanks to both.
 
@@ -41,6 +42,10 @@ redo from MrsKieu1102's build). Thanks to both.
   commit clears the redo timeline.
 - **Cancel in-flight rewrite** — a Cancel button on the generating modal aborts the request immediately (both
   sidecar and direct/Extender modes honour the abort signal).
+- **Large-text rewrites via the Ledger Pattern** — a selection larger than ~1/6 of the model context is windowed
+  into slices, rewritten one at a time against a durable, resumable ledger (per-slice review / retry / skip), then
+  assembled and applied in a single splice — replacing the old hard truncation. Set the model's context size in
+  Settings → Connection. Ported from TCLowe1982's fork.
 - **Marinara Extender connection mode** — route rewrites through a Marinara Extender sidecar instead of a
   separate Ollama/llama.cpp process, so only one model runs at a time. Configured in Settings → Connection.
 - **Character memory from Extender** — pulls live character memory from the Extender's `/api/memory-block`

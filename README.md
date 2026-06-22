@@ -62,6 +62,10 @@ section of text in a message using an AI model. Select text, choose a mode, and 
   this far better than a percentage). A **concise system-prompt** option trims tokens further for small models.
 - **Multi-message rewrites** — a selection spanning several messages is rewritten one at a time, or merged into a
   single pass.
+- **Large selections via the Ledger Pattern** — a selection too big for the model's context is windowed into slices
+  (~1/6 of the configured context size), rewritten one at a time against a durable, resumable ledger (review,
+  retry, or skip each slice), then assembled and applied in a single splice — instead of being truncated. Set the
+  model's context size in Settings → Connection.
 - **Undo and redo**, **cancellable** generation (aborts the in-flight request), and a **manual-save** mode that
   leaves the editor open so you confirm before committing.
 - **Occurrence-targeted splice** — when the selected text appears more than once in a message, the rewrite targets
@@ -108,9 +112,10 @@ This release builds on two community forks, with thanks to both authors:
   user-persona / voice-matching context, local model discovery, the edit-only (manual) trigger, speaker-aware
   editing, and redo.
 - **TCLowe1982** — their [Marinara-Rewrite fork](https://github.com/TCLowe1982/Marinara-Rewrite) contributed the
-  Marinara Extender memory source and connection mode, cancellable rewrites, the auto-update loader and build
-  pipeline, and splice-reliability fixes (occurrence-targeted matching, multi-paragraph anchors, and correct
-  lorebook scan handling). TCLowe also ported the speaker-aware editing and redo features from MrsKieu1102's build.
+  Marinara Extender memory source and connection mode, cancellable rewrites, the large-text Ledger Pattern
+  (windowed, resumable rewrites), the auto-update loader and build pipeline, and splice-reliability fixes
+  (occurrence-targeted matching, multi-paragraph anchors, and correct lorebook scan handling). TCLowe also ported
+  the speaker-aware editing and redo features from MrsKieu1102's build.
 
 ## Limitations
 
