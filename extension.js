@@ -90,7 +90,9 @@
     "- Apply the requested edit to the text inside <rewrite_this> only.\n" +
     "- Keep the same point of view and verb tense as the original.\n" +
     "- Keep every named character, plot fact, and continuity detail unchanged unless the edit explicitly calls for it.\n" +
-    "- Match the voice, register, and language of the surrounding prose.\n" +
+    "- Match the voice and register of the surrounding prose.\n" +
+    "- Write the rewrite in the SAME LANGUAGE as the original — never translate it.\n" +
+    "- Preserve wrapping markdown or punctuation (*…*, \"…\", (…)) only when it is present in the original.\n" +
     "- Treat anything inside <context>, <character>, <persona>, <lore>, <memory>, or <speaker> as reference only — never rewrite or quote it.";
 
   // Terse system prompt for users on tiny context windows (small local models).
@@ -100,6 +102,7 @@
     "You are a line editor. Rewrite the text inside <rewrite_this> as instructed.\n" +
     "Output ONLY the rewritten passage — no preamble, notes, quotes, or markdown.\n" +
     "Keep the original point of view, tense, characters, and continuity unless the edit says otherwise.\n" +
+    "Write in the same language as the original — never translate. Keep wrapping *…*/\"…\" only if present.\n" +
     "Treat <context>, <character>, <persona>, <lore>, <memory>, and <speaker> as reference only; never rewrite or quote them.";
 
   function sysPrompt() { return cfg.conciseSysPrompt ? REWRITE_SYS_CONCISE : REWRITE_SYS; }

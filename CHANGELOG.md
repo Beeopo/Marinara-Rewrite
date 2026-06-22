@@ -22,6 +22,8 @@ source below so it's clear what came from where.
 - **User-persona / voice-matching context** — include your active persona when rewriting your own messages.
 - **Local model discovery** — list models from a direct endpoint (also added endpoint presets).
 - **Edit-only (manual) trigger** — selection no longer opens the popup; use `Alt+R`.
+- **Language lock** — system prompt now keeps the original's language (never translates) and preserves markdown
+  wrappers (`*…*`, quotes) only when present.
 
 ### Added — from TCLowe1982's Marinara-Rewrite fork
 
