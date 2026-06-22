@@ -5,11 +5,13 @@ section of text in a message using an AI model. Select text, choose a mode, and 
 
 ## Screenshots
 
-| Rewrite popup | Custom prompt |
+| Rewrite popup | Result with diff |
 | --- | --- |
-| <img src="screenshots/rewrite-popup.png" width="380" alt="Rewrite popup with mode grid and length control"> | <img src="screenshots/custom-prompt.png" width="380" alt="Custom prompt dialog"> |
+| <img src="screenshots/popup.png" width="380" alt="Rewrite popup: token-cost panel, mode grid, length slider"> | <img src="screenshots/result.png" width="380" alt="Result modal with original/rewritten diff, token breakdown, and Copy"> |
 
-![Settings — Profiles](screenshots/settings-profiles.png)
+![Settings — Styles](screenshots/settings-styles.png)
+
+![Settings — Context](screenshots/settings-context.png)
 
 ![Settings — Connection](screenshots/settings-connection.png)
 
