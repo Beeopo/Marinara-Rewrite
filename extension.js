@@ -675,7 +675,7 @@
 
   marinara.addStyle(
         ".rwa{position:fixed;background:var(--popover);border:1px solid var(--border);border-radius:12px;" +
-    "padding:12px;box-shadow:0 12px 40px rgba(0,0,0,.55);z-index:10000;display:flex;flex-direction:column;gap:6px;" +
+    "padding:12px;box-shadow:0 12px 40px rgba(0,0,0,.15);z-index:10000;display:flex;flex-direction:column;gap:6px;" +
     "min-width:200px;width:max-content;max-width:min(90vw,480px);backdrop-filter:blur(18px);overflow:hidden;" +
     "animation:rwa-in .14s cubic-bezier(.22,1,.36,1);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,'Open Sans','Helvetica Neue',sans-serif;}" +
     "@keyframes rwa-in{from{opacity:0;transform:translateY(6px) scale(.95)}to{opacity:1;transform:none}}" +
@@ -736,7 +736,7 @@
     "box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:10010;pointer-events:none;" +
     "opacity:0;transition:opacity .12s;}" +
     ".rwa-tip-show{opacity:1!important;}" +
-    ".rwa-ov{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.72);" +
+    ".rwa-ov{position:fixed;top:0;left:0;right:0;bottom:0;background:color-mix(in srgb,var(--background) 88%,var(--foreground) 12%);" +
     "backdrop-filter:blur(8px);z-index:10001;display:flex;align-items:center;justify-content:center;" +
     "animation:rwa-fade .18s ease-out;}" +
     "@keyframes rwa-fade{from{opacity:0}to{opacity:1}}" +
@@ -786,7 +786,7 @@
     "padding:8px 16px;border-radius:8px;font:700 12px/1.4 inherit;" +
     "box-shadow:0 4px 20px rgba(0,0,0,.5);z-index:20000;pointer-events:none;" +
     "transition:opacity .4s ease;max-width:320px;text-align:center;}" +
-    ".rwa-toast-ok{background:linear-gradient(135deg,#10b981,#14b8a6)!important;color:#fff!important;}" +
+    ".rwa-toast-ok{background:var(--primary)!important;color:var(--primary-foreground)!important;}" +
     ".rwa-hist{background:var(--secondary);border:1px solid var(--border);" +
     "border-radius:8px;padding:8px 12px;margin-bottom:6px;}" +
     ".rwa-badge{display:inline-block;font-size:9px;font-weight:600;background:var(--primary);" +
