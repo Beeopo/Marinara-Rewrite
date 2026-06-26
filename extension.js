@@ -426,10 +426,19 @@
   }
 
   function rawScan(cid) {
-    // Fetch all lorebook entries for the chat so the fallback can filter.
-    return marinara.apiFetch("/lorebook-entries?chatId=" + encodeURIComponent(cid || ""))
+    // /lorebook-entries was removed in Marinara v2.x; /lorebooks/scan/:chatId is
+    // the replacement (same endpoint fetchLorebookEntries uses). Field names are
+    // normalized defensively until confirmed against a live v2.0.5 instance.
+    return marinara.apiFetch("/lorebooks/scan/" + encodeURIComponent(cid || ""))
       .then(function (resp) {
-        return Array.isArray(resp) ? resp : ((resp && (resp.entries || resp.data)) || []);
+        var arr = Array.isArray(resp) ? resp : ((resp && (resp.entries || resp.data)) || []);
+        return arr.map(function (e) {
+          return {
+            lorebookId: e.lorebookId != null ? e.lorebookId : (e.lorebook_id != null ? e.lorebook_id : e.bookId),
+            name: e.name || e.title || "",
+            content: e.content || e.text || "",
+          };
+        });
       }).catch(function () { return []; });
   }
 
