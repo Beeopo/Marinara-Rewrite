@@ -1262,6 +1262,34 @@
     ap(ft, mkBtn("Close", null, function () { ov.remove(); })).style.flex = "1";
   }
 
+  // Review mode: show the spliced raw content in an editable textarea and only
+  // PATCH (with whatever the user edited) when they click Apply.
+  function reviewThenPatch(cid, mid, oldContent, proposed, onDone) {
+    var ov = mkOv(10010);
+    var body = mkWin(ov, "560px", "Review & edit before applying");
+    var ta = ap(body, mk("textarea", "rwa-inp"));
+    ta.value = proposed;
+    ta.style.cssText = "width:100%;min-height:240px;resize:vertical;white-space:pre-wrap;font-family:inherit;";
+    var ft = ap(body, mk("div", "rwa-foot"));
+    ap(ft, mkBtn("Apply", "rwa-accept", function () {
+      var content = ta.value;
+      invalidateMsgCache();
+      patchMessage(cid, mid, content)
+        .then(function () {
+          var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
+          hist.unshift({ mid: mid, cid: cid, old: oldContent, post: content, when: Date.now() });
+          if (hist.length > depth) hist.length = depth;
+          if (redo.length) { redo.length = 0; saveRedo(); }
+          saveH();
+          ov.remove();
+          showToast(null, "✓ Applied", "ok");
+          if (onDone) onDone();
+        })
+        .catch(function (e) { showErr("Save failed:\n" + (e && e.message ? e.message : String(e))); });
+    })).style.flex = "2";
+    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+  }
+
   // ── Toast ─────────────────────────────────────────────────────────────────
   function showToast(anchorEl, msg, variant) {
     var t = mk("div", "rwa-toast" + (variant === "ok" ? " rwa-toast-ok" : ""), msg);
@@ -2023,6 +2051,10 @@
         var updated = rawContent.slice(0, span.as) + newText + rawContent.slice(span.ae);
 
         invalidateMsgCache();
+        if (cfg.reviewBeforeApply) {
+          reviewThenPatch(cid, mid, msg.content, updated, onDone);
+          return;
+        }
         patchMessage(cid, mid, updated)
           .then(function () {
             var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
@@ -2705,7 +2737,7 @@
           "Don't pop up when you select text — press Alt+R instead.");
         row(db, "Auto-apply", ck(cfg.autoApply, function (e) { cfg.autoApply = e.target.checked; saveC(); }),
           "Skip the preview and replace the text immediately.");
-        row(db, "Place in editor, don't save", ck(cfg.reviewBeforeApply, function (e) { cfg.reviewBeforeApply = e.target.checked; saveC(); }),
+        row(db, "Review & edit before applying", ck(cfg.reviewBeforeApply, function (e) { cfg.reviewBeforeApply = e.target.checked; saveC(); }),
           "Drop the rewrite into the message editor so you confirm and save it yourself (Ctrl+Enter).");
         row(db, "Typewriter reveal", ck(cfg.typewriter, function (e) { cfg.typewriter = e.target.checked; saveC(); }));
         row(db, "Show word diff", ck(cfg.showDiff, function (e) { cfg.showDiff = e.target.checked; saveC(); }));
