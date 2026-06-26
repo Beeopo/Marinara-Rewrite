@@ -68,6 +68,7 @@ assert.ok(_SRC.includes("function mapRenderedSpanToRaw"), "drift: mapRenderedSpa
 assert.ok(_SRC.includes("function alignExact"), "drift: alignExact (exact LCS core) missing");
 assert.ok(_SRC.includes("function findCleanAnchor"), "drift: findCleanAnchor (windowing peg) missing");
 assert.ok(_SRC.includes("function normForAnchor"), "drift: normForAnchor (quote-normalized anchoring) missing");
+assert.ok(_SRC.includes("function windowMap"), "drift: windowMap (per-edge large-selection mapping) missing");
 assert.ok(_SRC.includes("function doRedo"), "drift: doRedo missing");
 assert.ok(_SRC.includes('connMode === "extender"'), "drift: extender branch missing");
 assert.ok(_SRC.includes("_autoInFlight"), "drift: _autoInFlight guard missing");
@@ -181,12 +182,9 @@ function _findCleanAnchor(R, A, pos, side, LEN, MAXSPAN) {
 }
 // mirror of extension.js normForAnchor
 function _normForAnchor(s) { return s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'"); }
-// mirror of extension.js mapRenderedSpanToRaw (windowed wrapper over _alignExact)
-function _mapRenderedSpanToRaw(R, A, rs, re) {
+// mirror of extension.js windowMap
+function _windowMap(R, A, rs, re) {
   const n = R.length, m = A.length;
-  if (!n || !m) return null;
-  if (rs < 0 || re > n || re < rs) return null;
-  if (n * m <= 4000000) return _alignExact(R, A, rs, re);
   const LEN = 40, MAXSPAN = 800;
   const Rn = _normForAnchor(R), An = _normForAnchor(A);
   const left = _findCleanAnchor(Rn, An, rs, -1, LEN, MAXSPAN);
@@ -200,6 +198,20 @@ function _mapRenderedSpanToRaw(R, A, rs, re) {
   const loc = _alignExact(R.slice(wlo, whi), A.slice(lo, hi), rs - wlo, re - wlo);
   if (!loc) return null;
   return { as: lo + loc.as, ae: lo + loc.ae };
+}
+// mirror of extension.js mapRenderedSpanToRaw (windowed; large selections map per-edge)
+function _mapRenderedSpanToRaw(R, A, rs, re) {
+  const n = R.length, m = A.length;
+  if (!n || !m) return null;
+  if (rs < 0 || re > n || re < rs) return null;
+  if (n * m <= 4000000) return _alignExact(R, A, rs, re);
+  const whole = _windowMap(R, A, rs, re);
+  if (whole) return whole;
+  if (re - rs < 1) return null;
+  const startSpan = _windowMap(R, A, rs, rs + 1);
+  const endSpan = _windowMap(R, A, re - 1, re);
+  if (!startSpan || !endSpan || endSpan.ae < startSpan.as) return null;
+  return { as: startSpan.as, ae: endSpan.ae };
 }
 function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
 // clean boundaries MUST splice exactly:
@@ -261,4 +273,23 @@ function _filler(tag, count) {
   const out = _spl(RND, RAW, rs, rs + "afraid".length, "<<X>>");
   assert.equal(out, preA + "He felt *<<X>>* then. " + postA, "dialogue/quote-dense splice (normalized anchoring)");
   console.log("selfcheck: dialogue quote-normalization assertions passed");
+}
+{
+  // LARGE selection: when the SELECTION itself exceeds the ~4M cap it can't window as a
+  // single slice (the bug behind the live "Could not map" on a big paragraph — selections
+  // ≳1.9k chars returned null -> copy fallback). Its interior is replaced wholesale, so
+  // each edge is mapped with its own tiny window. Edges clean here -> exact splice.
+  const pre = _filler("Lp", 30), midSel = _filler("Lm", 60), post = _filler("Lq", 30);
+  const RAW = pre + midSel + post;   // no transforms in this case: rendered == raw
+  assert.ok(RAW.length * RAW.length > 4000000, "large-sel test not large enough");
+  assert.ok(midSel.length > 1900, "selection not large enough to force edge-mapping: " + midSel.length);
+  const out = _spl(RAW, RAW, pre.length, pre.length + midSel.length, "<<X>>");
+  assert.equal(out, pre + "<<X>>" + post, "large-selection edge-mapped splice (clean edges)");
+  // and with an italic that opens just before the selection and closes just after it:
+  // the markers must be preserved around the replacement, not bisected.
+  const RAW2 = pre + "*" + midSel + "*" + post;
+  const RND2 = pre + midSel + post; // italic markers stripped in render
+  const out2 = _spl(RND2, RAW2, pre.length, pre.length + midSel.length, "<<X>>");
+  assert.equal(out2, pre + "*<<X>>*" + post, "large-selection edge-mapped splice (transform-straddled edges)");
+  console.log("selfcheck: large-selection edge-mapping assertions passed");
 }

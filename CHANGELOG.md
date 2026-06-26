@@ -11,6 +11,9 @@
   copy/paste. The render↔stored alignment is now windowed around the selection, so a
   full-length roleplay reply (the exact alignment cost previously blew a size cap at
   ~2,000 characters) maps and splices correctly without scanning the whole message.
+  Large *selections* (a whole paragraph, ≳2,000 characters) are handled too: their
+  two cut points are mapped independently, since the selected span is replaced wholesale
+  and only its boundaries need locating.
 - **Fixed:** the edited message now updates on screen immediately after applying
   (the API-commit path refreshes the engine's chat view; previously a direct write
   left the displayed text stale until you switched chats or reloaded).

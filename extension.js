@@ -702,14 +702,6 @@
     }
     return null;
   }
-  // Map a rendered span [rs,re) into raw msg.content coords. Small message: exact
-  // full-message LCS. Large message: the O(n*m) matrix would blow the cap (the v5.1
-  // bug — a 3k-char message is 9M cells), so window it — peg clean anchors just outside
-  // the selection on both sides and run alignExact on only that bounded slice, then
-  // translate the result back to global raw coords. The anchors share verbatim text
-  // with raw at both window edges, so the windowed alignment is as exact as the full
-  // one. Falls back to null (copy) only when the message can't be anchored or the
-  // selection itself is too large to window.
   // Curly quotes/apostrophes are the engine's most common length-PRESERVING transform
   // (straight " -> “ ”, ' -> ’). They break verbatim anchor matching but not positions,
   // so we normalize them straight for the anchor SEARCH only — pegs stay valid in the
@@ -717,11 +709,13 @@
   function normForAnchor(s) {
     return s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
   }
-  function mapRenderedSpanToRaw(R, A, rs, re) {
+  // Window the alignment of [rs,re): peg clean anchors just outside the selection on
+  // both sides and run alignExact on only that bounded slice, then translate the cut
+  // back to global raw coords. The window must CONTAIN the whole selection, so this
+  // returns null when the selection itself is too big (its own size blows the cap) —
+  // mapRenderedSpanToRaw handles that case by mapping the two edges separately.
+  function windowMap(R, A, rs, re) {
     var n = R.length, m = A.length;
-    if (!n || !m) return null;
-    if (rs < 0 || re > n || re < rs) return null;
-    if (n * m <= 4000000) return alignExact(R, A, rs, re);
     var LEN = 40, MAXSPAN = 800;
     var Rn = normForAnchor(R), An = normForAnchor(A);
     var left = findCleanAnchor(Rn, An, rs, -1, LEN, MAXSPAN);
@@ -731,10 +725,31 @@
     var whi = right ? right.rPos + LEN : n;
     var hi = right ? right.aPos + LEN : m;
     if (wlo > rs || whi < re || lo >= hi || wlo >= whi) return null; // anchors must bracket & stay ordered
-    if ((whi - wlo) * (hi - lo) > 4000000) return null;             // selection too large to window
+    if ((whi - wlo) * (hi - lo) > 4000000) return null;             // window (incl. whole selection) too big
     var loc = alignExact(R.slice(wlo, whi), A.slice(lo, hi), rs - wlo, re - wlo);
     if (!loc) return null;
     return { as: lo + loc.as, ae: lo + loc.ae };
+  }
+  // Map a rendered span [rs,re) into raw msg.content coords. Small message: exact
+  // full-message LCS. Large message: the O(n*m) matrix would blow the ~4M-cell cap
+  // (the v5.1 bug), so window it. A SMALL selection windows whole in one slice. A LARGE
+  // selection (>~1.9k chars) can't — its own size exceeds the cap — but its interior is
+  // replaced wholesale, so only the two cut points matter: map each edge with its own
+  // tiny window. Falls back to null (copy) only when the message can't be anchored.
+  function mapRenderedSpanToRaw(R, A, rs, re) {
+    var n = R.length, m = A.length;
+    if (!n || !m) return null;
+    if (rs < 0 || re > n || re < rs) return null;
+    if (n * m <= 4000000) return alignExact(R, A, rs, re);
+    var whole = windowMap(R, A, rs, re);
+    if (whole) return whole;
+    // Selection too large to align as one window — map the START and END edges
+    // independently (1-char windows), then splice everything between them.
+    if (re - rs < 1) return null;
+    var startSpan = windowMap(R, A, rs, rs + 1);
+    var endSpan = windowMap(R, A, re - 1, re);
+    if (!startSpan || !endSpan || endSpan.ae < startSpan.as) return null;
+    return { as: startSpan.as, ae: endSpan.ae };
   }
   function wcDiff(a, b) {
     var d = wc(b) - wc(a), p = wc(a) ? Math.round((d / wc(a)) * 100) : 0;
