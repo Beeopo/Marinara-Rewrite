@@ -65,6 +65,9 @@ assert.ok(_SRC.includes("PATCH did not return an updated message"), "drift: PATC
 assert.ok(_SRC.includes("function renderedTextForMid"), "drift: renderedTextForMid missing");
 assert.ok(_SRC.includes("function refreshMessages"), "drift: refreshMessages (post-PATCH view refresh) missing");
 assert.ok(_SRC.includes("function mapRenderedSpanToRaw"), "drift: mapRenderedSpanToRaw missing");
+assert.ok(_SRC.includes("function alignExact"), "drift: alignExact (exact LCS core) missing");
+assert.ok(_SRC.includes("function findCleanAnchor"), "drift: findCleanAnchor (windowing peg) missing");
+assert.ok(_SRC.includes("function normForAnchor"), "drift: normForAnchor (quote-normalized anchoring) missing");
 assert.ok(_SRC.includes("function doRedo"), "drift: doRedo missing");
 assert.ok(_SRC.includes('connMode === "extender"'), "drift: extender branch missing");
 assert.ok(_SRC.includes("_autoInFlight"), "drift: _autoInFlight guard missing");
@@ -76,9 +79,9 @@ assert.ok(_LOADER.includes("allowRemote"), "drift: loader.js allowRemote gate mi
 console.log("drift-guard assertions passed");
 console.log("selfcheck: debug-buffer assertions passed");
 
-// 6) render<->raw span alignment + NON-CORRUPTION (mirror of mapRenderedSpanToRaw)
-function _mapRenderedSpanToRaw(R, A, rs, re) {
-  // <<< keep this mirror IDENTICAL in logic to extension.js's mapRenderedSpanToRaw >>>
+// 6) render<->raw span alignment + NON-CORRUPTION (mirror of alignExact)
+function _alignExact(R, A, rs, re) {
+  // <<< keep this mirror IDENTICAL in logic to extension.js's alignExact >>>
   const n = R.length, m = A.length;
   if (!n || !m || n * m > 4000000) return null;
   if (rs < 0 || re > n || re < rs) return null;
@@ -162,6 +165,42 @@ function _mapRenderedSpanToRaw(R, A, rs, re) {
   if (dirtyStart || dirtyEnd) return null;
   return { as, ae };
 }
+// mirror of extension.js findCleanAnchor
+function _findCleanAnchor(R, A, pos, side, LEN, MAXSPAN) {
+  const step = 8;
+  for (let t = 0; t * step <= MAXSPAN; t++) {
+    const p = side < 0 ? (pos - t * step - LEN) : (pos + t * step);
+    if (p < 0 || p + LEN > R.length) continue;
+    const cand = R.substring(p, p + LEN);
+    const idx = A.indexOf(cand);
+    if (idx < 0) continue;
+    if (A.indexOf(cand, idx + 1) >= 0) continue;
+    return { rPos: p, aPos: idx };
+  }
+  return null;
+}
+// mirror of extension.js normForAnchor
+function _normForAnchor(s) { return s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'"); }
+// mirror of extension.js mapRenderedSpanToRaw (windowed wrapper over _alignExact)
+function _mapRenderedSpanToRaw(R, A, rs, re) {
+  const n = R.length, m = A.length;
+  if (!n || !m) return null;
+  if (rs < 0 || re > n || re < rs) return null;
+  if (n * m <= 4000000) return _alignExact(R, A, rs, re);
+  const LEN = 40, MAXSPAN = 800;
+  const Rn = _normForAnchor(R), An = _normForAnchor(A);
+  const left = _findCleanAnchor(Rn, An, rs, -1, LEN, MAXSPAN);
+  const right = _findCleanAnchor(Rn, An, re, 1, LEN, MAXSPAN);
+  const wlo = left ? left.rPos : 0;
+  const lo = left ? left.aPos : 0;
+  const whi = right ? right.rPos + LEN : n;
+  const hi = right ? right.aPos + LEN : m;
+  if (wlo > rs || whi < re || lo >= hi || wlo >= whi) return null;
+  if ((whi - wlo) * (hi - lo) > 4000000) return null;
+  const loc = _alignExact(R.slice(wlo, whi), A.slice(lo, hi), rs - wlo, re - wlo);
+  if (!loc) return null;
+  return { as: lo + loc.as, ae: lo + loc.ae };
+}
 function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
 // clean boundaries MUST splice exactly:
 assert.equal(_spl("hello world", "hello world", 6, 11, "X"), "hello X");           // identity
@@ -175,6 +214,51 @@ const _s6 = _spl("Hi Alice!", "Hi {{char}}!", 3, 8, "X"); // whole expanded macr
 assert.ok(_s6 === null || _s6 === "Hi X!", "macro whole-token: must snap clean or fall back; got: " + _s6);
 const _s7 = _spl("Hi Alice!", "Hi {{char}}!", 3, 6, "X"); // sub-token "Ali"
 assert.ok(_s7 === null || _s7 === "Hi X!", "macro sub-token: must snap clean or fall back; got: " + _s7);
-// over-cap returns null
+// unanchorable large input (no shared runs) returns null -> copy fallback
 assert.equal(_mapRenderedSpanToRaw("a".repeat(2001), "b".repeat(2001), 0, 1), null);
 console.log("selfcheck: span-alignment assertions passed");
+
+// 6b) LARGE-message windowing. A real roleplay message (~3k chars) makes the full
+// O(n*m) matrix exceed the 4M cap, so the un-windowed aligner returns null and the
+// rewrite falls back to manual copy (the v5.1 bug seen live: 3173x3161 = 10M). The
+// windowed aligner must splice correctly while leaving the huge untouched regions
+// byte-identical. Filler is varied (embedded indices) so 40-char anchor runs are unique.
+function _filler(tag, count) {
+  let s = "";
+  for (let i = 0; i < count; i++)
+    s += tag + i + ": the quick brown fox " + (i * 7) + " jumps over the lazy dog " + (i * 13) + ". ";
+  return s;
+}
+{
+  const pre = _filler("Pre", 40), post = _filler("Post", 40);
+  const RAW = pre + ' She whispered *softly* to {{char}}, "hi" now. ' + post;
+  const RND = pre + " She whispered softly to Alice, “hi” now. " + post; // italic stripped, macro expanded, quotes curled
+  assert.ok(RAW.length * RND.length > 4000000, "large test not large enough: " + RAW.length * RND.length);
+  // (a) clean word inside an italic span -> markers preserved, filler untouched
+  const rsA = RND.indexOf("softly");
+  const outA = _spl(RND, RAW, rsA, rsA + "softly".length, "MURMURED");
+  assert.equal(outA, pre + ' She whispered *MURMURED* to {{char}}, "hi" now. ' + post, "large/clean-word splice");
+  // (b) selection spanning a macro: never corrupt the message; filler stays intact
+  const rsB = RND.indexOf("whispered softly to Alice");
+  const outB = _spl(RND, RAW, rsB, rsB + "whispered softly to Alice".length, "X");
+  assert.ok(outB === null || (outB.startsWith(pre) && outB.endsWith(post)), "large/macro-span: filler corrupted; got middle: " + (outB && outB.slice(pre.length, pre.length + 50)));
+  console.log("selfcheck: large-message windowing assertions passed");
+}
+{
+  // Quote-dense dialogue: curly quotes every few chars mean NO quote-free 40-char
+  // anchor run exists near the selection. Without quote-normalization the anchor
+  // search fails on every window (rendered “ != stored ") and the rewrite falls back
+  // to copy; quote-normalized anchoring maps it. (Splice still aligns original text.)
+  const u = (i) => "“Y" + i + ",” “N" + i + ",” ";
+  const ur = (i) => '"Y' + i + ',\" "N' + i + ',\" ';
+  let preR = "", preA = "", postR = "", postA = "";
+  for (let i = 0; i < 100; i++) { preR += u(i); preA += ur(i); }
+  for (let i = 100; i < 200; i++) { postR += u(i); postA += ur(i); }
+  const RAW = preA + "He felt *afraid* then. " + postA;
+  const RND = preR + "He felt afraid then. " + postR;
+  assert.ok(RAW.length * RND.length > 4000000, "dialogue test not large enough: " + RAW.length * RND.length);
+  const rs = RND.indexOf("afraid");
+  const out = _spl(RND, RAW, rs, rs + "afraid".length, "<<X>>");
+  assert.equal(out, preA + "He felt *<<X>>* then. " + postA, "dialogue/quote-dense splice (normalized anchoring)");
+  console.log("selfcheck: dialogue quote-normalization assertions passed");
+}

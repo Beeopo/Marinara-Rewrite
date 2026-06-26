@@ -7,6 +7,10 @@
   rendered DOM no longer matches stored content. The extension now commits via the
   message API (`PATCH`), locating the selection in the engine's rendered output and
   aligning it back to stored content for the splice — no editor automation.
+- **Fixed:** rewrites in long messages now apply instead of falling back to manual
+  copy/paste. The render↔stored alignment is now windowed around the selection, so a
+  full-length roleplay reply (the exact alignment cost previously blew a size cap at
+  ~2,000 characters) maps and splices correctly without scanning the whole message.
 - **Fixed:** the edited message now updates on screen immediately after applying
   (the API-commit path refreshes the engine's chat view; previously a direct write
   left the displayed text stale until you switched chats or reloaded).

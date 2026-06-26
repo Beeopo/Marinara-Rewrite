@@ -591,9 +591,9 @@
   // demoted to non-anchors. Boundaries that touch a transform are snapped OUTWARD to
   // cover whole token(s); if a clean span cannot be produced, null is returned and
   // the caller shows the Copy fallback. Clean boundaries always splice exactly.
-  function mapRenderedSpanToRaw(R, A, rs, re) {
+  function alignExact(R, A, rs, re) {
     var n = R.length, m = A.length;
-    if (!n || !m || n * m > 4000000) return null; // ponytail: ~2k×2k char cap; null -> copy fallback
+    if (!n || !m || n * m > 4000000) return null; // ponytail: ~2k×2k char cap; null -> caller windows or copy-falls-back
     if (rs < 0 || re > n || re < rs) return null;
     var i, j, k, c;
     var dp = [];
@@ -683,6 +683,58 @@
     var dirtyEnd = ae > 0 && ae < m && !matchedRaw[ae - 1] && !matchedRaw[ae];
     if (dirtyStart || dirtyEnd) return null;
     return { as: as, ae: ae };
+  }
+  // Find a "clean anchor": a verbatim run of rendered text near `pos` that occurs
+  // exactly once in raw A, giving an unambiguous coordinate peg. side<0 searches runs
+  // ending at/before pos (leftward); side>0 searches runs starting at/after pos
+  // (rightward). Steps past transforms (which break the verbatim match) and repetition
+  // (which breaks uniqueness). Returns {rPos, aPos} (R[rPos..rPos+LEN] === A[aPos..]) or null.
+  function findCleanAnchor(R, A, pos, side, LEN, MAXSPAN) {
+    var step = 8, t, p, cand, idx;
+    for (t = 0; t * step <= MAXSPAN; t++) {
+      p = side < 0 ? (pos - t * step - LEN) : (pos + t * step);
+      if (p < 0 || p + LEN > R.length) continue;
+      cand = R.substring(p, p + LEN);
+      idx = A.indexOf(cand);
+      if (idx < 0) continue;                       // transform inside cand: not verbatim in raw
+      if (A.indexOf(cand, idx + 1) >= 0) continue; // not unique: ambiguous peg
+      return { rPos: p, aPos: idx };
+    }
+    return null;
+  }
+  // Map a rendered span [rs,re) into raw msg.content coords. Small message: exact
+  // full-message LCS. Large message: the O(n*m) matrix would blow the cap (the v5.1
+  // bug — a 3k-char message is 9M cells), so window it — peg clean anchors just outside
+  // the selection on both sides and run alignExact on only that bounded slice, then
+  // translate the result back to global raw coords. The anchors share verbatim text
+  // with raw at both window edges, so the windowed alignment is as exact as the full
+  // one. Falls back to null (copy) only when the message can't be anchored or the
+  // selection itself is too large to window.
+  // Curly quotes/apostrophes are the engine's most common length-PRESERVING transform
+  // (straight " -> “ ”, ' -> ’). They break verbatim anchor matching but not positions,
+  // so we normalize them straight for the anchor SEARCH only — pegs stay valid in the
+  // original coords, and the splice still aligns the original (un-normalized) window.
+  function normForAnchor(s) {
+    return s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+  }
+  function mapRenderedSpanToRaw(R, A, rs, re) {
+    var n = R.length, m = A.length;
+    if (!n || !m) return null;
+    if (rs < 0 || re > n || re < rs) return null;
+    if (n * m <= 4000000) return alignExact(R, A, rs, re);
+    var LEN = 40, MAXSPAN = 800;
+    var Rn = normForAnchor(R), An = normForAnchor(A);
+    var left = findCleanAnchor(Rn, An, rs, -1, LEN, MAXSPAN);
+    var right = findCleanAnchor(Rn, An, re, 1, LEN, MAXSPAN);
+    var wlo = left ? left.rPos : 0;
+    var lo = left ? left.aPos : 0;
+    var whi = right ? right.rPos + LEN : n;
+    var hi = right ? right.aPos + LEN : m;
+    if (wlo > rs || whi < re || lo >= hi || wlo >= whi) return null; // anchors must bracket & stay ordered
+    if ((whi - wlo) * (hi - lo) > 4000000) return null;             // selection too large to window
+    var loc = alignExact(R.slice(wlo, whi), A.slice(lo, hi), rs - wlo, re - wlo);
+    if (!loc) return null;
+    return { as: lo + loc.as, ae: lo + loc.ae };
   }
   function wcDiff(a, b) {
     var d = wc(b) - wc(a), p = wc(a) ? Math.round((d / wc(a)) * 100) : 0;
