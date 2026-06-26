@@ -509,6 +509,32 @@
     for (var k = 0; k < n && idx !== -1; k++) idx = hay.indexOf(needle, idx + needle.length);
     return idx;
   }
+  // Map a [rs,re) span in the rendered text to a [as,ae) span in raw msg.content.
+  // The engine renders raw content through macro/quote/markdown transforms; this
+  // LCS-aligns the two strings so a selection captured from the DOM can be spliced
+  // back into raw content. Returns null over the size cap (caller copies instead).
+  function mapRenderedSpanToRaw(R, A, rs, re) {
+    var n = R.length, m = A.length;
+    if (!n || !m || n * m > 4000000) return null; // ponytail: ~2k×2k char cap; null -> copy fallback
+    var dp = [];
+    for (var i = 0; i <= n; i++) dp.push(new Int32Array(m + 1));
+    for (var i = n - 1; i >= 0; i--)
+      for (var j = m - 1; j >= 0; j--)
+        dp[i][j] = (R.charCodeAt(i) === A.charCodeAt(j))
+          ? dp[i + 1][j + 1] + 1
+          : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    var rawAt = new Int32Array(n + 1);
+    var i2 = 0, j2 = 0;
+    while (i2 < n) {
+      if (j2 < m && R.charCodeAt(i2) === A.charCodeAt(j2)) { rawAt[i2++] = j2++; }
+      else if (j2 >= m) { rawAt[i2++] = m; }
+      else if (dp[i2 + 1][j2] >= dp[i2][j2 + 1]) { rawAt[i2++] = j2; } // rendered-only
+      else { j2++; }                                                   // raw-only
+    }
+    rawAt[n] = m;
+    var as = rawAt[rs], ae = rawAt[re];
+    return (ae >= as) ? { as: as, ae: ae } : null;
+  }
   function wcDiff(a, b) {
     var d = wc(b) - wc(a), p = wc(a) ? Math.round((d / wc(a)) * 100) : 0;
     return (d >= 0 ? "+" : "") + d + " words (" + (p >= 0 ? "+" : "") + p + "%)";
