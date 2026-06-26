@@ -192,6 +192,47 @@
   }
   function invalidateMsgCache() { _msgCache = { key: null, msgs: null, ts: 0 }; }
 
+  // Direct PATCH leaves the engine's react-query cache unaware of the change, so the
+  // on-screen message stays stale until its own refetch (the removed editor save used
+  // to trigger that). Reach the engine's QueryClient via the React fiber (it sits a
+  // few nodes under #root) and invalidate the chat's message query. Best-effort: if
+  // engine internals change this no-ops and we fall back to refetch-on-navigate; it
+  // never throws into the commit path.
+  var _qc = null;
+  function findQueryClient() {
+    if (_qc && typeof _qc.invalidateQueries === "function") return _qc;
+    var root = document.getElementById("root") || document.body;
+    if (!root) return null;
+    var key = null, ks = Object.keys(root), i;
+    for (i = 0; i < ks.length; i++) {
+      if (ks[i].indexOf("__reactContainer") === 0 || ks[i].indexOf("__reactFiber") === 0) { key = ks[i]; break; }
+    }
+    if (!key) return null;
+    var start = root[key];
+    if (start && start.current) start = start.current;
+    var stack = [start], seen = new Set(), count = 0;
+    while (stack.length && count < 50000) {
+      var f = stack.pop(); count++;
+      if (!f || typeof f !== "object" || seen.has(f)) continue;
+      seen.add(f);
+      var c = f.memoizedProps && f.memoizedProps.client;
+      if (c && typeof c.invalidateQueries === "function") { _qc = c; return c; }
+      if (f.child) stack.push(f.child);
+      if (f.sibling) stack.push(f.sibling);
+    }
+    return null;
+  }
+  function refreshMessages(cid) {
+    try {
+      var qc = findQueryClient();
+      if (!qc || !cid) return;
+      qc.invalidateQueries({ predicate: function (q) {
+        var k = q && q.queryKey;
+        return Array.isArray(k) && k.indexOf("messages") !== -1 && k.indexOf(cid) !== -1;
+      } });
+    } catch (e) { /* best-effort; falls back to refetch-on-navigate */ }
+  }
+
   // Write raw content back to the engine. apiFetch spreads options into fetch and
   // resolves to parsed JSON; the PATCH route returns the updated message object.
   function patchMessage(cid, mid, content) {
@@ -207,6 +248,7 @@
       if (!res || res.error || res.id == null) {
         throw new Error((res && res.error) ? String(res.error) : "PATCH did not return an updated message");
       }
+      refreshMessages(cid); // re-render the edited message now that there's no editor save to do it
       return res;
     });
   }

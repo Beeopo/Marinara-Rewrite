@@ -63,6 +63,7 @@ assert.ok(_SRC.includes("function patchMessage"), "drift: patchMessage (v2 PATCH
 assert.ok(/method:\s*"PATCH"/.test(_SRC), "drift: PATCH method missing");
 assert.ok(_SRC.includes("PATCH did not return an updated message"), "drift: PATCH success-shape check missing (failed write must reject)");
 assert.ok(_SRC.includes("function renderedTextForMid"), "drift: renderedTextForMid missing");
+assert.ok(_SRC.includes("function refreshMessages"), "drift: refreshMessages (post-PATCH view refresh) missing");
 assert.ok(_SRC.includes("function mapRenderedSpanToRaw"), "drift: mapRenderedSpanToRaw missing");
 assert.ok(_SRC.includes("function doRedo"), "drift: doRedo missing");
 assert.ok(_SRC.includes('connMode === "extender"'), "drift: extender branch missing");
