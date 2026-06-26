@@ -75,45 +75,105 @@ assert.ok(_LOADER.includes("allowRemote"), "drift: loader.js allowRemote gate mi
 console.log("drift-guard assertions passed");
 console.log("selfcheck: debug-buffer assertions passed");
 
-// 6) render<->raw span alignment (mirror of mapRenderedSpanToRaw in extension.js)
+// 6) render<->raw span alignment + NON-CORRUPTION (mirror of mapRenderedSpanToRaw)
 function _mapRenderedSpanToRaw(R, A, rs, re) {
-  var n = R.length, m = A.length;
+  // <<< keep this mirror IDENTICAL in logic to extension.js's mapRenderedSpanToRaw >>>
+  const n = R.length, m = A.length;
   if (!n || !m || n * m > 4000000) return null;
+  if (rs < 0 || re > n || re < rs) return null;
+  let i, j, k, c;
   const dp = [];
-  for (let i = 0; i <= n; i++) dp.push(new Int32Array(m + 1));
-  for (let i = n - 1; i >= 0; i--)
-    for (let j = m - 1; j >= 0; j--)
+  for (i = 0; i <= n; i++) dp.push(new Int32Array(m + 1));
+  for (i = n - 1; i >= 0; i--)
+    for (j = m - 1; j >= 0; j--)
       dp[i][j] = (R.charCodeAt(i) === A.charCodeAt(j))
         ? dp[i + 1][j + 1] + 1
         : Math.max(dp[i + 1][j], dp[i][j + 1]);
-  const rawAt = new Int32Array(n + 1);
-  let i = 0, j = 0;
-  while (i < n) {
-    if (j < m && R.charCodeAt(i) === A.charCodeAt(j)) { rawAt[i++] = j++; }
-    else if (j >= m) { rawAt[i++] = m; }
-    else if (dp[i + 1][j] >= dp[i][j + 1]) { rawAt[i++] = j; }   // rendered-only char
-    else { j++; }                                                // raw-only char
+  // Backtrace: mr[i] = matched raw index for rendered char i, or -1 (rendered-only).
+  // matchedRaw[j] = 1 if raw char j is an LCS match (else raw-only / transform char).
+  const mr = new Int32Array(n);
+  for (k = 0; k < n; k++) mr[k] = -1;
+  const matchedRaw = new Uint8Array(m);
+  let i2 = 0, j2 = 0;
+  while (i2 < n || j2 < m) {
+    if (i2 < n && j2 < m && R.charCodeAt(i2) === A.charCodeAt(j2)) {
+      mr[i2] = j2; matchedRaw[j2] = 1; i2++; j2++;
+    } else if (j2 >= m || (i2 < n && dp[i2 + 1][j2] >= dp[i2][j2 + 1])) {
+      i2++; // rendered-only char
+    } else {
+      j2++; // raw-only char
+    }
   }
-  rawAt[n] = m;
-  const as = rawAt[rs], ae = rawAt[re];
-  return (ae >= as) ? { as, ae } : null;
+  // Demote ISLAND matches: a matched raw char flanked by raw-only chars on BOTH
+  // sides is an incidental match inside a transform token, not a real anchor.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (k = 0; k < n; k++) {
+      const rj = mr[k];
+      if (rj < 0) continue;
+      const leftRO = (rj > 0) && !matchedRaw[rj - 1];
+      const rightRO = (rj < m - 1) && !matchedRaw[rj + 1];
+      if (leftRO && rightRO) { mr[k] = -1; matchedRaw[rj] = 0; changed = true; }
+    }
+  }
+  // Compute raw cut points from the nearest real anchors.
+  let as, ae, x, pm, nm;
+  if (rs >= n) { as = m; }
+  else if (mr[rs] >= 0) { as = mr[rs]; }
+  else {
+    pm = -1;
+    for (x = rs - 1; x >= 0; x--) { if (mr[x] >= 0) { pm = x; break; } }
+    as = (pm >= 0) ? mr[pm] + 1 : 0;
+  }
+  if (re <= 0) { ae = 0; }
+  else if (mr[re - 1] >= 0) { ae = mr[re - 1] + 1; }
+  else {
+    nm = -1;
+    for (x = re; x < n; x++) { if (mr[x] >= 0) { nm = x; break; } }
+    ae = (nm >= 0) ? mr[nm] : m;
+  }
+  if (ae < as) return null;
+  // If the selection touches a transform, snap each edge OUTWARD so no raw-only
+  // token is bisected.
+  let touchesTransform = false;
+  for (k = rs; k < re; k++) { if (mr[k] < 0) { touchesTransform = true; break; } }
+  if (!touchesTransform) {
+    for (c = as; c < ae; c++) { if (!matchedRaw[c]) { touchesTransform = true; break; } }
+  }
+  if (touchesTransform) {
+    while (as > 0 && !matchedRaw[as - 1] && !matchedRaw[as]) as--;
+    while (ae < m && !matchedRaw[ae] && ae > 0 && !matchedRaw[ae - 1]) ae++;
+    if (as === ae) {
+      for (k = rs; k < re; k++) {
+        if (mr[k] < 0) {
+          while (ae < m && !matchedRaw[ae]) ae++;
+          while (as > 0 && !matchedRaw[as - 1]) as--;
+          break;
+        }
+      }
+    }
+  }
+  if (ae < as) return null;
+  // Final clean-edge check: neither cut may sit strictly inside a raw-only run.
+  const dirtyStart = as > 0 && as < m && !matchedRaw[as - 1] && !matchedRaw[as];
+  const dirtyEnd = ae > 0 && ae < m && !matchedRaw[ae - 1] && !matchedRaw[ae];
+  if (dirtyStart || dirtyEnd) return null;
+  return { as, ae };
 }
-function _slice(A, s) { return A.slice(s.as, s.ae); }
-// identity
-let s = _mapRenderedSpanToRaw("hello world", "hello world", 6, 11);
-assert.equal(_slice("hello world", s), "world");
-// markdown stripped in raw: rendered "bold text" <- raw "**bold** text"
-s = _mapRenderedSpanToRaw("bold text", "**bold** text", 5, 9);
-assert.equal(_slice("**bold** text", s), "text");
-// curly quotes in rendered, straight in raw (same length)
-s = _mapRenderedSpanToRaw("he said “hi”", 'he said "hi"', 9, 11);
-assert.equal(_slice('he said "hi"', s), "hi");
-// macro expanded in rendered: select text AFTER the macro maps past the raw token
-s = _mapRenderedSpanToRaw("Hi Alice!", "Hi {{char}}!", 8, 9); // the "!"
-assert.equal(_slice("Hi {{char}}!", s), "!");
-// boundary INSIDE an expanded macro: degrades gracefully (snaps within the raw token)
-s = _mapRenderedSpanToRaw("Hi Alice!", "Hi {{char}}!", 3, 8); // "Alice"
-assert.ok(s && s.as >= 3 && s.ae <= 11 && s.ae >= s.as);
+function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
+// clean boundaries MUST splice exactly:
+assert.equal(_spl("hello world", "hello world", 6, 11, "X"), "hello X");           // identity
+assert.equal(_spl("a b c", "a b c", 2, 3, "X"), "a X c");                          // mid, identical
+assert.equal(_spl("bold text", "**bold** text", 5, 9, "X"), "**bold** X");         // markdown stripped (suffix)
+assert.equal(_spl("he said “hi”", 'he said "hi"', 9, 11, "X"), 'he said "X"');     // curly→straight quotes
+assert.equal(_spl("Hi Alice!", "Hi {{char}}!", 0, 3, "X"), "X{{char}}!");          // clean prefix, macro after
+assert.equal(_spl("Hi Alice!", "Hi {{char}}!", 8, 9, "X"), "Hi {{char}}X");        // clean suffix, macro before
+// boundary INSIDE a transform region MUST NOT corrupt: null OR clean snap to whole token
+const _s6 = _spl("Hi Alice!", "Hi {{char}}!", 3, 8, "X"); // whole expanded macro
+assert.ok(_s6 === null || _s6 === "Hi X!", "macro whole-token: must snap clean or fall back; got: " + _s6);
+const _s7 = _spl("Hi Alice!", "Hi {{char}}!", 3, 6, "X"); // sub-token "Ali"
+assert.ok(_s7 === null || _s7 === "Hi X!", "macro sub-token: must snap clean or fall back; got: " + _s7);
 // over-cap returns null
 assert.equal(_mapRenderedSpanToRaw("a".repeat(2001), "b".repeat(2001), 0, 1), null);
 console.log("selfcheck: span-alignment assertions passed");

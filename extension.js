@@ -541,27 +541,106 @@
   // The engine renders raw content through macro/quote/markdown transforms; this
   // LCS-aligns the two strings so a selection captured from the DOM can be spliced
   // back into raw content. Returns null over the size cap (caller copies instead).
+  //
+  // CORRECTNESS / NON-CORRUPTION: a naive LCS map orphans transform tokens when a
+  // selection boundary lands inside a transform-only region (e.g. selecting part of
+  // an expanded {{char}}). Incidental single-char matches inside such tokens (the
+  // 'c' shared by "Alice" and "{{char}}") defeat boundary detection, so they are
+  // demoted to non-anchors. Boundaries that touch a transform are snapped OUTWARD to
+  // cover whole token(s); if a clean span cannot be produced, null is returned and
+  // the caller shows the Copy fallback. Clean boundaries always splice exactly.
   function mapRenderedSpanToRaw(R, A, rs, re) {
     var n = R.length, m = A.length;
     if (!n || !m || n * m > 4000000) return null; // ponytail: ~2k×2k char cap; null -> copy fallback
+    if (rs < 0 || re > n || re < rs) return null;
+    var i, j, k, c;
     var dp = [];
-    for (var i = 0; i <= n; i++) dp.push(new Int32Array(m + 1));
-    for (var i = n - 1; i >= 0; i--)
-      for (var j = m - 1; j >= 0; j--)
+    for (i = 0; i <= n; i++) dp.push(new Int32Array(m + 1));
+    for (i = n - 1; i >= 0; i--)
+      for (j = m - 1; j >= 0; j--)
         dp[i][j] = (R.charCodeAt(i) === A.charCodeAt(j))
           ? dp[i + 1][j + 1] + 1
           : Math.max(dp[i + 1][j], dp[i][j + 1]);
-    var rawAt = new Int32Array(n + 1);
+    // Backtrace the alignment. mr[i] = matched raw index for rendered char i, or -1
+    // (rendered-only). matchedRaw[j] = 1 if raw char j is an LCS match (else it is a
+    // raw-only / transform char).
+    var mr = new Int32Array(n);
+    for (k = 0; k < n; k++) mr[k] = -1;
+    var matchedRaw = new Uint8Array(m);
     var i2 = 0, j2 = 0;
-    while (i2 < n) {
-      if (j2 < m && R.charCodeAt(i2) === A.charCodeAt(j2)) { rawAt[i2++] = j2++; }
-      else if (j2 >= m) { rawAt[i2++] = m; }
-      else if (dp[i2 + 1][j2] >= dp[i2][j2 + 1]) { rawAt[i2++] = j2; } // rendered-only
-      else { j2++; }                                                   // raw-only
+    while (i2 < n || j2 < m) {
+      if (i2 < n && j2 < m && R.charCodeAt(i2) === A.charCodeAt(j2)) {
+        mr[i2] = j2; matchedRaw[j2] = 1; i2++; j2++;
+      } else if (j2 >= m || (i2 < n && dp[i2 + 1][j2] >= dp[i2][j2 + 1])) {
+        i2++; // rendered-only char
+      } else {
+        j2++; // raw-only char
+      }
     }
-    rawAt[n] = m;
-    var as = rawAt[rs], ae = rawAt[re];
-    return (ae >= as) ? { as: as, ae: ae } : null;
+    // Demote ISLAND matches: a matched raw char flanked by raw-only chars on BOTH
+    // sides is an incidental match inside a transform token, not a real anchor.
+    // Iterate to a fixpoint (demoting one island can expose another).
+    var changed = true;
+    while (changed) {
+      changed = false;
+      for (k = 0; k < n; k++) {
+        var rj = mr[k];
+        if (rj < 0) continue;
+        var leftRO = (rj > 0) && !matchedRaw[rj - 1];
+        var rightRO = (rj < m - 1) && !matchedRaw[rj + 1];
+        if (leftRO && rightRO) { mr[k] = -1; matchedRaw[rj] = 0; changed = true; }
+      }
+    }
+    // Compute raw cut points from the nearest real anchors.
+    var as, ae, x, pm, nm;
+    // START cut (before rendered char rs).
+    if (rs >= n) { as = m; }
+    else if (mr[rs] >= 0) { as = mr[rs]; }
+    else { // rendered-only: just after the previous anchor's raw char
+      pm = -1;
+      for (x = rs - 1; x >= 0; x--) { if (mr[x] >= 0) { pm = x; break; } }
+      as = (pm >= 0) ? mr[pm] + 1 : 0;
+    }
+    // END cut (after rendered char re-1).
+    if (re <= 0) { ae = 0; }
+    else if (mr[re - 1] >= 0) { ae = mr[re - 1] + 1; }
+    else { // last selected char is rendered-only: extend to the next anchor's raw start
+      nm = -1;
+      for (x = re; x < n; x++) { if (mr[x] >= 0) { nm = x; break; } }
+      ae = (nm >= 0) ? mr[nm] : m;
+    }
+    if (ae < as) return null;
+    // If the selection touches a transform (it contains rendered-only chars, or the
+    // raw span interior contains raw-only chars), snap each edge OUTWARD so no
+    // raw-only token is bisected.
+    var touchesTransform = false;
+    for (k = rs; k < re; k++) { if (mr[k] < 0) { touchesTransform = true; break; } }
+    if (!touchesTransform) {
+      for (c = as; c < ae; c++) { if (!matchedRaw[c]) { touchesTransform = true; break; } }
+    }
+    if (touchesTransform) {
+      // Start partway into a raw-only token -> pull cut to that token's start.
+      while (as > 0 && !matchedRaw[as - 1] && !matchedRaw[as]) as--;
+      // End partway through a raw-only token -> push cut to that token's end.
+      while (ae < m && !matchedRaw[ae] && ae > 0 && !matchedRaw[ae - 1]) ae++;
+      // Selection clearly covers a transform but mapped to an empty raw span:
+      // expand to enclose the adjacent raw-only run.
+      if (as === ae) {
+        for (k = rs; k < re; k++) {
+          if (mr[k] < 0) {
+            while (ae < m && !matchedRaw[ae]) ae++;
+            while (as > 0 && !matchedRaw[as - 1]) as--;
+            break;
+          }
+        }
+      }
+    }
+    if (ae < as) return null;
+    // Final clean-edge check: neither cut may sit strictly inside a raw-only run.
+    var dirtyStart = as > 0 && as < m && !matchedRaw[as - 1] && !matchedRaw[as];
+    var dirtyEnd = ae > 0 && ae < m && !matchedRaw[ae - 1] && !matchedRaw[ae];
+    if (dirtyStart || dirtyEnd) return null;
+    return { as: as, ae: ae };
   }
   function wcDiff(a, b) {
     var d = wc(b) - wc(a), p = wc(a) ? Math.round((d / wc(a)) * 100) : 0;
