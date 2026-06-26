@@ -61,6 +61,7 @@ assert.ok(_SRC.includes("seqOk"), "drift: merge marker ordering (seqOk) missing"
 assert.ok(_SRC.includes("function nthIndexOf"), "drift: nthIndexOf missing");
 assert.ok(_SRC.includes("function patchMessage"), "drift: patchMessage (v2 PATCH commit) missing");
 assert.ok(/method:\s*"PATCH"/.test(_SRC), "drift: PATCH method missing");
+assert.ok(_SRC.includes("PATCH did not return an updated message"), "drift: PATCH success-shape check missing (failed write must reject)");
 assert.ok(_SRC.includes("function renderedTextForMid"), "drift: renderedTextForMid missing");
 assert.ok(_SRC.includes("function mapRenderedSpanToRaw"), "drift: mapRenderedSpanToRaw missing");
 assert.ok(_SRC.includes("function doRedo"), "drift: doRedo missing");

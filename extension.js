@@ -198,7 +198,17 @@
     return marinara.apiFetch(
       "/chats/" + encodeURIComponent(cid) + "/messages/" + encodeURIComponent(mid),
       { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: content }) }
-    );
+    ).then(function (res) {
+      // apiFetch resolves even on HTTP 4xx/5xx (the engine bridge doesn't check
+      // res.ok). The route returns the updated message (has an id) on success and
+      // { error } on failure, so detect that shape and throw — otherwise a failed
+      // write would falsely toast "Applied" and undo would shift away the only copy
+      // of the pre-rewrite text.
+      if (!res || res.error || res.id == null) {
+        throw new Error((res && res.error) ? String(res.error) : "PATCH did not return an updated message");
+      }
+      return res;
+    });
   }
 
   var _loreCache = { key: null, result: null, ts: 0 };
@@ -2747,7 +2757,7 @@
         row(db, "Auto-apply", ck(cfg.autoApply, function (e) { cfg.autoApply = e.target.checked; saveC(); }),
           "Skip the preview and replace the text immediately.");
         row(db, "Review & edit before applying", ck(cfg.reviewBeforeApply, function (e) { cfg.reviewBeforeApply = e.target.checked; saveC(); }),
-          "Drop the rewrite into the message editor so you confirm and save it yourself (Ctrl+Enter).");
+          "Show the rewrite in an editable box and apply it only when you click Apply.");
         row(db, "Typewriter reveal", ck(cfg.typewriter, function (e) { cfg.typewriter = e.target.checked; saveC(); }));
         row(db, "Show word diff", ck(cfg.showDiff, function (e) { cfg.showDiff = e.target.checked; saveC(); }));
         row(db, "Merge multi-message", ck(cfg.mergeMultiMsg, function (e) { cfg.mergeMultiMsg = e.target.checked; saveC(); }),
