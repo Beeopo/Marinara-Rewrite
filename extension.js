@@ -934,8 +934,8 @@
     "box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:10010;pointer-events:none;" +
     "opacity:0;transition:opacity .12s;}" +
     ".rwa-tip-show{opacity:1!important;}" +
-    ".rwa-ov{position:fixed;top:0;left:0;right:0;bottom:0;background:color-mix(in srgb,var(--background) 88%,var(--foreground) 12%);" +
-    "backdrop-filter:blur(8px);z-index:10001;display:flex;align-items:center;justify-content:center;" +
+    ".rwa-ov{position:fixed;top:0;left:0;right:0;bottom:0;background:color-mix(in srgb,var(--background) 18%,transparent);" +
+    "z-index:10001;display:flex;align-items:center;justify-content:center;" +
     "animation:rwa-fade .18s ease-out;}" +
     "@keyframes rwa-fade{from{opacity:0}to{opacity:1}}" +
     ".rwa-win{background:var(--popover);border:1px solid var(--border);border-radius:12px;" +

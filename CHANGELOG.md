@@ -24,6 +24,8 @@
 - **Fixed:** Extender memory fallback uses `/lorebooks/scan/:chatId`
   (`/lorebook-entries` was removed in v2.x).
 - **Fixed:** popup shadow, overlay, and success toast adapt to light themes.
+- **Changed:** the rewrite result/review modal no longer dims and blurs the whole
+  screen — its backdrop is now a light scrim, so the chat stays visible behind it.
 - **Note:** requires Marinara Engine v2.0.5 or newer.
 
 ## v5.0
