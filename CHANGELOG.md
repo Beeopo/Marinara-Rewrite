@@ -1,5 +1,21 @@
 # Changelog
 
+## v5.1 — Marinara Engine v2.x compatibility
+
+- **Fixed:** rewrites now commit reliably on Marinara v2.0.5+. The engine moved
+  macro/quote/markdown transforms into the render path (v2.0.0 refactor), so the
+  rendered DOM no longer matches stored content. The extension now commits via the
+  message API (`PATCH`), locating the selection in the engine's rendered output and
+  aligning it back to stored content for the splice — no editor automation.
+- **Changed:** undo/redo use the API and work even when the message is scrolled
+  out of view.
+- **Changed:** "Review before applying" now opens an editable preview in the
+  extension (the native editor is no longer driven).
+- **Fixed:** Extender memory fallback uses `/lorebooks/scan/:chatId`
+  (`/lorebook-entries` was removed in v2.x).
+- **Fixed:** popup shadow, overlay, and success toast adapt to light themes.
+- **Note:** requires Marinara Engine v2.0.5 or newer.
+
 ## v5.0
 
 Major release. A new popup with live token costs and per-rewrite context control, the Marinara Extender

@@ -1,4 +1,4 @@
-// Rewrite Assistant v4.1 — Marinara Engine Extension (UI Overhaul)
+// Rewrite Assistant v5.1 — Marinara Engine v2.x Compatibility
 (function (marinara) {
   "use strict";
 
