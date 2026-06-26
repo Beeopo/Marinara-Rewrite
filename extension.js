@@ -773,7 +773,6 @@
     "background:linear-gradient(90deg,transparent 0%,color-mix(in srgb,var(--primary) 10%,transparent) 50%,transparent 100%);" +
     "animation:rwa-shim 1.8s linear infinite;pointer-events:none;}" +
     "@keyframes rwa-shim{from{left:-100%}to{left:100%}}" +
-    ".rwa-msg-hl{outline:2px solid var(--primary)!important;outline-offset:3px;border-radius:4px;}" +
     ".rwa-toast{position:fixed;background:var(--primary);color:var(--primary-foreground);" +
     "padding:8px 16px;border-radius:8px;font:700 12px/1.4 inherit;" +
     "box-shadow:0 4px 20px rgba(0,0,0,.5);z-index:20000;pointer-events:none;" +
@@ -1280,156 +1279,6 @@
       t.style.opacity = "0";
       marinara.setTimeout(function () { t.remove(); }, 420);
     }, 3200);
-  }
-
-  // -- Pre-fill edit textarea --------------------------------------------------
-  function setNativeTextareaValue(ta, value) {
-    // Marinara's roleplay editor textarea is React-controlled; a plain `.value`
-    // set won't fire React's onChange, so save reads stale state. Use the
-    // prototype's native setter so React sees a real value change.
-    try {
-      var d = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
-      if (d && d.set) { d.set.call(ta, value); return; }
-    } catch (e) {}
-    ta.value = value;
-  }
-
-  function findEditTextarea(mid) {
-    var el = document.querySelector('[data-message-id="' + mid + '"]');
-    if (el) { var t = el.querySelector("textarea"); if (t) return t; }
-    // Roleplay editor (ConversationMessage) renders the textarea inside the
-    // message list, OUTSIDE the id node. Pick the message-list textarea that
-    // isn't the composer (the composer has a placeholder; the editor doesn't).
-    // N6 fix: before returning the scroller fallback, verify the candidate
-    // textarea is a descendant of this message's DOM element (or that no other
-    // message's editor is open). If the textarea belongs to a different mid,
-    // return null so waitForTextarea keeps waiting for the correct editor to open
-    // rather than writing the new text into the wrong message.
-    var scroller = document.querySelector(".mari-messages-scroll") ||
-                   document.querySelector("[data-chat-scroll]");
-    if (scroller) {
-      var tas = scroller.querySelectorAll("textarea");
-      for (var i = 0; i < tas.length; i++) {
-        var ta = tas[i];
-        if (ta.placeholder) continue; // skip the message composer
-        // Only accept this textarea if it is inside the element for `mid`, or if
-        // there is no [data-message-id] ancestor at all (some editors mount outside
-        // any message node). This prevents grabbing message N's still-closing
-        // editor when applying chained auto-apply to message N+1.
-        var ownerMsg = ta.closest ? ta.closest("[data-message-id]") : null;
-        if (ownerMsg && ownerMsg.getAttribute("data-message-id") !== mid) {
-          // Belongs to a different message — refuse it, keep waiting.
-          continue;
-        }
-        return ta;
-      }
-      // If every non-placeholder textarea belongs to a different mid, return null
-      // (do not fall through to the first textarea regardless of owner).
-    }
-    return null;
-  }
-
-  function findSaveButton(ta) {
-    // ChatMessage editor: titled icon button.
-    var byTitle = document.querySelector('button[title="Save (Cmd+Enter)"]') ||
-                  document.querySelector('button[aria-label*="save" i]');
-    if (byTitle) return byTitle;
-    // ConversationMessage (roleplay) editor: plain text button reading "save",
-    // sitting next to the textarea (no title, no aria, no Ctrl+Enter handler).
-    var scope = (ta && ta.closest && (ta.closest(".space-y-2") ||
-                 (ta.parentElement && ta.parentElement.parentElement))) || document;
-    var btns = scope.querySelectorAll("button");
-    for (var i = 0; i < btns.length; i++) {
-      if ((btns[i].textContent || "").trim().toLowerCase() === "save") return btns[i];
-    }
-    return null;
-  }
-
-  function prefillEditTextarea(mid, content, onDone) {
-    var msgEl = document.querySelector('[data-message-id="' + mid + '"]');
-    if (!msgEl) {
-      logDbg("apply.error", { stage: "find-message", mid: mid });
-      showErr("Cannot find message in the DOM.\nHas the chat changed?\n\nDebug: message-id=" + mid);
-      return false;
-    }
-    msgEl.classList.add("rwa-msg-hl");
-    logDbg("apply.openEditor", { mid: mid });
-    // Marinara opens the inline editor via this event -- there is no edit button
-    // in the DOM to click. Both message components listen on `window`.
-    window.dispatchEvent(new CustomEvent("marinara:start-edit-message", { detail: { messageId: mid } }));
-    waitForTextarea(mid, content, onDone);
-    return true;
-  }
-
-  function applyToTextarea(mid, ta, content, onDone) {
-    logDbg("apply.fill", { chars: content.length });
-    setNativeTextareaValue(ta, content);
-    ta.dispatchEvent(new Event("input", { bubbles: true }));
-
-    marinara.setTimeout(function () {
-      var el = document.querySelector('[data-message-id="' + mid + '"]');
-      if (el) el.classList.remove("rwa-msg-hl");
-      var scope = el || document;
-
-      if (cfg.reviewBeforeApply) {
-        logDbg("apply.review", { mid: mid });
-        if (onDone) onDone();
-        showToast(el, "✏️ Edit open — review and press Ctrl+Enter to save");
-        return;
-      }
-
-      var saveBtn = findSaveButton(ta);
-      if (saveBtn) {
-        saveBtn.click();
-        logDbg("apply.saved", { via: "button", label: (saveBtn.textContent || saveBtn.title || "").trim().slice(0, 20) });
-        showToast(null, "✓ Applied", "ok");
-      } else {
-        // ChatMessage editor also saves on Ctrl+Enter; ConversationMessage does
-        // not, but if its save button vanished there's nothing better to try.
-        ta.dispatchEvent(new KeyboardEvent("keydown", {
-          key: "Enter", ctrlKey: true, bubbles: true, cancelable: true,
-        }));
-        logDbg("apply.saved", { via: "ctrl-enter", saveBtnFound: false });
-        showToast(el, "✏️ Saved via Ctrl+Enter — verify the message updated");
-      }
-      if (onDone) onDone();
-    }, 50);
-  }
-
-  function waitForTextarea(mid, content, onDone) {
-    var settled = false;
-    var observer = null;
-    function attempt() {
-      if (settled) return;
-      var ta = findEditTextarea(mid);
-      if (!ta) return;
-      settled = true;
-      if (observer) observer.disconnect();
-      logDbg("apply.textareaFound", {});
-      applyToTextarea(mid, ta, content, onDone);
-    }
-    // Observe the whole document: the roleplay component can remount the message
-    // node, which would detach an observer scoped to the original element.
-    observer = marinara.observe(document.body, attempt, { childList: true, subtree: true });
-    attempt(); // in case the editor is already open
-    // Never hang the result modal: if the editor never appears, fail loudly.
-    marinara.setTimeout(function () {
-      if (settled) return;
-      settled = true;
-      if (observer) observer.disconnect();
-      var el = document.querySelector('[data-message-id="' + mid + '"]');
-      if (el) el.classList.remove("rwa-msg-hl");
-      logDbg("apply.error", {
-        stage: "textarea-timeout",
-        mid: mid,
-        anyTextarea: !!document.querySelector("[data-chat-scroll] textarea"),
-      });
-      showErr(
-        "The message editor didn't open within 3s.\n\n" +
-        "Marinara's edit UI may have changed, or this message type isn't editable.\n" +
-        "The rewrite is still shown above -- copy it manually if needed."
-      );
-    }, 3000);
   }
 
   // ── Rewrite — opens generation modal ─────────────────────────────────────
@@ -2199,42 +2048,36 @@
     if (!hist.length) return;
     var h = hist[0];
     var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
-    var ok = prefillEditTextarea(h.mid, h.old, function () {
-      hist.shift();
-      saveH();
-      // Make the undone rewrite redoable (only if we captured its post-state).
-      if (h.post != null) { redo.unshift(h); if (redo.length > depth) redo.length = depth; saveRedo(); }
-      killPopup();
-    });
-    if (!ok) {
-      // Message isn't in the DOM (scrolled out of the virtualized list). Keep the
-      // entry — discarding it would lose the only copy of the pre-rewrite text
-      // without restoring anything.
-      showToast(null, "Can't undo — scroll to the message first, then retry");
-    }
+    invalidateMsgCache();
+    patchMessage(h.cid || getChatId(), h.mid, h.old)
+      .then(function () {
+        hist.shift();
+        saveH();
+        if (h.post != null) { redo.unshift(h); if (redo.length > depth) redo.length = depth; saveRedo(); }
+        showToast(null, "↶ Undone", "ok");
+        killPopup();
+      })
+      .catch(function (e) { showErr("Undo failed:\n" + (e && e.message ? e.message : String(e))); });
   }
 
   // ── Redo ──────────────────────────────────────────────────────────────────
-  // Mirrors undo: re-apply the post-rewrite content and move the entry back
-  // onto the undo stack. Same data-loss guard as doUndo — on failure to open
-  // the editor, do not discard the redo entry.
   function doRedo() {
     if (!redo.length) return;
     var r = redo[0];
     if (r.post == null) { redo.shift(); saveRedo(); return; }
     var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
-    var ok = prefillEditTextarea(r.mid, r.post, function () {
-      redo.shift();
-      saveRedo();
-      hist.unshift(r);
-      if (hist.length > depth) hist.length = depth;
-      saveH();
-      killPopup();
-    });
-    if (!ok) {
-      // Same guard as doUndo: do not discard the redo entry on failure.
-      showToast(null, "Can't redo — scroll to the message first, then retry");
-    }
+    invalidateMsgCache();
+    patchMessage(r.cid || getChatId(), r.mid, r.post)
+      .then(function () {
+        redo.shift();
+        saveRedo();
+        hist.unshift(r);
+        if (hist.length > depth) hist.length = depth;
+        saveH();
+        showToast(null, "↷ Redone", "ok");
+        killPopup();
+      })
+      .catch(function (e) { showErr("Redo failed:\n" + (e && e.message ? e.message : String(e))); });
   }
 
   // ── Custom prompt ─────────────────────────────────────────────────────────
