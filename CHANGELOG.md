@@ -7,6 +7,9 @@
   rendered DOM no longer matches stored content. The extension now commits via the
   message API (`PATCH`), locating the selection in the engine's rendered output and
   aligning it back to stored content for the splice — no editor automation.
+- **Fixed:** the edited message now updates on screen immediately after applying
+  (the API-commit path refreshes the engine's chat view; previously a direct write
+  left the displayed text stale until you switched chats or reloaded).
 - **Changed:** undo/redo use the API and work even when the message is scrolled
   out of view.
 - **Changed:** "Review before applying" now opens an editable preview in the
