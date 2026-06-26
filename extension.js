@@ -192,6 +192,15 @@
   }
   function invalidateMsgCache() { _msgCache = { key: null, msgs: null, ts: 0 }; }
 
+  // Write raw content back to the engine. apiFetch spreads options into fetch and
+  // resolves to parsed JSON; the PATCH route returns the updated message object.
+  function patchMessage(cid, mid, content) {
+    return marinara.apiFetch(
+      "/chats/" + encodeURIComponent(cid) + "/messages/" + encodeURIComponent(mid),
+      { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: content }) }
+    );
+  }
+
   var _loreCache = { key: null, result: null, ts: 0 };
   var _charListCache = null;
 
@@ -2135,115 +2144,49 @@
           );
         }
 
-        var normOrig    = savedSel.text.trim().replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-        var normContent = (msg.content || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-        var updated = null;
-        var found = false;
+        var normSel = savedSel.text.trim().replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        var rawContent = (msg.content || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        var renderedFull = renderedTextForMid(mid);
 
+        // Locate the selection in the rendered text exactly — it was captured from
+        // the DOM, so it is a substring of the rendered text (no fuzzy match needed).
         var occ = (savedSel && typeof savedSel.occ === "number") ? savedSel.occ : 0;
-        var idx = nthIndexOf(normContent, normOrig, occ);
-        if (idx === -1 && occ > 0) idx = normContent.indexOf(normOrig);
-        if (idx !== -1) {
-          updated = normContent.slice(0, idx) + newText + normContent.slice(idx + normOrig.length);
-          found = true;
-        }
-
-        if (!found) {
-          try {
-            var flexPat = new RegExp(
-              normOrig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\n/g, "\\s{1,4}"),
-              "u"
-            );
-            var m = normContent.match(flexPat);
-            if (m && m.index !== undefined) {
-              updated = normContent.slice(0, m.index) + newText + normContent.slice(m.index + m[0].length);
-              found = true;
-            }
-          } catch (e) {}
-        }
-
-        if (!found) {
-          var anchorWords = normOrig.trim().split(/\s+/).filter(Boolean);
-          if (anchorWords.length >= 10) {
-            var AN = 5;
-            function trimPunct(w) { return w.replace(/^[^a-zA-Z\u00C0-\uFFFF]+|[^a-zA-Z\u00C0-\uFFFF]+$/g, ""); }
-            function escAnchor(w) { return trimPunct(w).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-            var IW = "[^a-zA-Z\u00C0-\uFFFF]{1,16}"; // ponytail: cap separator backtracking (gap is [\s\S]{0,600}?, tighten per-separator cost)
-            var head = anchorWords.slice(0, AN).map(escAnchor).filter(function (w) { return w.length >= 2; });
-            var tail = anchorWords.slice(-AN).map(escAnchor).filter(function (w) { return w.length >= 2; });
-            if (head.length >= 3 && tail.length >= 3) {
-              try {
-                var anchorPat = new RegExp(head.join(IW) + "[\\s\\S]{0,600}?" + tail.join(IW), "u");
-                var m2 = normContent.match(anchorPat);
-                // Reject spans that balloon past ~1.5x the selection: on repetitive
-                // prose the lazy gap can run to a later recurrence of the tail words
-                // and replace far more than the user selected.
-                if (m2 && m2.index !== undefined && m2[0].length <= Math.max(40, normOrig.length * 1.5)) {
-                  updated = normContent.slice(0, m2.index) + newText + normContent.slice(m2.index + m2[0].length);
-                  found = true;
-                }
-              } catch (e) {}
-            }
-          }
-        }
-
-        if (!found) {
-          // Markdown-tolerant fallback: match the selection's words in order,
-          // allowing any markdown/whitespace/punctuation between them. Handles
-          // *emphasis*, line breaks, and DOM-vs-stored joining differences that
-          // the exact/whitespace/anchor passes miss.
-          var fuzzyWords = normOrig.split(/[^A-Za-z0-9\u00c0-\uffff]+/u).filter(Boolean);
-          // ponytail: cap word count (60) and the inter-word gap ({0,8}). This is
-          // the last-resort pass; an unbounded word count with {0,40} gaps could
-          // stall the tab on long selections that fail every earlier pass. Raise
-          // the caps only if real selections start missing.
-          if (fuzzyWords.length >= 2 && fuzzyWords.length <= 60) {
-            try {
-              var SEP = "[^A-Za-z0-9\u00c0-\uffff]{0,8}";
-              var fuzzyPat = new RegExp(
-                fuzzyWords.map(function (w) { return w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }).join(SEP),
-                "u"
-              );
-              var fm = normContent.match(fuzzyPat);
-              if (fm && fm.index !== undefined) {
-                // The match runs first word→last word, so emphasis markers
-                // hugging the span (e.g. *...* , **...** , _..._ , `...`) sit
-                // just outside it. Absorb them so the replacement doesn't
-                // orphan a stray marker.
-                var fStart = fm.index, fEnd = fm.index + fm[0].length;
-                // Cap at 2 chars so a run like *** or ~~~ (thematic break) is
-                // never fully consumed; the longest real emphasis prefix is ** or __.
-                var _eMax = 2;
-                while (_eMax-- > 0 && fStart > 0 && "*_~`".indexOf(normContent.charAt(fStart - 1)) !== -1) fStart--;
-                _eMax = 2;
-                while (_eMax-- > 0 && fEnd < normContent.length && "*_~`".indexOf(normContent.charAt(fEnd)) !== -1) fEnd++;
-                updated = normContent.slice(0, fStart) + newText + normContent.slice(fEnd);
-                found = true;
-              }
-            } catch (e) {}
-          }
-        }
-
-        if (!found) {
+        var rs = nthIndexOf(renderedFull, normSel, occ);
+        if (rs === -1) rs = renderedFull.indexOf(normSel);
+        if (rs === -1) {
           showErr(
-            "Could not locate the selected text in the stored message.\n\n" +
-            "This can happen when the selection spans formatting or list markers.\n" +
-            "Tip: select within a single paragraph, and avoid grabbing the empty\n" +
-            "line between paragraphs."
+            "Could not locate the selected text in the rendered message.\n\n" +
+            "The message may have changed since you selected. Re-select and try again."
           );
           return;
         }
+        var re = rs + normSel.length;
+
+        // Map the rendered span into raw msg.content coordinates and splice.
+        var span = mapRenderedSpanToRaw(renderedFull, rawContent, rs, re);
+        if (!span) {
+          showErr(
+            "Could not map the selection back to stored content (message too large\n" +
+            "or unmappable). Use the Copy button and paste the rewrite manually."
+          );
+          return;
+        }
+        var updated = rawContent.slice(0, span.as) + newText + rawContent.slice(span.ae);
 
         invalidateMsgCache();
-        prefillEditTextarea(mid, updated, function () {
-          var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
-          hist.unshift({ mid: mid, cid: cid, old: msg.content, post: updated, when: Date.now() });
-          if (hist.length > depth) hist.length = depth;
-          // A fresh rewrite invalidates the redo timeline.
-          if (redo.length) { redo.length = 0; saveRedo(); }
-          saveH();
-          if (onDone) onDone();
-        });
+        patchMessage(cid, mid, updated)
+          .then(function () {
+            var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
+            hist.unshift({ mid: mid, cid: cid, old: msg.content, post: updated, when: Date.now() });
+            if (hist.length > depth) hist.length = depth;
+            if (redo.length) { redo.length = 0; saveRedo(); }
+            saveH();
+            showToast(null, "✓ Applied", "ok");
+            if (onDone) onDone();
+          })
+          .catch(function (e) {
+            showErr("Save failed:\n" + (e && e.message ? e.message : String(e)));
+          });
       })
       .catch(function (e) {
         showErr("Commit failed:\n" + (e && e.message ? e.message : String(e)));
@@ -3211,6 +3154,20 @@
     } catch (e) {
       return range.toString().trim();
     }
+  }
+
+  // The rendered text of a message's content blocks (NOT the whole element — the
+  // author/timestamp header isn't in stored content). Concatenated across blocks
+  // for grouped turns that share one id. This is the string the selection was
+  // captured from, and what we align against raw msg.content.
+  function renderedTextForMid(mid) {
+    var segs = document.querySelectorAll('[data-message-id="' + mid + '"]');
+    var out = "";
+    for (var i = 0; i < segs.length; i++) {
+      var cs = segs[i].querySelectorAll(".mari-message-content");
+      for (var j = 0; j < cs.length; j++) out += cs[j].textContent || "";
+    }
+    return out.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   }
 
   // How many times the selected text already appears in this message BEFORE the
