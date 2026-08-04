@@ -81,6 +81,13 @@ assert.ok(!/addStyle/.test(_SRC), "drift: extension.js still calls addStyle (rem
 const _CSS = _rf(new URL("./extension.css", import.meta.url), "utf8");
 assert.ok(_CSS.includes(".rwa{"), "drift: extension.css missing the base .rwa rule");
 assert.ok(_CSS.includes(".rwa-win "), "drift: extension.css missing the .rwa-win rules");
+// v6.0: Marinara 2.4's full-page host object dropped apiFetch/on/addStyle/extensionId.
+// The shim rebuilds them so the 5.1 body needs no call-site changes.
+assert.ok(/^\(function \(host\) \{/m.test(_SRC), "drift: IIFE parameter is not `host` (shim missing)");
+assert.ok(_SRC.includes("var marinara = {"), "drift: compat shim object missing");
+assert.ok(_SRC.includes('"x-marinara-csrf"'), "drift: apiFetch shim not sending the CSRF header");
+assert.ok(_SRC.includes('fetch("/api" + path'), "drift: apiFetch shim not prefixing /api");
+assert.ok(_SRC.includes("removeEventListener"), "drift: on() shim not registering teardown");
 console.log("drift-guard assertions passed");
 console.log("selfcheck: debug-buffer assertions passed");
 
