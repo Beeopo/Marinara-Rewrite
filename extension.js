@@ -9,10 +9,12 @@
   // and that `marinara` is now only
   //   { version, extension, log, storage, setTimeout, clearTimeout,
   //     setInterval, clearInterval, onCleanup }
-  // — apiFetch, on, the old style-injection helper, and extensionId are gone.
+  // — apiFetch, on, extensionId, and the old style-injection helper are gone.
   // Rebuilding the first three here is a ~30-line change; rewriting their
-  // ~3,300 lines of call sites is not. The style helper has no shim: the CSS
-  // ships in the manifest's `css` field instead (see Task 2).
+  // ~3,300 lines of call sites is not. The style helper (last) has no shim: the
+  // CSS ships in the manifest's `css` field instead.
+  // clearTimeout/clearInterval are deliberately not mirrored — nothing calls
+  // them through the bridge, and the host cancels outstanding timers on teardown.
   var marinara = {
     extension:   host.extension,
     log:         host.log,
@@ -30,9 +32,13 @@
     apiFetch: function (path, opts) {
       var o = opts || {};
       var method = (o.method || "GET").toUpperCase();
-      var headers = Object.assign({}, o.headers);
-      if (method !== "GET" && method !== "HEAD") headers["x-marinara-csrf"] = "1";
-      return fetch("/api" + path, Object.assign({}, o, { headers: headers, cache: "no-store" }))
+      // Headers(), not a plain object: it normalizes every shape a caller might
+      // pass (plain object, Headers instance, array of pairs). Object.assign on a
+      // Headers instance yields {} — the entries aren't own properties — which
+      // would silently drop the CSRF header on a write.
+      var headers = new Headers(o.headers || {});
+      if (method !== "GET" && method !== "HEAD") headers.set("x-marinara-csrf", "1");
+      return fetch("/api" + path, Object.assign({}, o, { headers: headers, cache: o.cache || "no-store" }))
         .then(function (r) { return r.json().catch(function () { return null; }); });
     },
 
