@@ -75,6 +75,12 @@ assert.ok(_SRC.includes("_autoInFlight"), "drift: _autoInFlight guard missing");
 assert.ok(_SRC.includes("selectionOccurrence"), "drift: selectionOccurrence missing");
 assert.ok(_SRC.includes("fetchExtenderMemory"), "drift: fetchExtenderMemory missing");
 assert.ok(_SRC.includes("fetchSpeakerNote"), "drift: fetchSpeakerNote missing");
+// v6.0: styles moved out of the removed marinara.addStyle bridge into extension.css,
+// which the manifest ships in its own `css` field so the engine owns teardown.
+assert.ok(!/addStyle/.test(_SRC), "drift: extension.js still calls addStyle (removed in Marinara 2.4)");
+const _CSS = _rf(new URL("./extension.css", import.meta.url), "utf8");
+assert.ok(_CSS.includes(".rwa{"), "drift: extension.css missing the base .rwa rule");
+assert.ok(_CSS.includes(".rwa-win "), "drift: extension.css missing the .rwa-win rules");
 console.log("drift-guard assertions passed");
 console.log("selfcheck: debug-buffer assertions passed");
 

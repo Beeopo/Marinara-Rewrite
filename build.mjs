@@ -10,6 +10,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 
 const BUNDLE = "rewrite-assistant.json";
 const SOURCE = "extension.js";
+const STYLES = "extension.css";
 
 // 1) Gate on selfcheck (its top-level assertions throw on failure).
 try {
@@ -23,6 +24,8 @@ try {
 const bundle = JSON.parse(readFileSync(BUNDLE, "utf8"));
 const source = readFileSync(SOURCE, "utf8");
 bundle.js = source;
+const styles = readFileSync(STYLES, "utf8");
+bundle.css = styles;
 
 // Pretty-print (2-space) then convert structural newlines to CRLF to match the
 // existing file. Newlines inside the js/css strings are already escaped as "\n".
@@ -35,4 +38,8 @@ if (check.js !== source) {
   console.error("build: round-trip mismatch — bundle js does not equal extension.js.");
   process.exit(1);
 }
-console.log(`build: wrote ${BUNDLE} (${out.length} chars; js ${source.length} chars) OK`);
+if (check.css !== styles) {
+  console.error("build: round-trip mismatch — bundle css does not equal extension.css.");
+  process.exit(1);
+}
+console.log(`build: wrote ${BUNDLE} (${out.length} chars; js ${source.length} chars; css ${styles.length} chars) OK`);
