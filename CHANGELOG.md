@@ -1,5 +1,36 @@
 # Changelog
 
+## v6.0 — Marinara Engine v2.4 Personal Extensions
+
+Marinara 2.4 replaced its extension system (`extensions` → `personal-extensions`,
+sandboxed by default). v5.1 does not run on it at all — it installs and then does
+nothing. This release ports the extension to the new full-page runtime.
+
+- **Breaking:** the auto-update loader is gone. `loader.js` and
+  `rewrite-assistant-loader.json` are deleted. Marinara binds approval to the SHA-256
+  of the stored code, so any runtime-fetched code bypasses the review gate; the
+  engine also dropped `blob:` from its CSP `script-src`, which blocked the loader's
+  execution path outright. Updates now mean re-import and re-approve.
+- **Breaking:** installing requires two gates to be open first —
+  `ENABLE_EXTERNAL_EXTENSIONS=true` on the host, and **Allow third-party extension
+  imports** in Settings → Advanced → Danger Zone. See the README.
+- **Fixed:** the manifest now declares `runtime: "client"` and
+  `capabilities: ["full_page_access"]`. Without an explicit capabilities field the
+  2.4 import path assumes the safe sandbox, where the extension runs in a Worker
+  with no DOM and no `/api` access — it would install cleanly and never work.
+- **Fixed:** `apiFetch`, `on`, `addStyle`, and `extensionId` were all removed from
+  the host object. The first three are rebuilt as a compatibility shim, preserving
+  the old `apiFetch` behaviour of resolving on 4xx/5xx so a failed write is still
+  detected from the response shape rather than being reported as "Applied".
+- **Fixed:** settings no longer vanish on re-import. The storage namespace was
+  derived from the engine-generated extension id, which is minted fresh every time
+  the extension is imported, so each import stranded the previous install's
+  profiles, history, and custom prompts. The namespace is now a fixed literal, and
+  a first run copies a previous install's keys across without deleting them.
+- **Changed:** styles moved from the removed `marinara.addStyle` call into
+  `extension.css`, shipped in the manifest's `css` field so the engine creates and
+  removes the stylesheet node itself.
+
 ## v5.1 — Marinara Engine v2.x compatibility
 
 - **Fixed:** rewrites now commit reliably on Marinara v2.0.5+. The engine moved

@@ -83,17 +83,30 @@ section of text in a message using an AI model. Select text, choose a mode, and 
 
 ## Install
 
-Two options:
+Marinara Engine 2.4+ keeps third-party extensions behind two gates. Open both first:
 
-- **Full bundle (no auto-update):** download [`rewrite-assistant.json`](rewrite-assistant.json), open the
-  Extensions panel in Marinara Engine, and import it.
-- **Auto-update loader:** import [`rewrite-assistant-loader.json`](rewrite-assistant-loader.json) once. It pulls the
-  latest extension on every Marinara load (local Extender sidecar → GitHub → offline cache), so future updates only
-  need a reload.
+1. On the Marinara host, set `ENABLE_EXTERNAL_EXTENSIONS=true` in `.env`, then restart the server.
+2. In Marinara, go to **Settings → Advanced → Danger Zone**, scroll past the data-deletion
+   controls, and enable **Allow third-party extension imports**.
 
-Then enable the extension. Select text in any message, or press `Alt+R`, to open the rewrite popup.
+Then download [`rewrite-assistant.json`](rewrite-assistant.json) and import it under
+**Settings → Addons → External Extensions**. Review the code, compare the displayed SHA-256
+hash against the one in the approval dialog, and choose **Review and Run**.
 
-The unbundled source is in [`extension.js`](extension.js); the loader source is in [`loader.js`](loader.js).
+Select text in any message, or press `Alt+R`, to open the rewrite popup.
+
+**This extension requests Full page access,** which is not a sandbox capability — the code runs
+inside Marinara's page with the same authority as anything pasted into the browser console. It
+needs that: the rewrite flow reads your selection out of the rendered message DOM and commits
+the result through Marinara's `/api` routes, neither of which the sandboxed runtime can reach.
+Read the source before you approve it.
+
+**There is no automatic updater any more.** Marinara binds approval to the exact hash of the
+stored code, so every update needs a fresh import and a fresh approval — code fetched at runtime
+would bypass the review that approval exists to enforce, and the engine's CSP now blocks that
+execution path regardless.
+
+Source lives in [`extension.js`](extension.js) and [`extension.css`](extension.css).
 
 ## Direct API configuration
 
@@ -169,16 +182,18 @@ export it. The API key is redacted from the export.
 
 ## Development
 
-Source is `extension.js` (the extension) and `loader.js` (the auto-update loader). A runnable check covers the
-non-trivial logic (URL normalization, API response shaping, length-control math, prompt assembly order, debug ring
-buffer, and drift guards):
+Source is `extension.js` (behavior) and `extension.css` (styles). A runnable check covers the
+non-trivial logic (URL normalization, API response shaping, length-control math, prompt assembly
+order, debug ring buffer, render↔stored span alignment, legacy-namespace adoption, and drift
+guards):
 
 ```sh
 node selfcheck.mjs
 ```
 
-Build the installable bundles from source (runs selfcheck first, then writes `rewrite-assistant.json` and
-`rewrite-assistant-loader.json`):
+Build the installable bundle from source — runs selfcheck first, then splices `extension.js` and
+`extension.css` into `rewrite-assistant.json`. Never hand-edit that file; `build.mjs` owns it,
+manifest metadata included:
 
 ```sh
 node build.mjs
