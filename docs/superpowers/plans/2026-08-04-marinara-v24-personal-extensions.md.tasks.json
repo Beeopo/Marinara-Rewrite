@@ -58,7 +58,7 @@
     {
       "id": 7,
       "subject": "Task 7: Verify the rewrite round-trip in a live Marinara 2.4.0",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         1,
         2,
