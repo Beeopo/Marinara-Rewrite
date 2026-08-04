@@ -94,7 +94,9 @@ assert.ok(_SRC.includes("removeEventListener"), "drift: on() shim not registerin
 // extension id stranded the user's data on every re-import.
 assert.ok(_SRC.includes("function adoptLegacyNamespace"), "drift: adoptLegacyNamespace missing");
 assert.ok(_SRC.includes('var NS = "rwa-rewrite-assistant"'), "drift: storage namespace is not the fixed literal");
-assert.ok(!/extensionId/.test(_SRC), "drift: extensionId is back (the id is regenerated on every import)");
+// Match a real use, not the bare word, so comments can still explain the history.
+assert.ok(!/marinara\.extensionId\b|extensionId\s*:/.test(_SRC), "drift: extensionId is back (the id is regenerated on every import)");
+assert.ok(/SUFFIXES = \[[^\]]*"-p"\]/.test(_SRC), "drift: the -p sentinel is no longer copied last (partial-copy would strand data)");
 assert.ok(!/rwa-loader-allow-remote/.test(_SRC), "drift: the Loader settings group is back (loader.js was deleted in v6.0)");
 console.log("drift-guard assertions passed");
 console.log("selfcheck: debug-buffer assertions passed");
@@ -317,7 +319,7 @@ function _filler(tag, count) {
 // 5.x derived its namespace from the engine-generated extension id, which is
 // minted fresh on every import, so each re-import stranded the previous data.
 const _NS = "rwa-rewrite-assistant";
-const _SUF = ["-p", "-c", "-h", "-r", "-x", "-a", "-dbg", "-ledger"];
+const _SUF = ["-c", "-h", "-r", "-x", "-a", "-dbg", "-ledger", "-p"];
 function _fakeLS(seed) {
   const m = { ...seed };
   return {
@@ -330,22 +332,26 @@ function _fakeLS(seed) {
 }
 function _adopt(ls) {
   // <<< keep this mirror IDENTICAL in logic to extension.js's adoptLegacyNamespace >>>
-  if (ls.getItem(_NS + "-p") !== null) return null;
-  let old = null;
-  for (let i = 0; i < ls.length; i++) {
-    const k = ls.key(i);
-    if (!k || k.slice(-2) !== "-p" || k.indexOf("rwa-") !== 0) continue;
-    const prefix = k.slice(0, -2);
-    if (prefix === _NS) continue;
-    old = prefix;
-    break;
-  }
-  if (!old) return null;
-  for (let j = 0; j < _SUF.length; j++) {
-    const v = ls.getItem(old + _SUF[j]);
-    if (v !== null) ls.setItem(_NS + _SUF[j], v);
-  }
-  return old;
+  // The try/catch is part of that logic, not scaffolding: localStorage throws in
+  // private browsing and on quota, and case (f) below depends on it.
+  try {
+    if (ls.getItem(_NS + "-p") !== null) return null;
+    let old = null;
+    for (let i = 0; i < ls.length; i++) {
+      const k = ls.key(i);
+      if (!k || k.slice(-2) !== "-p" || k.indexOf("rwa-") !== 0) continue;
+      const prefix = k.slice(0, -2);
+      if (prefix === _NS) continue;
+      old = prefix;
+      break;
+    }
+    if (!old) return null;
+    for (let j = 0; j < _SUF.length; j++) {
+      const v = ls.getItem(old + _SUF[j]);
+      if (v !== null) ls.setItem(_NS + _SUF[j], v);
+    }
+    return old;
+  } catch (e) { return null; }
 }
 
 // (a) fresh install: nothing to adopt, nothing written
@@ -385,5 +391,32 @@ function _adopt(ls) {
 {
   const ls = _fakeLS({ [_NS + "-c"]: "x" });
   assert.equal(_adopt(ls), null);
+}
+// (f) a throw mid-copy (localStorage quota — a copy transiently doubles usage)
+// must leave the "-p" sentinel UNSET so the next load retries. "-p" is last in
+// _SUF for exactly this reason: written first, a partial copy would look like a
+// completed adoption forever and strand every remaining suffix.
+{
+  assert.equal(_SUF[_SUF.length - 1], "-p", "the -p sentinel must be copied last");
+  const seed = {};
+  for (const s of _SUF) seed["rwa-9f3c1a2b" + s] = "V" + s;
+  const base = _fakeLS(seed);
+  let writes = 0;
+  const ls = {
+    get length() { return base.length; },
+    key: (i) => base.key(i),
+    getItem: (k) => base.getItem(k),
+    setItem: (k, v) => {
+      if (++writes > 3) { const e = new Error("QuotaExceededError"); e.name = "QuotaExceededError"; throw e; }
+      base.setItem(k, v);
+    },
+    dump: () => base.dump(),
+  };
+  assert.equal(_adopt(ls), null, "a swallowed throw must report failure, not success");
+  assert.equal(ls.getItem(_NS + "-p"), null, "sentinel must be unset so the next load retries");
+  // retry on a healthy store completes the adoption
+  const ls2 = _fakeLS(ls.dump());
+  assert.equal(_adopt(ls2), "rwa-9f3c1a2b", "retry must find the legacy set again");
+  for (const s of _SUF) assert.equal(ls2.getItem(_NS + s), "V" + s, "retry must copy " + s);
 }
 console.log("selfcheck: legacy-namespace adoption assertions passed");

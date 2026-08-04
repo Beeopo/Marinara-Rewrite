@@ -54,7 +54,12 @@
   // the old and the new engine mint a fresh id on every import, so the namespace
   // moved each time and stranded the previous install's profiles and history.
   var NS = "rwa-rewrite-assistant";
-  var SUFFIXES = ["-p", "-c", "-h", "-r", "-x", "-a", "-dbg", "-ledger"];
+  // "-p" is LAST on purpose: it doubles as the "already adopted" sentinel below.
+  // Writing it first would make a mid-copy throw (localStorage quota — and a copy
+  // transiently doubles usage) look like a completed adoption forever, stranding
+  // every suffix after it. Written last, a failed run leaves the sentinel absent
+  // and the next load retries; re-copying is idempotent.
+  var SUFFIXES = ["-c", "-h", "-r", "-x", "-a", "-dbg", "-ledger", "-p"];
   var K_PROF  = NS + "-p";
   var K_CFG   = NS + "-c";
   var K_HIST  = NS + "-h";
