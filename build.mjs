@@ -20,12 +20,25 @@ try {
   process.exit(1);
 }
 
-// 2) Splice source into the bundle, preserving key order + metadata.
-const bundle = JSON.parse(readFileSync(BUNDLE, "utf8"));
+// 2) Build the manifest fresh. Marinara 2.4's schema has no `id` or `enabled` —
+//    the engine mints its own id and every import starts disabled pending hash
+//    approval — and `capabilities` must be explicit: without it the import path
+//    defaults to the safe sandbox, a Worker with no DOM and no /api access, so
+//    the extension would install cleanly and then do nothing at all.
+//    See packages/client/src/lib/personal-extension-import.ts in the engine.
+const MANIFEST = {
+  name: "Rewrite Assistant",
+  version: "6.0.0",
+  description:
+    "Highlight text in any message to rewrite with AI. v6.0: Marinara Engine v2.4 " +
+    "Personal Extensions — full-page capability, host compatibility shim, " +
+    "manifest-owned stylesheet, and a fixed storage namespace that survives re-imports.",
+  runtime: "client",
+  capabilities: ["full_page_access"],
+};
 const source = readFileSync(SOURCE, "utf8");
-bundle.js = source;
 const styles = readFileSync(STYLES, "utf8");
-bundle.css = styles;
+const bundle = { ...MANIFEST, css: styles, js: source };
 
 // Pretty-print (2-space) then convert structural newlines to CRLF to match the
 // existing file. Newlines inside the js/css strings are already escaped as "\n".
