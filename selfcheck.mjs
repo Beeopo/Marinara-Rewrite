@@ -75,8 +75,6 @@ assert.ok(_SRC.includes("_autoInFlight"), "drift: _autoInFlight guard missing");
 assert.ok(_SRC.includes("selectionOccurrence"), "drift: selectionOccurrence missing");
 assert.ok(_SRC.includes("fetchExtenderMemory"), "drift: fetchExtenderMemory missing");
 assert.ok(_SRC.includes("fetchSpeakerNote"), "drift: fetchSpeakerNote missing");
-const _LOADER = _rf(new URL("./loader.js", import.meta.url), "utf8");
-assert.ok(_LOADER.includes("allowRemote"), "drift: loader.js allowRemote gate missing");
 console.log("drift-guard assertions passed");
 console.log("selfcheck: debug-buffer assertions passed");
 
