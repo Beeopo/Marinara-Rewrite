@@ -98,6 +98,12 @@ assert.ok(_SRC.includes('var NS = "rwa-rewrite-assistant"'), "drift: storage nam
 assert.ok(!/marinara\.extensionId\b|extensionId\s*:/.test(_SRC), "drift: extensionId is back (the id is regenerated on every import)");
 assert.ok(/SUFFIXES = \[[^\]]*"-p"\]/.test(_SRC), "drift: the -p sentinel is no longer copied last (partial-copy would strand data)");
 assert.ok(!/rwa-loader-allow-remote/.test(_SRC), "drift: the Loader settings group is back (loader.js was deleted in v6.0)");
+// v6.0: build.mjs owns the manifest. Guard the two fields that decide whether the
+// extension runs in the page or dies silently in the sandboxed Worker.
+const _BUILD = _rf(new URL("./build.mjs", import.meta.url), "utf8");
+assert.ok(_BUILD.includes('capabilities: ["full_page_access"]'), "drift: manifest does not request full_page_access");
+assert.ok(_BUILD.includes('runtime: "client"'), "drift: manifest runtime is not client");
+assert.ok(!/^\s*id:/m.test(_BUILD), "drift: manifest re-introduced an `id` field (not in the 2.4 schema)");
 console.log("drift-guard assertions passed");
 console.log("selfcheck: debug-buffer assertions passed");
 
