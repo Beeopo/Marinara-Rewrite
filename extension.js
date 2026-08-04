@@ -1,6 +1,48 @@
-// Rewrite Assistant v5.1 — Marinara Engine v2.x Compatibility
-(function (marinara) {
+// Rewrite Assistant v6.0 — Marinara Engine v2.4 Personal Extensions (full page)
+(function (host) {
   "use strict";
+
+  // ── Host compatibility shim ───────────────────────────────────────────────
+  // Marinara 2.4 replaced the extension bridge with the Personal Extensions
+  // full-page runtime. The engine splices this file into
+  //   run(extension, async (marinara) => { "use strict"; <this file> })
+  // and that `marinara` is now only
+  //   { version, extension, log, storage, setTimeout, clearTimeout,
+  //     setInterval, clearInterval, onCleanup }
+  // — apiFetch, on, the old style-injection helper, and extensionId are gone.
+  // Rebuilding the first three here is a ~30-line change; rewriting their
+  // ~3,300 lines of call sites is not. The style helper has no shim: the CSS
+  // ships in the manifest's `css` field instead (see Task 2).
+  var marinara = {
+    extension:   host.extension,
+    log:         host.log,
+    storage:     host.storage,
+    setTimeout:  host.setTimeout,
+    setInterval: host.setInterval,
+    onCleanup:   host.onCleanup,
+    extensionId: host.extension.id,
+
+    // The old bridge resolved to parsed JSON and did NOT check res.ok, so callers
+    // detect failure from the response shape instead of a rejection — see
+    // patchMessage's `res.error || res.id == null` test. Preserve that exactly:
+    // parse the body whatever the status, and resolve null when it isn't JSON at
+    // all (an HTML error page), which patchMessage already treats as a failure.
+    apiFetch: function (path, opts) {
+      var o = opts || {};
+      var method = (o.method || "GET").toUpperCase();
+      var headers = Object.assign({}, o.headers);
+      if (method !== "GET" && method !== "HEAD") headers["x-marinara-csrf"] = "1";
+      return fetch("/api" + path, Object.assign({}, o, { headers: headers, cache: "no-store" }))
+        .then(function (r) { return r.json().catch(function () { return null; }); });
+    },
+
+    // The old bridge removed its listeners when the extension was disabled.
+    // addEventListener does not, so register the teardown with the host.
+    on: function (target, type, handler, options) {
+      target.addEventListener(type, handler, options);
+      host.onCleanup(function () { target.removeEventListener(type, handler, options); });
+    }
+  };
 
   // ── Storage ───────────────────────────────────────────────────────────────
   var NS = "rwa-" + marinara.extensionId;
