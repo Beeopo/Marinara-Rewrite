@@ -77,7 +77,9 @@ assert.ok(_SRC.includes("fetchExtenderMemory"), "drift: fetchExtenderMemory miss
 assert.ok(_SRC.includes("fetchSpeakerNote"), "drift: fetchSpeakerNote missing");
 // v6.0: styles moved out of the removed marinara.addStyle bridge into extension.css,
 // which the manifest ships in its own `css` field so the engine owns teardown.
-assert.ok(!/addStyle/.test(_SRC), "drift: extension.js still calls addStyle (removed in Marinara 2.4)");
+// Match a real call, not the bare word — the shim's comments need to be able to
+// name the removed helper without tripping this.
+assert.ok(!/\baddStyle\s*\(/.test(_SRC), "drift: extension.js still calls addStyle(...) (removed in Marinara 2.4)");
 const _CSS = _rf(new URL("./extension.css", import.meta.url), "utf8");
 assert.ok(_CSS.includes(".rwa{"), "drift: extension.css missing the base .rwa rule");
 assert.ok(_CSS.includes(".rwa-win "), "drift: extension.css missing the .rwa-win rules");
