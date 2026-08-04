@@ -929,6 +929,20 @@ Post the BEFORE string, the AFTER string, the `CHANGED:` line, and the undo re-c
 
 ---
 
+## Deviations during execution
+
+Recorded so a later reader trusts the code over this document where they disagree.
+
+| Plan said | Shipped | Why |
+|---|---|---|
+| `SUFFIXES = ["-p", ...]` | `-p` **last** | `-p` doubles as the "already adopted" sentinel. Written first, a mid-copy throw (localStorage quota — a copy transiently doubles usage) was swallowed by the catch with the sentinel already set, so every later load saw adoption as complete and stranded the rest. Written last, a failed run retries. |
+| Adoption takes the first `rwa-*-p` match | Scores candidates by newest history `when` | Every 5.x re-import minted a namespace, so re-importers have several. First-match relies on localStorage enumeration order, which the spec leaves implementation-defined; in insertion-order browsers it restores the *oldest* install. |
+| `selfcheck` mirrors `adoptLegacyNamespace` by hand | Extracts and runs the shipped function | The hand mirror faithfully reproduced the first-match bug while eight assertions passed over it. `NS`/`SUFFIXES` are parsed from the source too, so they cannot drift. |
+| `apiFetch` builds headers with `Object.assign` | `new Headers(o.headers \|\| {})` | `Object.assign({}, someHeadersInstance)` yields `{}` — entries aren't own properties — silently dropping the CSRF header on a write. |
+| Shim carries `extension`, `storage`, `extensionId` | Only the six members actually called | `extensionId`'s sole consumer was the old `NS`; `extension`/`storage` were never read. |
+| Task 4 was namespace-only | Also deletes the dead Loader settings group and reclaims `rwa-loader-cache-v4` | Task 1 deleted `loader.js`, but the settings UI still told users to edit it, and the loader's ~180 KB source cache was left occupying the origin's storage budget forever. |
+| Drift guards match a bare word (`addStyle`, `extensionId`, `rwa-loader-allow-remote`) | Match a real use | Three separate times a guard blocked a *comment* explaining the removal, or the cleanup code removing the key. A guard that forbids documenting its own subject is a maintenance trap. |
+
 ## Self-Review
 
 **Spec coverage** — each break identified in the adversarial review maps to a task:
