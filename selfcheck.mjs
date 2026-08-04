@@ -97,7 +97,11 @@ assert.ok(_SRC.includes('var NS = "rwa-rewrite-assistant"'), "drift: storage nam
 // Match a real use, not the bare word, so comments can still explain the history.
 assert.ok(!/marinara\.extensionId\b|extensionId\s*:/.test(_SRC), "drift: extensionId is back (the id is regenerated on every import)");
 assert.ok(/SUFFIXES = \[[^\]]*"-p"\]/.test(_SRC), "drift: the -p sentinel is no longer copied last (partial-copy would strand data)");
-assert.ok(!/rwa-loader-allow-remote/.test(_SRC), "drift: the Loader settings group is back (loader.js was deleted in v6.0)");
+// Forbid READING or WRITING the loader's keys, not merely naming them — v6.0
+// deliberately calls removeItem on them to reclaim the storage the loader left behind.
+assert.ok(!/grp\(\w+, "Loader"\)/.test(_SRC), "drift: the Loader settings group is back (loader.js was deleted in v6.0)");
+assert.ok(!/(?:get|set)Item\("rwa-loader-/.test(_SRC), "drift: something reads or writes a loader key again");
+assert.ok(_SRC.includes('removeItem("rwa-loader-cache-v4")'), "drift: the loader's ~180KB source cache is no longer reclaimed");
 // v6.0: build.mjs owns the manifest. Guard the two fields that decide whether the
 // extension runs in the page or dies silently in the sandboxed Worker.
 const _BUILD = _rf(new URL("./build.mjs", import.meta.url), "utf8");
@@ -321,11 +325,23 @@ function _filler(tag, count) {
   console.log("selfcheck: large-selection edge-mapping assertions passed");
 }
 
-// 7) legacy-namespace adoption (mirror of extension.js adoptLegacyNamespace).
-// 5.x derived its namespace from the engine-generated extension id, which is
-// minted fresh on every import, so each re-import stranded the previous data.
-const _NS = "rwa-rewrite-assistant";
-const _SUF = ["-c", "-h", "-r", "-x", "-a", "-dbg", "-ledger", "-p"];
+// 7) legacy-namespace adoption. 5.x derived its namespace from the engine-generated
+// extension id, which is minted fresh on every import, so each re-import stranded
+// the previous data.
+//
+// These cases run the SHIPPED function, extracted from extension.js — not a hand-
+// copied mirror. A mirror has to be kept identical by hand, and a review caught one
+// faithfully reproducing a bug while eight assertions passed over it. The namespace
+// and suffix list are read from the source too, so they cannot drift either.
+const _NS = JSON.parse(_SRC.match(/var NS = ("[^"]*");/)[1]);
+const _SUF = JSON.parse(_SRC.match(/var SUFFIXES = (\[[^\]]*\]);/)[1]);
+assert.equal(_NS, "rwa-rewrite-assistant", "storage namespace changed unexpectedly");
+assert.equal(_SUF[_SUF.length - 1], "-p", "the -p sentinel must be copied last");
+const _ADOPT_SRC = _SRC.slice(
+  _SRC.indexOf("function legacyRecency"),
+  _SRC.indexOf("var _adoptedFrom = adoptLegacyNamespace();"),
+);
+assert.ok(_ADOPT_SRC.includes("function adoptLegacyNamespace"), "could not extract adoptLegacyNamespace from extension.js");
 function _fakeLS(seed) {
   const m = { ...seed };
   return {
@@ -333,32 +349,12 @@ function _fakeLS(seed) {
     key: (i) => Object.keys(m)[i] ?? null,
     getItem: (k) => (k in m ? m[k] : null),
     setItem: (k, v) => { m[k] = String(v); },
+    removeItem: (k) => { delete m[k]; },
     dump: () => m,
   };
 }
-function _adopt(ls) {
-  // <<< keep this mirror IDENTICAL in logic to extension.js's adoptLegacyNamespace >>>
-  // The try/catch is part of that logic, not scaffolding: localStorage throws in
-  // private browsing and on quota, and case (f) below depends on it.
-  try {
-    if (ls.getItem(_NS + "-p") !== null) return null;
-    let old = null;
-    for (let i = 0; i < ls.length; i++) {
-      const k = ls.key(i);
-      if (!k || k.slice(-2) !== "-p" || k.indexOf("rwa-") !== 0) continue;
-      const prefix = k.slice(0, -2);
-      if (prefix === _NS) continue;
-      old = prefix;
-      break;
-    }
-    if (!old) return null;
-    for (let j = 0; j < _SUF.length; j++) {
-      const v = ls.getItem(old + _SUF[j]);
-      if (v !== null) ls.setItem(_NS + _SUF[j], v);
-    }
-    return old;
-  } catch (e) { return null; }
-}
+const _adopt = (ls) =>
+  new Function("localStorage", "NS", "SUFFIXES", _ADOPT_SRC + "\nreturn adoptLegacyNamespace();")(ls, _NS, _SUF);
 
 // (a) fresh install: nothing to adopt, nothing written
 {
@@ -403,7 +399,6 @@ function _adopt(ls) {
 // _SUF for exactly this reason: written first, a partial copy would look like a
 // completed adoption forever and strand every remaining suffix.
 {
-  assert.equal(_SUF[_SUF.length - 1], "-p", "the -p sentinel must be copied last");
   const seed = {};
   for (const s of _SUF) seed["rwa-9f3c1a2b" + s] = "V" + s;
   const base = _fakeLS(seed);
@@ -424,5 +419,45 @@ function _adopt(ls) {
   const ls2 = _fakeLS(ls.dump());
   assert.equal(_adopt(ls2), "rwa-9f3c1a2b", "retry must find the legacy set again");
   for (const s of _SUF) assert.equal(ls2.getItem(_NS + s), "V" + s, "retry must copy " + s);
+}
+// (g) SEVERAL legacy namespaces — every 5.x re-import minted a new one, so a user
+// who re-imported has one set per import. The most recently USED one must win, by
+// history recency; picking the first or last enumerated would be a coin flip on
+// implementation-defined localStorage ordering and could restore stale settings
+// over current ones.
+{
+  const older = [{ when: 1000 }, { when: 900 }];
+  const newer = [{ when: 5000 }, { when: 4000 }];
+  const ls = _fakeLS({
+    "rwa-OLD-p": "OLDPROFILES", "rwa-OLD-c": "oldcfg", "rwa-OLD-h": JSON.stringify(older),
+    "rwa-NEW-p": "NEWPROFILES", "rwa-NEW-c": "newcfg", "rwa-NEW-h": JSON.stringify(newer),
+  });
+  assert.equal(_adopt(ls), "rwa-NEW", "the most recently used namespace must win");
+  assert.equal(ls.getItem(_NS + "-c"), "newcfg", "must not restore the stale config");
+  assert.equal(ls.getItem(_NS + "-p"), "NEWPROFILES");
+}
+// (h) insertion order must NOT decide it: same data, reversed key order, same answer.
+{
+  const older = [{ when: 1000 }], newer = [{ when: 5000 }];
+  const mk = (first, second) => _fakeLS({
+    [first + "-p"]: first, [first + "-h"]: JSON.stringify(first === "rwa-NEW" ? newer : older),
+    [second + "-p"]: second, [second + "-h"]: JSON.stringify(second === "rwa-NEW" ? newer : older),
+  });
+  assert.equal(_adopt(mk("rwa-OLD", "rwa-NEW")), "rwa-NEW");
+  assert.equal(_adopt(mk("rwa-NEW", "rwa-OLD")), "rwa-NEW", "result must not depend on enumeration order");
+}
+// (i) no history anywhere: still adopts something rather than giving up
+{
+  const ls = _fakeLS({ "rwa-A-p": "A", "rwa-B-p": "B" });
+  assert.ok(["rwa-A", "rwa-B"].includes(_adopt(ls)), "must still adopt when no history exists");
+  assert.notEqual(ls.getItem(_NS + "-p"), null, "profiles must be copied");
+}
+// (j) corrupt history JSON must not abort adoption — it just scores 0
+{
+  const ls = _fakeLS({
+    "rwa-BAD-p": "BAD", "rwa-BAD-h": "{not json",
+    "rwa-GOOD-p": "GOOD", "rwa-GOOD-h": JSON.stringify([{ when: 42 }]),
+  });
+  assert.equal(_adopt(ls), "rwa-GOOD", "corrupt history must score 0, not throw");
 }
 console.log("selfcheck: legacy-namespace adoption assertions passed");
