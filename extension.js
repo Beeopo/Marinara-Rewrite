@@ -9,8 +9,8 @@
   // and that `marinara` is now only
   //   { version, extension, log, storage, setTimeout, clearTimeout,
   //     setInterval, clearInterval, onCleanup }
-  // — apiFetch, on, extensionId, and the old style-injection helper are gone.
-  // Rebuilding the first three here is a ~30-line change; rewriting their
+  // — apiFetch, on, and the old style-injection helper are gone.
+  // Rebuilding the first two here is a ~30-line change; rewriting their
   // ~3,300 lines of call sites is not. The style helper (last) has no shim: the
   // CSS ships in the manifest's `css` field instead.
   // clearTimeout/clearInterval are deliberately not mirrored — nothing calls
@@ -22,7 +22,6 @@
     setTimeout:  host.setTimeout,
     setInterval: host.setInterval,
     onCleanup:   host.onCleanup,
-    extensionId: host.extension.id,
 
     // The old bridge resolved to parsed JSON and did NOT check res.ok, so callers
     // detect failure from the response shape instead of a rejection — see
@@ -51,7 +50,11 @@
   };
 
   // ── Storage ───────────────────────────────────────────────────────────────
-  var NS = "rwa-" + marinara.extensionId;
+  // Fixed namespace. 5.x used "rwa-" + the engine-generated extension id, but both
+  // the old and the new engine mint a fresh id on every import, so the namespace
+  // moved each time and stranded the previous install's profiles and history.
+  var NS = "rwa-rewrite-assistant";
+  var SUFFIXES = ["-p", "-c", "-h", "-r", "-x", "-a", "-dbg", "-ledger"];
   var K_PROF  = NS + "-p";
   var K_CFG   = NS + "-c";
   var K_HIST  = NS + "-h";
@@ -60,6 +63,33 @@
   var K_AUTO  = NS + "-a";
   var K_DBG   = NS + "-dbg";
   var K_LEDGER = NS + "-ledger";
+
+  // One-time adoption of a 5.x install's data: find the old "rwa-<id>-*" set by its
+  // profiles key and copy it onto the fixed namespace. Guarded on the fixed
+  // namespace being empty, so re-running never clobbers newer data. Copies rather
+  // than moves — the legacy keys stay readable if the user rolls back to 5.1.
+  function adoptLegacyNamespace() {
+    try {
+      if (localStorage.getItem(NS + "-p") !== null) return null;
+      var old = null;
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (!k || k.slice(-2) !== "-p" || k.indexOf("rwa-") !== 0) continue;
+        var prefix = k.slice(0, -2);
+        if (prefix === NS) continue;
+        old = prefix;
+        break;
+      }
+      if (!old) return null;
+      for (var j = 0; j < SUFFIXES.length; j++) {
+        var v = localStorage.getItem(old + SUFFIXES[j]);
+        if (v !== null) localStorage.setItem(NS + SUFFIXES[j], v);
+      }
+      return old;
+    } catch (e) { return null; }
+  }
+  var _adoptedFrom = adoptLegacyNamespace();
+  if (_adoptedFrom) marinara.log.info("adopted settings from legacy namespace " + _adoptedFrom);
 
   var _quotaWarned = false;
   function load(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
@@ -2797,21 +2827,6 @@
         var dbgNote = mk("div", "", "Writes ME-rewrite-debug.json to Downloads (also at window.__rwaDebug). The API key is redacted.");
         dbgNote.style.cssText = "font-size:10px;color:var(--muted-foreground);margin-top:8px;line-height:1.5;";
         ap(db, dbgNote);
-
-        // Loader: remote auto-update opt-in.
-        // Written directly to localStorage (not cfg) because the loader bundle
-        // reads this key standalone before extension.js is loaded.
-        grp(db, "Loader");
-        var remoteOn = (function () { try { return localStorage.getItem("rwa-loader-allow-remote") === "1"; } catch (e) { return false; } })();
-        row(db, "Allow remote auto-update (loader)",
-          ck(remoteOn, function (e) {
-            try { localStorage.setItem("rwa-loader-allow-remote", e.target.checked ? "1" : "0"); } catch (err) {}
-          }),
-          "Fetches extension code from GitHub on each Marinara load (falls back after local sidecar fails). ⚠️ Runs remote code — only enable if you trust the configured GitHub URL."
-        );
-        var loaderNote = mk("div", "", "Off by default. When off, only the local Extender sidecar and the last-cached copy are used. Change the REMOTE URL in loader.js to point at your own repo before enabling.");
-        loaderNote.style.cssText = "font-size:10px;color:var(--muted-foreground);margin-top:4px;line-height:1.5;";
-        ap(db, loaderNote);
       }
 
       function secPopup(pane) {
