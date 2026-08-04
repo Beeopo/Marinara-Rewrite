@@ -16,9 +16,7 @@
   // clearTimeout/clearInterval are deliberately not mirrored — nothing calls
   // them through the bridge, and the host cancels outstanding timers on teardown.
   var marinara = {
-    extension:   host.extension,
     log:         host.log,
-    storage:     host.storage,
     setTimeout:  host.setTimeout,
     setInterval: host.setInterval,
     onCleanup:   host.onCleanup,
@@ -69,21 +67,44 @@
   var K_DBG   = NS + "-dbg";
   var K_LEDGER = NS + "-ledger";
 
-  // One-time adoption of a 5.x install's data: find the old "rwa-<id>-*" set by its
-  // profiles key and copy it onto the fixed namespace. Guarded on the fixed
-  // namespace being empty, so re-running never clobbers newer data. Copies rather
-  // than moves — the legacy keys stay readable if the user rolls back to 5.1.
+  // Newest write time in a namespace's history, or 0. History entries carry
+  // `when: Date.now()`, so this is a real recency signal — unlike localStorage
+  // enumeration order, which the spec leaves implementation-defined.
+  function legacyRecency(prefix) {
+    try {
+      var h = JSON.parse(localStorage.getItem(prefix + "-h"));
+      if (!Array.isArray(h)) return 0;
+      var best = 0;
+      for (var i = 0; i < h.length; i++) {
+        if (h[i] && typeof h[i].when === "number" && h[i].when > best) best = h[i].when;
+      }
+      return best;
+    } catch (e) { return 0; }
+  }
+
+  // One-time adoption of a 5.x install's data: find the old "rwa-<id>-*" sets by
+  // their profiles key and copy the most recently used one onto the fixed
+  // namespace. Guarded on the fixed namespace being empty, so re-running never
+  // clobbers newer data. Copies rather than moves — the legacy keys stay readable
+  // if the user rolls back to 5.1.
+  //
+  // There can be several: every 5.x re-import minted a fresh namespace, which is
+  // the bug this exists to repair, so a user who re-imported has one set per
+  // import. Picking the first or last enumerated would be a coin flip on
+  // implementation-defined ordering and could restore months-old settings over
+  // current ones, so score by history recency instead. `>=` lets a later
+  // candidate win a tie, which keeps the no-history case deterministic.
   function adoptLegacyNamespace() {
     try {
       if (localStorage.getItem(NS + "-p") !== null) return null;
-      var old = null;
+      var old = null, bestWhen = -1;
       for (var i = 0; i < localStorage.length; i++) {
         var k = localStorage.key(i);
         if (!k || k.slice(-2) !== "-p" || k.indexOf("rwa-") !== 0) continue;
         var prefix = k.slice(0, -2);
         if (prefix === NS) continue;
-        old = prefix;
-        break;
+        var when = legacyRecency(prefix);
+        if (when >= bestWhen) { bestWhen = when; old = prefix; }
       }
       if (!old) return null;
       for (var j = 0; j < SUFFIXES.length; j++) {
@@ -95,6 +116,13 @@
   }
   var _adoptedFrom = adoptLegacyNamespace();
   if (_adoptedFrom) marinara.log.info("adopted settings from legacy namespace " + _adoptedFrom);
+  // The 5.x auto-update loader (deleted in v6.0) cached the whole extension source
+  // under rwa-loader-cache-v4 — ~180 KB of the origin's localStorage budget that
+  // nothing reads any more, and this extension's own history competes for it.
+  try {
+    localStorage.removeItem("rwa-loader-cache-v4");
+    localStorage.removeItem("rwa-loader-allow-remote");
+  } catch (e) {}
 
   var _quotaWarned = false;
   function load(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
