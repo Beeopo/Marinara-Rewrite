@@ -90,6 +90,12 @@ assert.ok(_SRC.includes("var marinara = {"), "drift: compat shim object missing"
 assert.ok(_SRC.includes('"x-marinara-csrf"'), "drift: apiFetch shim not sending the CSRF header");
 assert.ok(_SRC.includes('fetch("/api" + path'), "drift: apiFetch shim not prefixing /api");
 assert.ok(_SRC.includes("removeEventListener"), "drift: on() shim not registering teardown");
+// v6.0: the storage namespace is a fixed literal. Deriving it from the engine's
+// extension id stranded the user's data on every re-import.
+assert.ok(_SRC.includes("function adoptLegacyNamespace"), "drift: adoptLegacyNamespace missing");
+assert.ok(_SRC.includes('var NS = "rwa-rewrite-assistant"'), "drift: storage namespace is not the fixed literal");
+assert.ok(!/extensionId/.test(_SRC), "drift: extensionId is back (the id is regenerated on every import)");
+assert.ok(!/rwa-loader-allow-remote/.test(_SRC), "drift: the Loader settings group is back (loader.js was deleted in v6.0)");
 console.log("drift-guard assertions passed");
 console.log("selfcheck: debug-buffer assertions passed");
 
@@ -306,3 +312,78 @@ function _filler(tag, count) {
   assert.equal(out2, pre + "*<<X>>*" + post, "large-selection edge-mapped splice (transform-straddled edges)");
   console.log("selfcheck: large-selection edge-mapping assertions passed");
 }
+
+// 7) legacy-namespace adoption (mirror of extension.js adoptLegacyNamespace).
+// 5.x derived its namespace from the engine-generated extension id, which is
+// minted fresh on every import, so each re-import stranded the previous data.
+const _NS = "rwa-rewrite-assistant";
+const _SUF = ["-p", "-c", "-h", "-r", "-x", "-a", "-dbg", "-ledger"];
+function _fakeLS(seed) {
+  const m = { ...seed };
+  return {
+    get length() { return Object.keys(m).length; },
+    key: (i) => Object.keys(m)[i] ?? null,
+    getItem: (k) => (k in m ? m[k] : null),
+    setItem: (k, v) => { m[k] = String(v); },
+    dump: () => m,
+  };
+}
+function _adopt(ls) {
+  // <<< keep this mirror IDENTICAL in logic to extension.js's adoptLegacyNamespace >>>
+  if (ls.getItem(_NS + "-p") !== null) return null;
+  let old = null;
+  for (let i = 0; i < ls.length; i++) {
+    const k = ls.key(i);
+    if (!k || k.slice(-2) !== "-p" || k.indexOf("rwa-") !== 0) continue;
+    const prefix = k.slice(0, -2);
+    if (prefix === _NS) continue;
+    old = prefix;
+    break;
+  }
+  if (!old) return null;
+  for (let j = 0; j < _SUF.length; j++) {
+    const v = ls.getItem(old + _SUF[j]);
+    if (v !== null) ls.setItem(_NS + _SUF[j], v);
+  }
+  return old;
+}
+
+// (a) fresh install: nothing to adopt, nothing written
+{
+  const ls = _fakeLS({});
+  assert.equal(_adopt(ls), null);
+  assert.deepEqual(ls.dump(), {});
+}
+// (b) legacy install: every present suffix copied, absent ones skipped
+{
+  const ls = _fakeLS({
+    "rwa-9f3c1a2b-p": '[{"id":"expand"}]',
+    "rwa-9f3c1a2b-c": '{"temp":0.8}',
+    "rwa-9f3c1a2b-h": "[]",
+    "unrelated-key": "keep me",
+  });
+  assert.equal(_adopt(ls), "rwa-9f3c1a2b");
+  assert.equal(ls.getItem(_NS + "-p"), '[{"id":"expand"}]');
+  assert.equal(ls.getItem(_NS + "-c"), '{"temp":0.8}');
+  assert.equal(ls.getItem(_NS + "-h"), "[]");
+  assert.equal(ls.getItem(_NS + "-ledger"), null, "absent suffix must not be written");
+  assert.equal(ls.getItem("unrelated-key"), "keep me");
+}
+// (c) non-destructive: the legacy keys survive so a rollback to 5.1 still reads them
+{
+  const ls = _fakeLS({ "rwa-9f3c1a2b-p": "LEGACY" });
+  _adopt(ls);
+  assert.equal(ls.getItem("rwa-9f3c1a2b-p"), "LEGACY", "adoption must copy, never move");
+}
+// (d) already migrated: no-op, never clobbers newer data
+{
+  const ls = _fakeLS({ [_NS + "-p"]: "NEW", "rwa-9f3c1a2b-p": "OLD" });
+  assert.equal(_adopt(ls), null);
+  assert.equal(ls.getItem(_NS + "-p"), "NEW");
+}
+// (e) the fixed namespace's own key is never treated as a legacy source
+{
+  const ls = _fakeLS({ [_NS + "-c"]: "x" });
+  assert.equal(_adopt(ls), null);
+}
+console.log("selfcheck: legacy-namespace adoption assertions passed");
