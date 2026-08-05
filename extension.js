@@ -929,7 +929,13 @@
   var OPAQUE_RE = /\{\{[\s\S]*?\}\}|```[\s\S]*?```|`[^`\n]*`|!\[[^\]\n]*\]\([^)\s]*\)|\\[\s\S]|<[A-Za-z][^<>]*\/>/g;
   var EMPH_RE   = /(\*\*\*|\*\*|~~|==|__|\*|_)(?!\1)([\s\S]*?)\1/g;
   var LINK_RE   = /\[([^\]\n]*)\]\(([^)\s]*)\)/g;
-  var TAG_RE    = /<([A-Za-z][A-Za-z0-9]*)[^<>]*>[\s\S]*?<\/\1\s*>/g;
+  // (?![A-Za-z0-9]) pins the tag-name boundary: without it, the name atom
+  // [A-Za-z0-9]* and the attribute atom [^<>]* both match the same run of
+  // characters, so on an unclosed "<" + long alnum run every failed overall
+  // match re-partitions the run between them — quadratic backtracking. For
+  // any well-formed tag the lookahead is vacuous (whitespace, =, ", /, or >
+  // follows the name); it only prunes the doomed re-partitions.
+  var TAG_RE    = /<([A-Za-z][A-Za-z0-9]*)(?![A-Za-z0-9])[^<>]*>[\s\S]*?<\/\1\s*>/g;
   function spanIsBalanced(A, as, ae) {
     var t, m, i, pairs = [], ov = function (s, e) { return as < e && ae > s; };
     OPAQUE_RE.lastIndex = 0;
