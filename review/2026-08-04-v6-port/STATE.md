@@ -16,9 +16,10 @@
 | 4 FIX | **done** — all 15 tasks across Tracks A+B+C. 11 commits `5c9c662..c741ed1`. Every fix carries a test proven to fail when the behaviour it guards is broken (not merely deleted). |
 | 4.5 SIGNOFF r1 | **done** — 3 skeptics; defects in all three groups. B1's parity rule was outright wrong (`**bold**` + select `"ld text"` → `"**boX"`, plus 7 more constructs corrupting and false refusals on transform-free prose); **no guard read the shipped artifact**, which had genuinely drifted; empty-profile resurrection; an abort-race that would turn cancels into error dialogs; two guards pinning the condition not the effect (scoping Content-Type to PATCH, or swapping the CONN_KEYS comparisons — the latter would export the API key in plaintext). Fixed in `5fd6b3f`, `833ab7b`, `ec0d137`. |
 | LIVE VERIFY | **done** on `:7999` (engine restarted on a new port; `:7860` instance had died). Current build re-approved after the code change cleared `approvedHash` — itself a live confirmation of a README claim. Round-trip: 2nd occurrence rewritten, 1st untouched, `*…*` markers and `{{char}}` intact. **B2 proven under attack** — a real concurrent write produced the confirm modal and was NOT overwritten; Cancel left it intact. Throwaway chat deleted, config restored, mock stopped. |
-| 4.5 SIGNOFF r2 | in progress — 3 skeptics over all 11 fix commits, weighted to the write path (`c741ed1`) and to the corrections (`5fd6b3f` is the SECOND attempt at the aligner guard, and attempt 1 shipped green and wrong). |
-| 5 DOCS | pending |
-| 6 REPORT | pending |
+| 4.5 SIGNOFF r2 | **done** — 3 skeptics, **7 further defects**, incl. the run's most important: the aligner suite tested a hand-copied MIRROR, so gutting the shipped `spanIsBalanced` left everything green while the extension still corrupted. Also nested pairs never registered, `windowMap` validated only a window slice, `guardedPatch` wrote blind on a non-array re-read, `reviewThenPatch` had 3 non-write exits and 2 were fixed, and the adoption rollback deleted pre-existing values. All fixed in `46cb4c0`, `7a716ec`. |
+| 4.5 SIGNOFF r2 (was) | in progress — 3 skeptics over all 11 fix commits, weighted to the write path (`c741ed1`) and to the corrections (`5fd6b3f` is the SECOND attempt at the aligner guard, and attempt 1 shipped green and wrong). |
+| 5 DOCS | **done** — `c2d260f`. README Limitations + Features and the CHANGELOG now cover the behaviour the fixes changed. No `bible/` in this repo, so `foundation-audit` is offered, not built. |
+| 6 REPORT | **done** — `REPORT.md`. |
 
 ## Stack / conventions
 
