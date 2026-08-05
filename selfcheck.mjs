@@ -206,6 +206,15 @@ assert.equal(_spanIsBalanced('say <speaker="A">line</speaker> end', 0, 8), false
 assert.equal(_spanIsBalanced("a <b><i>x</i></b> c", 0, 9), false, "nested inner-delimiter cut must refuse");
 assert.equal(_spanIsBalanced("plain <b>unclosed text", 0, 10), true, "an unclosed tag forms no pair");
 assert.equal(_spanIsBalanced("a < b and c > d", 0, 5), true, "comparison operators are not tags");
+// Intentional divergence, not a regression: the OLD regex matched a
+// name-MISMATCHED pair (<abc123>...</abc>) by backtracking the name to "abc"
+// and swallowing "123" as pseudo-attributes — the same backtracking that was
+// quadratic. Names that differ can never be a real pair, the engine renders
+// such text literally (unknown tags aren't in its allowlist), so no pair =
+// no refusal is correct. If this assertion fails, someone restored the
+// backtracking. See commit 0f688fe.
+assert.equal(_spanIsBalanced("<abc123>content</abc>", 9, 16), true,
+  "mismatched-name pseudo-tags must not register as a pair");
 function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
 // clean boundaries MUST splice exactly:
 assert.equal(_spl("hello world", "hello world", 6, 11, "X"), "hello X");           // identity
