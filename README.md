@@ -3,6 +3,9 @@
 An extension for [Marinara Engine](https://github.com/SillyTavern/Marinara-Engine) that rewrites a selected
 section of text in a message using an AI model. Select text, choose a mode, and the selection is replaced in place.
 
+> **Using [Lumiverse](https://github.com/lumiverse)?** A native port of this extension lives at
+> **[Beeopo/Lumiverse-Rewrite](https://github.com/Beeopo/Lumiverse-Rewrite)**.
+
 ## Screenshots
 
 | Rewrite popup | Result with diff |
