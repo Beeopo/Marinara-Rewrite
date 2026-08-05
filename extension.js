@@ -1,4 +1,4 @@
-// Rewrite Assistant v6.0 — Marinara Engine v2.4 Personal Extensions (full page)
+// Rewrite Assistant v6.1 — Marinara Engine v2.4 Personal Extensions (full page)
 (function (host) {
   "use strict";
 

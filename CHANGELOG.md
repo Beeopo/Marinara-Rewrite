@@ -15,6 +15,24 @@
   the connection picker, instead of blaming the local sidecar.
 - The selected connection id is excluded from settings export/import, like every
   other connection setting.
+- **Fixed:** plain prose containing literal `*` or `_` characters no longer
+  false-refuses rewrites. When the rendered text is byte-identical to the stored
+  text the engine transformed nothing, so those markers were never formatting —
+  the selection now maps directly instead of being refused.
+- **Fixed:** block macros (`{{#if}}…{{/if}}`) can no longer be halved by a
+  splice, including when nested inside a same-named block. Tags and block macros
+  are now paired by name with proper nesting; previously a nested or self-closing
+  construct could leave a delimiter orphanable — or refuse a perfectly safe edit.
+- **Fixed:** a large-selection Ledger apply no longer drops the whitespace at
+  sentence and paragraph slice boundaries when the slices are assembled. (One
+  corner remains: a single unbroken run longer than a slice with no sentence
+  punctuation at all is hard-cut mid-run, and a rewritten slice can still fuse
+  at that cut.)
+- **Performance:** locating a selection near a `<` or `{{#` followed by a long
+  unbroken run of text no longer stalls (a regex backtracking issue — ~700 ms per
+  check at 40k characters, now ~0 ms). Guarded by timing assertions in the suite.
+- CI now runs the self-check suite and a bundle-staleness check on every push to
+  main and every pull request, on an LF checkout.
 
 ## v6.0 — Marinara Engine v2.4 Personal Extensions
 

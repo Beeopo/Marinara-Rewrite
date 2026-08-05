@@ -5,8 +5,7 @@ ME-rewrite-debug.json
 # with local paths in them, not part of the shipped extension. Keep on disk,
 # keep out of the public repo.
 review/
-docs/superpowers/plans/*.tasks.json
-docs/superpowers/plans/2026-08-04-*
+docs/superpowers/
 
 # OS / editor cruft
 .DS_Store

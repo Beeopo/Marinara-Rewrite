@@ -156,8 +156,10 @@ and splice the new text in. Most failures happen at that second step, not the ge
   selected text in the rendered message", and "could not map the selection back to stored content". A selection
   whose edges land inside a formatting marker or a macro refuses rather than risk a bad splice; trimming the
   selection to whole words, clear of markers, usually resolves it. The same applies to nested formatting
-  (`**bold with *inner* italic**`) and to `<speaker="…">` wrappers in group chats — taking one delimiter without
-  its partner would leave the other stranded in the message, so the rewrite is refused instead.
+  (`**bold with *inner* italic**`), block macros (`{{#if}}…{{/if}}`), and `<speaker="…">` wrappers in group
+  chats — taking one delimiter without its partner would leave the other stranded in the message, so the rewrite
+  is refused instead. One case never refuses: if the message renders exactly as stored (no markers, macros, or
+  curly quotes anywhere), any `*` or `_` in it is literal text, and selections crossing them apply normally.
 - **The message may have changed since you selected the text.** Marinara writes to messages from several places —
   swipes, regenerates, and automatic background messages — and its save endpoint is last-write-wins. Every write
   the extension makes re-reads the stored message first. An **apply** re-locates your selection in the current
