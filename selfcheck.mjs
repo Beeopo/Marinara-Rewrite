@@ -70,8 +70,11 @@ assert.ok(_SRC.includes("function alignExact"), "drift: alignExact (exact LCS co
 // shares a run with its own expansion. Guard both the function and both call sites —
 // alignExact's, and the per-edge composition that alignExact never sees.
 assert.ok(_SRC.includes("function spanIsBalanced"), "drift: spanIsBalanced (mid-token splice guard) missing");
-assert.equal((_SRC.match(/if \(!spanIsBalanced\(/g) || []).length, 2,
-  "drift: spanIsBalanced must gate BOTH alignExact and the per-edge composed span");
+// Three gates, not two: alignExact's own, windowMap's re-check against the WHOLE
+// document (its alignExact call only ever saw a window slice, so a pair straddling
+// the window edge was invisible there), and the per-edge composed span.
+assert.equal((_SRC.match(/if \(!spanIsBalanced\(/g) || []).length, 3,
+  "drift: spanIsBalanced must gate alignExact, windowMap's whole-document re-check, AND the per-edge composed span");
 assert.ok(_SRC.includes("function findCleanAnchor"), "drift: findCleanAnchor (windowing peg) missing");
 assert.ok(_SRC.includes("function normForAnchor"), "drift: normForAnchor (quote-normalized anchoring) missing");
 assert.ok(_SRC.includes("function windowMap"), "drift: windowMap (per-edge large-selection mapping) missing");
@@ -158,174 +161,34 @@ if (!process.env.RWA_BUILDING) {
 console.log("drift-guard assertions passed");
 console.log("selfcheck: debug-buffer assertions passed");
 
-// 6) render<->raw span alignment + NON-CORRUPTION (mirror of alignExact)
-function _alignExact(R, A, rs, re) {
-  // <<< keep this mirror IDENTICAL in logic to extension.js's alignExact >>>
-  const n = R.length, m = A.length;
-  if (!n || !m || n * m > 4000000) return null;
-  if (rs < 0 || re > n || re < rs) return null;
-  let i, j, k, c;
-  const dp = [];
-  for (i = 0; i <= n; i++) dp.push(new Int32Array(m + 1));
-  for (i = n - 1; i >= 0; i--)
-    for (j = m - 1; j >= 0; j--)
-      dp[i][j] = (R.charCodeAt(i) === A.charCodeAt(j))
-        ? dp[i + 1][j + 1] + 1
-        : Math.max(dp[i + 1][j], dp[i][j + 1]);
-  // Backtrace: mr[i] = matched raw index for rendered char i, or -1 (rendered-only).
-  // matchedRaw[j] = 1 if raw char j is an LCS match (else raw-only / transform char).
-  const mr = new Int32Array(n);
-  for (k = 0; k < n; k++) mr[k] = -1;
-  const matchedRaw = new Uint8Array(m);
-  let i2 = 0, j2 = 0;
-  while (i2 < n || j2 < m) {
-    if (i2 < n && j2 < m && R.charCodeAt(i2) === A.charCodeAt(j2)) {
-      mr[i2] = j2; matchedRaw[j2] = 1; i2++; j2++;
-    } else if (j2 >= m || (i2 < n && dp[i2 + 1][j2] >= dp[i2][j2 + 1])) {
-      i2++; // rendered-only char
-    } else {
-      j2++; // raw-only char
-    }
-  }
-  // Demote ISLAND matches: a matched raw char flanked by raw-only chars on BOTH
-  // sides is an incidental match inside a transform token, not a real anchor.
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (k = 0; k < n; k++) {
-      const rj = mr[k];
-      if (rj < 0) continue;
-      const leftRO = (rj > 0) && !matchedRaw[rj - 1];
-      const rightRO = (rj < m - 1) && !matchedRaw[rj + 1];
-      if (leftRO && rightRO) { mr[k] = -1; matchedRaw[rj] = 0; changed = true; }
-    }
-  }
-  // Compute raw cut points from the nearest real anchors.
-  let as, ae, x, pm, nm;
-  if (rs >= n) { as = m; }
-  else if (mr[rs] >= 0) { as = mr[rs]; }
-  else {
-    pm = -1;
-    for (x = rs - 1; x >= 0; x--) { if (mr[x] >= 0) { pm = x; break; } }
-    as = (pm >= 0) ? mr[pm] + 1 : 0;
-  }
-  if (re <= 0) { ae = 0; }
-  else if (mr[re - 1] >= 0) { ae = mr[re - 1] + 1; }
-  else {
-    nm = -1;
-    for (x = re; x < n; x++) { if (mr[x] >= 0) { nm = x; break; } }
-    ae = (nm >= 0) ? mr[nm] : m;
-  }
-  if (ae < as) return null;
-  // If the selection touches a transform, snap each edge OUTWARD so no raw-only
-  // token is bisected.
-  let touchesTransform = false;
-  for (k = rs; k < re; k++) { if (mr[k] < 0) { touchesTransform = true; break; } }
-  if (!touchesTransform) {
-    for (c = as; c < ae; c++) { if (!matchedRaw[c]) { touchesTransform = true; break; } }
-  }
-  if (touchesTransform) {
-    while (as > 0 && !matchedRaw[as - 1] && !matchedRaw[as]) as--;
-    while (ae < m && !matchedRaw[ae] && ae > 0 && !matchedRaw[ae - 1]) ae++;
-    if (as === ae) {
-      for (k = rs; k < re; k++) {
-        if (mr[k] < 0) {
-          while (ae < m && !matchedRaw[ae]) ae++;
-          while (as > 0 && !matchedRaw[as - 1]) as--;
-          break;
-        }
-      }
-    }
-  }
-  if (ae < as) return null;
-  // Final clean-edge check: neither cut may sit strictly inside a raw-only run.
-  const dirtyStart = as > 0 && as < m && !matchedRaw[as - 1] && !matchedRaw[as];
-  const dirtyEnd = ae > 0 && ae < m && !matchedRaw[ae - 1] && !matchedRaw[ae];
-  if (dirtyStart || dirtyEnd) return null;
-  if (!_spanIsBalanced(A, as, ae)) return null;
-  return { as, ae };
-}
-// <<< mirror of extension.js spanIsBalanced — keep IDENTICAL in logic >>>
-  var _OPAQUE_RE = /\{\{[\s\S]*?\}\}|```[\s\S]*?```|`[^`\n]*`|!\[[^\]\n]*\]\([^)\s]*\)|\\[\s\S]|<[A-Za-z][^<>]*\/>/g;
-  var _EMPH_RE   = /(\*\*\*|\*\*|~~|==|__|\*|_)(?!\1)([\s\S]*?)\1/g;
-  var _LINK_RE   = /\[([^\]\n]*)\]\(([^)\s]*)\)/g;
-  var _TAG_RE    = /<([A-Za-z][A-Za-z0-9]*)[^<>]*>[\s\S]*?<\/\1\s*>/g;
-  function _spanIsBalanced(A, as, ae) {
-    var t, m, i, pairs = [], ov = function (s, e) { return as < e && ae > s; };
-    _OPAQUE_RE.lastIndex = 0;
-    while ((t = _OPAQUE_RE.exec(A))) {
-      var os = t.index, oe = os + t[0].length;
-      if (ov(os, oe) && !(as <= os && ae >= oe)) return false;
-    }
-    _EMPH_RE.lastIndex = 0;
-    while ((m = _EMPH_RE.exec(A))) {
-      var d = m[1].length, s0 = m.index, e0 = s0 + m[0].length;
-      pairs.push([s0, s0 + d, e0 - d, e0]);
-    }
-    _LINK_RE.lastIndex = 0;
-    while ((m = _LINK_RE.exec(A))) {
-      var ls = m.index;
-      pairs.push([ls, ls + 1, ls + 1 + m[1].length, ls + m[0].length]);
-    }
-    _TAG_RE.lastIndex = 0;
-    while ((m = _TAG_RE.exec(A))) {
-      var ts = m.index, raw = m[0];
-      pairs.push([ts, ts + raw.indexOf(">") + 1, ts + raw.lastIndexOf("</"), ts + raw.length]);
-    }
-    // Exactly one delimiter of a pair inside the cut orphans the other.
-    for (i = 0; i < pairs.length; i++) {
-      if (ov(pairs[i][0], pairs[i][1]) !== ov(pairs[i][2], pairs[i][3])) return false;
-    }
-    return true;
-  }
-// mirror of extension.js findCleanAnchor
-function _findCleanAnchor(R, A, pos, side, LEN, MAXSPAN) {
-  const step = 8;
-  for (let t = 0; t * step <= MAXSPAN; t++) {
-    const p = side < 0 ? (pos - t * step - LEN) : (pos + t * step);
-    if (p < 0 || p + LEN > R.length) continue;
-    const cand = R.substring(p, p + LEN);
-    const idx = A.indexOf(cand);
-    if (idx < 0) continue;
-    if (A.indexOf(cand, idx + 1) >= 0) continue;
-    return { rPos: p, aPos: idx };
-  }
-  return null;
-}
-// mirror of extension.js normForAnchor
-function _normForAnchor(s) { return s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'"); }
-// mirror of extension.js windowMap
-function _windowMap(R, A, rs, re) {
-  const n = R.length, m = A.length;
-  const LEN = 40, MAXSPAN = 800;
-  const Rn = _normForAnchor(R), An = _normForAnchor(A);
-  const left = _findCleanAnchor(Rn, An, rs, -1, LEN, MAXSPAN);
-  const right = _findCleanAnchor(Rn, An, re, 1, LEN, MAXSPAN);
-  const wlo = left ? left.rPos : 0;
-  const lo = left ? left.aPos : 0;
-  const whi = right ? right.rPos + LEN : n;
-  const hi = right ? right.aPos + LEN : m;
-  if (wlo > rs || whi < re || lo >= hi || wlo >= whi) return null;
-  if ((whi - wlo) * (hi - lo) > 4000000) return null;
-  const loc = _alignExact(R.slice(wlo, whi), A.slice(lo, hi), rs - wlo, re - wlo);
-  if (!loc) return null;
-  return { as: lo + loc.as, ae: lo + loc.ae };
-}
-// mirror of extension.js mapRenderedSpanToRaw (windowed; large selections map per-edge)
-function _mapRenderedSpanToRaw(R, A, rs, re) {
-  const n = R.length, m = A.length;
-  if (!n || !m) return null;
-  if (rs < 0 || re > n || re < rs) return null;
-  if (n * m <= 4000000) return _alignExact(R, A, rs, re);
-  const whole = _windowMap(R, A, rs, re);
-  if (whole) return whole;
-  if (re - rs < 1) return null;
-  const startSpan = _windowMap(R, A, rs, rs + 1);
-  const endSpan = _windowMap(R, A, re - 1, re);
-  if (!startSpan || !endSpan || endSpan.ae < startSpan.as) return null;
-  if (!_spanIsBalanced(A, startSpan.as, endSpan.ae)) return null;
-  return { as: startSpan.as, ae: endSpan.ae };
-}
+// 6) render<->raw span alignment + NON-CORRUPTION.
+//
+// These run the SHIPPED functions, extracted from extension.js. They used to run a
+// hand-copied mirror, and a sign-off proved what that was worth: gutting the shipped
+// spanIsBalanced to `return true` left this entire section green while the real
+// extension spliced "**bold** text" into "**boX". The 20 cases below were pinned
+// against the mirror and said nothing about the artifact users install.
+const _ALIGN_SRC =
+  _SRC.slice(_SRC.indexOf("  var OPAQUE_RE ="), _SRC.indexOf("  // Index of the n-th")) +
+  _SRC.slice(_SRC.indexOf("  function alignExact(R, A, rs, re) {"), _SRC.indexOf("  function wcDiff(a, b) {"));
+const _AL = new Function(
+  _ALIGN_SRC +
+    "\nreturn { spanIsBalanced: spanIsBalanced, alignExact: alignExact, windowMap: windowMap," +
+    " mapRenderedSpanToRaw: mapRenderedSpanToRaw, normForAnchor: normForAnchor, findCleanAnchor: findCleanAnchor };",
+)();
+const _alignExact = _AL.alignExact;
+const _spanIsBalanced = _AL.spanIsBalanced;
+const _windowMap = _AL.windowMap;
+const _mapRenderedSpanToRaw = _AL.mapRenderedSpanToRaw;
+const _normForAnchor = _AL.normForAnchor;
+const _findCleanAnchor = _AL.findCleanAnchor;
+// The extraction must actually have produced working functions — an empty or broken
+// slice would make every assertion below vacuous, which is the failure mode this
+// whole change exists to remove.
+assert.equal(typeof _alignExact, "function", "aligner extraction failed — assertions below would be vacuous");
+assert.equal(typeof _spanIsBalanced, "function", "spanIsBalanced extraction failed");
+assert.equal(_spanIsBalanced("**bold** text", 2, 9), false, "extraction sanity: the shipped guard must reject an orphaning span");
+assert.equal(_spanIsBalanced("plain text here", 0, 5), true, "extraction sanity: the shipped guard must allow a clean span");
 function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
 // clean boundaries MUST splice exactly:
 assert.equal(_spl("hello world", "hello world", 6, 11, "X"), "hello X");           // identity
@@ -373,6 +236,19 @@ for (const [A, R, sel, why] of [
   ["Hi ![alt](https://e.co/i.png) word.", "Hi alt word.", "Hi al", "image"],
   ["Hi <b>text</b> word.", "Hi text word.", "Hi tex", "html tag pair"],
 ]) assert.equal(_bisect(A, R, sel), null, "must refuse (" + why + "): " + JSON.stringify(A));
+// (a2) NESTED pairs. A /g/ scan leaves lastIndex past the closing delimiter, so a
+// pair inside the content never registered and could never be checked — and the
+// engine recurses emphasis six deep and renders <speaker="…"> as a wrapper, so in
+// any multi-character chat every inner <b>/<i> is nested. Each of these orphaned a
+// delimiter before the rescan fix.
+for (const [A, R, sel, why] of [
+  ["**bold with *inner* italic**", "bold with inner italic", "with inner", "inner * opened inside **"],
+  ["**bold with *inner* italic**", "bold with inner italic", "inner ital", "inner * closed inside **"],
+  ["==note ~~gone~~ here==", "note gone here", "note gone", "~~ nested in =="],
+  ["~~all **very** bad~~", "all very bad", "all very", "** nested in ~~"],
+  ["<b>She said <i>maybe</i> softly</b>", "She said maybe softly", "said maybe", "<i> nested in <b>"],
+  ['<speaker="Bob">She said <b>yes</b> firmly</speaker>', "She said yes firmly", "said yes", "<b> nested in a speaker wrapper"],
+]) assert.equal(_bisect(A, R, sel), null, "nested pair must refuse (" + why + "): " + JSON.stringify(A));
 // (b) must SPLICE: cutting through CONTENT between delimiters is the common case
 for (const [A, R, sel, want] of [
   ["**hey** there", "hey there", "hey", "**X** there"],
@@ -546,6 +422,37 @@ const _adopt = (ls) =>
   };
   assert.equal(_adopt(ls), null, "a swallowed throw must report failure, not success");
   assert.equal(ls.getItem(_NS + "-p"), null, "sentinel must be unset so the next load retries");
+  // Rollback must RESTORE a pre-existing value, not delete it. Deleting turns
+  // "overwritten with a stale legacy value" into "erased, defaults apply" — worse
+  // than the bug the rollback exists to prevent.
+  {
+    const seed2 = { [_NS + "-c"]: "MY-REAL-CURRENT-CONFIG" };
+    for (const s of _SUF) seed2["rwa-9f3c1a2b" + s] = "LEGACY" + s;
+    const base2 = _fakeLS(seed2);
+    // Model quota by SIZE, not by a write counter: real storage frees up when a key
+    // is removed, and a rollback that restores with setItem alone would be impossible
+    // to satisfy under a counter that never relents. That distinction is the fix —
+    // clear first, then restore.
+    const CAP = Object.values(seed2).join("").length + 30;
+    const used = () => Object.values(base2.dump()).join("").length;
+    const ls2 = {
+      get length() { return base2.length; },
+      key: (i) => base2.key(i),
+      getItem: (k) => base2.getItem(k),
+      removeItem: (k) => base2.removeItem(k),
+      setItem: (k, v) => {
+        const prior = base2.getItem(k);
+        if (used() - (prior === null ? 0 : prior.length) + String(v).length > CAP) {
+          const e = new Error("QuotaExceededError"); e.name = "QuotaExceededError"; throw e;
+        }
+        base2.setItem(k, v);
+      },
+      dump: () => base2.dump(),
+    };
+    assert.equal(_adopt(ls2), null, "partial copy must report failure");
+    assert.equal(ls2.getItem(_NS + "-c"), "MY-REAL-CURRENT-CONFIG",
+      "rollback must RESTORE a pre-existing value, not delete it");
+  }
   // A partial copy is not just a missing sentinel: the suffixes written before the
   // throw (here "-c", "-h", "-r") must be rolled back too, or the CURRENT load boots
   // on a mixed legacy/default state even though the NEXT load would retry cleanly.
@@ -895,6 +802,11 @@ console.log("selfcheck: fence-escaping assertions passed");
   // fix patched doCommit and left reviewThenPatch stalling through the same door.
   assert.equal((_SRC.match(/if \(!res\) \{ if \(onFail\) onFail\(null\); return; \}/g) || []).length, 2,
     "drift: both chained decline sites (doCommit and reviewThenPatch) must call onFail — one alone still stalls a merge");
+  // reviewThenPatch has THREE exits that are not a write: decline, Cancel, and a save
+  // failure. The first two were fixed and the third stayed broken — a real PATCH
+  // failure during a reviewed merge still stalled the chain silently.
+  assert.ok(/showErr\("Save failed:[\s\S]{0,120}if \(onFail\) onFail\("Save failed"\);/.test(_SRC),
+    "drift: reviewThenPatch's save-failure path no longer reports — a reviewed merge stalls with no summary");
   assert.ok(/function reviewThenPatch\(cid, mid, oldContent, proposed, onDone, onFail\)/.test(_SRC),
     "drift: reviewThenPatch no longer accepts onFail, so its decline and Cancel cannot report");
   assert.ok(/reviewThenPatch\(cid, mid, msg\.content, updated, onDone, onFail\)/.test(_SRC),
