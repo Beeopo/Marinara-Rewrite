@@ -13,6 +13,9 @@ const SOURCE = "extension.js";
 const STYLES = "extension.css";
 
 // 1) Gate on selfcheck (its top-level assertions throw on failure).
+// Tell it we're mid-build so it skips its bundle-is-in-sync assertion — that check
+// exists to catch a forgotten rebuild, and this IS the rebuild.
+process.env.RWA_BUILDING = "1";
 try {
   await import("./selfcheck.mjs");
 } catch (e) {

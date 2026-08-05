@@ -126,6 +126,18 @@ const _BUILD = _rf(new URL("./build.mjs", import.meta.url), "utf8");
 assert.ok(_BUILD.includes('capabilities: ["full_page_access"]'), "drift: manifest does not request full_page_access");
 assert.ok(_BUILD.includes('runtime: "client"'), "drift: manifest runtime is not client");
 assert.ok(!/^\s*id:/m.test(_BUILD), "drift: manifest re-introduced an `id` field (not in the 2.4 schema)");
+
+// Every guard above reads the SOURCE. Users import the BUNDLE. Nothing checked that
+// the two agree, so "edit source, run selfcheck, commit, forget `node build.mjs`"
+// shipped a stale artifact with a fully green suite — and a line-ending change alone
+// was enough to desync them once. Skipped while build.mjs is mid-run: it gates on
+// selfcheck BEFORE writing the bundle, so asserting here unconditionally would make
+// the build unrunnable exactly when a rebuild is what's needed.
+if (!process.env.RWA_BUILDING) {
+  const _BUNDLE = JSON.parse(_rf(new URL("./rewrite-assistant.json", import.meta.url), "utf8"));
+  assert.equal(_BUNDLE.js, _SRC, "drift: rewrite-assistant.json is stale — run `node build.mjs`");
+  assert.equal(_BUNDLE.css, _CSS, "drift: rewrite-assistant.json styles are stale — run `node build.mjs`");
+}
 console.log("drift-guard assertions passed");
 console.log("selfcheck: debug-buffer assertions passed");
 
