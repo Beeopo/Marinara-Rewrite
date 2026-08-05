@@ -160,7 +160,21 @@
     { id: "grammar",     name: "Grammar Fix",           order: 12, prompt: "Fix only grammar, spelling, and punctuation. Do not change wording, style, or content." },
   ];
 
-  var profiles = loadArr(K_PROF, DEF_PROFILES);
+  // Shape predicate for a stored profile. Shared by the loader below and the
+  // settings import, which is the only other place untrusted profile data enters.
+  function validProfileEntry(e) {
+    return e && typeof e === "object" && !Array.isArray(e) &&
+           typeof e.id === "string" && typeof e.name === "string" && typeof e.prompt === "string";
+  }
+
+  // Filter, don't just array-check. loadArr only proves the top level is an array,
+  // and adoptLegacyNamespace copies a previous install's profiles across verbatim —
+  // a new unvalidated writer of this key. A single null element made migratePrompts
+  // below throw, and because the engine splices this file synchronously into its
+  // main(), that throw aborts every remaining top-level statement: no bindings, no
+  // popup, and nothing in the UI to say why. Filtering here covers every writer.
+  var profiles = loadArr(K_PROF, DEF_PROFILES).filter(validProfileEntry);
+  if (!profiles.length) profiles = DEF_PROFILES.slice();
 
   var DEF_CFG = {
     cols: 2, rows: 8, typewriter: false, useCharCard: false, showDiff: false,
@@ -2474,11 +2488,7 @@
           var dropped = 0;
 
           // profiles/customs: must be arrays; entries must be objects with string
-          // id, name, prompt (the three required profile fields).
-          function validProfileEntry(e) {
-            return e && typeof e === "object" && !Array.isArray(e) &&
-                   typeof e.id === "string" && typeof e.name === "string" && typeof e.prompt === "string";
-          }
+          // id, name, prompt — validProfileEntry is defined once near the loader.
           if (Array.isArray(data.profiles)) {
             var before = data.profiles.length;
             profiles = data.profiles.filter(validProfileEntry);

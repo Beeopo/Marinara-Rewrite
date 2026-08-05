@@ -472,4 +472,33 @@ const _adopt = (ls) =>
   });
   assert.equal(_adopt(ls), "rwa-GOOD", "corrupt history must score 0, not throw");
 }
+// (k) a malformed profile from an adopted legacy namespace must not kill init.
+// adoptLegacyNamespace copies a previous install's -p value verbatim, so it is a
+// writer this file never validated. A single null element used to throw in
+// migratePrompts, and because the engine splices extension.js synchronously into
+// its main(), that throw aborted every remaining top-level statement — the whole
+// extension silently failed to exist, with no listener anywhere in the client for
+// the error event the engine dispatches.
+{
+  const src = _SRC.slice(_SRC.indexOf("function validProfileEntry"), _SRC.indexOf("var DEF_CFG"));
+  const migrate = _SRC.slice(_SRC.indexOf("function migratePrompts"), _SRC.indexOf("})();", _SRC.indexOf("function migratePrompts")) + 5);
+  assert.ok(src.includes(".filter(validProfileEntry)"), "drift: K_PROF load no longer filters malformed entries");
+
+  const run = (raw) => new Function("stored", `
+    function loadArr(k, def) { var v = null; try { v = JSON.parse(stored); } catch (e) {} return Array.isArray(v) ? v : def; }
+    var K_PROF = "x", DEF_PROFILES = [{id:"expand",name:"Expand",prompt:"p",order:0}];
+    ${src.slice(0, src.indexOf("var DEF_CFG"))}
+    return profiles;
+  `)(raw);
+
+  // the exact value that used to blackhole the extension
+  const survived = run('[{"id":"expand","name":"Expand","prompt":"p"},null]');
+  assert.ok(Array.isArray(survived), "malformed legacy profiles must not throw");
+  assert.ok(survived.every((p) => p && typeof p.id === "string"), "null element must be filtered out");
+  assert.equal(survived.length, 1, "the one valid entry survives");
+
+  // an entirely malformed array falls back to defaults rather than an empty list
+  const allBad = run('[null,null]');
+  assert.ok(allBad.length > 0, "an all-malformed array must fall back to DEF_PROFILES, not empty");
+}
 console.log("selfcheck: legacy-namespace adoption assertions passed");
