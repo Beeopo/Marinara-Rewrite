@@ -15,8 +15,9 @@ jobs:
           node-version: 20
       # selfcheck includes the bundle drift guard: it fails if
       # rewrite-assistant.json was not rebuilt after a source change.
-      # Running on ubuntu also exercises the LF-checkout path that
-      # .gitattributes pins - a regression there fails here first.
+      # Ubuntu defaults to LF on checkout; .gitattributes overrides that to
+      # CRLF for the three coupled files - running here proves the override
+      # actually holds, so a regression there fails here first.
       - run: node selfcheck.mjs
       - run: node build.mjs
       # The build must be a no-op on a clean tree: if it changed the bundle,
