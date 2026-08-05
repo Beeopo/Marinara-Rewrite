@@ -1206,6 +1206,9 @@
     // formatting — orphaning is impossible, and the splice replaces exactly
     // what was on screen. The balance heuristic exists to protect transforms;
     // with none present it can only false-refuse. Identity-map and skip it.
+    // NOTE: sound only as a WHOLE-MESSAGE check. A per-window version in
+    // windowMap below cannot skip spanIsBalanced — its re-check runs against
+    // the FULL document precisely to catch pairs straddling the window edge.
     if (R === A) return { as: rs, ae: re };
     if (n * m <= 4000000) return alignExact(R, A, rs, re);
     var whole = windowMap(R, A, rs, re);
