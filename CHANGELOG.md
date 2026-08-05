@@ -22,11 +22,14 @@ nothing. This release ports the extension to the new full-page runtime.
   the host object. The first three are rebuilt as a compatibility shim, preserving
   the old `apiFetch` behaviour of resolving on 4xx/5xx so a failed write is still
   detected from the response shape rather than being reported as "Applied".
-- **Fixed:** settings no longer vanish on re-import. The storage namespace was
-  derived from the engine-generated extension id, which is minted fresh every time
-  the extension is imported, so each import stranded the previous install's
-  profiles, history, and custom prompts. The namespace is now a fixed literal, and
-  a first run copies a previous install's keys across without deleting them.
+- **Fixed:** settings no longer vanish on upgrade. The storage namespace was
+  derived from the engine-generated extension id, and the engine dedupes imports by
+  extension *name* — but the old manifest baked the version into that name
+  ("Rewrite Assistant v5.1"), so every release looked like a brand-new extension,
+  got a fresh id, and stranded the previous install's profiles, history, and custom
+  prompts. The namespace is now a fixed literal independent of any engine id, the
+  manifest name no longer carries the version, and a first run copies a previous
+  install's keys across without deleting them.
 - **Changed:** styles moved from the removed `marinara.addStyle` call into
   `extension.css`, shipped in the manifest's `css` field so the engine creates and
   removes the stylesheet node itself.
