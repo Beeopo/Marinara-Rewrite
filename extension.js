@@ -704,6 +704,29 @@
     if (words.length < 3 && s.trim().length > 10) return Math.ceil(s.trim().length / 2);
     return words.length;
   }
+  // Would replacing this raw span orphan half of a transform token?
+  //
+  // The aligner's clean-edge test asks whether each cut sits between two raw-only
+  // chars. That misses the case where a macro's raw spelling shares a run with its
+  // own rendered expansion: {{char50}} rendering as PersonName50 makes "50" look
+  // matched, so a cut lands mid-token and the splice leaves "50}}" behind as literal
+  // text the macro can never expand from again. Checking the SPAN instead of the
+  // edges catches it — "Hi {{char" has an opening {{ with no close.
+  //
+  // Refuse rather than snap outward over the token: refusing degrades to the copy
+  // fallback, which is annoying but reversible, whereas snapping would silently eat
+  // the user's emphasis markers around short words (*no*, **hi**).
+  //
+  // ponytail: counts delimiters, does not parse markdown. A selection that
+  // legitimately straddles one marker also refuses — correct, since replacing it
+  // would orphan the other half either way. Upgrade path is a real tokenizer.
+  function spanIsBalanced(s) {
+    if ((s.match(/\{\{/g) || []).length !== (s.match(/\}\}/g) || []).length) return false;
+    if ((s.match(/\*/g) || []).length % 2) return false;
+    if ((s.match(/`/g) || []).length % 2) return false;
+    if ((s.match(/_/g) || []).length % 2) return false;
+    return true;
+  }
   // Index of the n-th (0-based) non-overlapping occurrence of needle in haystack, or -1.
   function nthIndexOf(hay, needle, n) {
     var idx = hay.indexOf(needle);
@@ -813,6 +836,7 @@
     var dirtyStart = as > 0 && as < m && !matchedRaw[as - 1] && !matchedRaw[as];
     var dirtyEnd = ae > 0 && ae < m && !matchedRaw[ae - 1] && !matchedRaw[ae];
     if (dirtyStart || dirtyEnd) return null;
+    if (!spanIsBalanced(A.slice(as, ae))) return null;
     return { as: as, ae: ae };
   }
   // Find a "clean anchor": a verbatim run of rendered text near `pos` that occurs
@@ -880,6 +904,9 @@
     var startSpan = windowMap(R, A, rs, rs + 1);
     var endSpan = windowMap(R, A, re - 1, re);
     if (!startSpan || !endSpan || endSpan.ae < startSpan.as) return null;
+    // Each edge was validated against its own window; the span BETWEEN them never
+    // was, and that interior is what gets replaced. Re-check the composed span.
+    if (!spanIsBalanced(A.slice(startSpan.as, endSpan.ae))) return null;
     return { as: startSpan.as, ae: endSpan.ae };
   }
   function wcDiff(a, b) {

@@ -66,6 +66,12 @@ assert.ok(_SRC.includes("function renderedTextForMid"), "drift: renderedTextForM
 assert.ok(_SRC.includes("function refreshMessages"), "drift: refreshMessages (post-PATCH view refresh) missing");
 assert.ok(_SRC.includes("function mapRenderedSpanToRaw"), "drift: mapRenderedSpanToRaw missing");
 assert.ok(_SRC.includes("function alignExact"), "drift: alignExact (exact LCS core) missing");
+// The balance check is what stops a macro's raw spelling being bisected when it
+// shares a run with its own expansion. Guard both the function and both call sites —
+// alignExact's, and the per-edge composition that alignExact never sees.
+assert.ok(_SRC.includes("function spanIsBalanced"), "drift: spanIsBalanced (mid-token splice guard) missing");
+assert.equal((_SRC.match(/if \(!spanIsBalanced\(/g) || []).length, 2,
+  "drift: spanIsBalanced must gate BOTH alignExact and the per-edge composed span");
 assert.ok(_SRC.includes("function findCleanAnchor"), "drift: findCleanAnchor (windowing peg) missing");
 assert.ok(_SRC.includes("function normForAnchor"), "drift: normForAnchor (quote-normalized anchoring) missing");
 assert.ok(_SRC.includes("function windowMap"), "drift: windowMap (per-edge large-selection mapping) missing");
@@ -207,7 +213,17 @@ function _alignExact(R, A, rs, re) {
   const dirtyStart = as > 0 && as < m && !matchedRaw[as - 1] && !matchedRaw[as];
   const dirtyEnd = ae > 0 && ae < m && !matchedRaw[ae - 1] && !matchedRaw[ae];
   if (dirtyStart || dirtyEnd) return null;
+  if (!_spanIsBalanced(A.slice(as, ae))) return null;
   return { as, ae };
+}
+// mirror of extension.js spanIsBalanced
+function _spanIsBalanced(s) {
+  // <<< keep this mirror IDENTICAL in logic to extension.js's spanIsBalanced >>>
+  if ((s.match(/\{\{/g) || []).length !== (s.match(/\}\}/g) || []).length) return false;
+  if ((s.match(/\*/g) || []).length % 2) return false;
+  if ((s.match(/`/g) || []).length % 2) return false;
+  if ((s.match(/_/g) || []).length % 2) return false;
+  return true;
 }
 // mirror of extension.js findCleanAnchor
 function _findCleanAnchor(R, A, pos, side, LEN, MAXSPAN) {
@@ -254,6 +270,7 @@ function _mapRenderedSpanToRaw(R, A, rs, re) {
   const startSpan = _windowMap(R, A, rs, rs + 1);
   const endSpan = _windowMap(R, A, re - 1, re);
   if (!startSpan || !endSpan || endSpan.ae < startSpan.as) return null;
+  if (!_spanIsBalanced(A.slice(startSpan.as, endSpan.ae))) return null;
   return { as: startSpan.as, ae: endSpan.ae };
 }
 function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
@@ -269,6 +286,19 @@ const _s6 = _spl("Hi Alice!", "Hi {{char}}!", 3, 8, "X"); // whole expanded macr
 assert.ok(_s6 === null || _s6 === "Hi X!", "macro whole-token: must snap clean or fall back; got: " + _s6);
 const _s7 = _spl("Hi Alice!", "Hi {{char}}!", 3, 6, "X"); // sub-token "Ali"
 assert.ok(_s7 === null || _s7 === "Hi X!", "macro sub-token: must snap clean or fall back; got: " + _s7);
+// A macro whose expansion shares a run with its own raw spelling used to defeat the
+// clean-edge test: "50" looks matched, the cut lands mid-token, and the splice leaves
+// "50}}" behind as literal text the macro can never expand from again. Must REFUSE.
+assert.equal(_spl("Hi PersonName50 there.", "Hi {{char50}} there.", 0, 11, "X"), null,
+  "2-char incidental match inside a macro must refuse, not bisect");
+assert.equal(_spl("Hi NameABC there.", "Hi {{charABC}} there.", 0, 8, "X"), null,
+  "3-char incidental match inside a macro must refuse, not bisect");
+// ...and refusing must NOT come at the cost of eating emphasis markers around short
+// words. These are the common case (*no*, **hi**) and must still splice cleanly.
+assert.equal(_spl("hey there", "**hey** there", 0, 3, "X"), "**X** there", "3-char word keeps its bold markers");
+assert.equal(_spl("hi there", "*hi* there", 0, 2, "X"), "*X* there", "2-char word keeps its italic markers");
+assert.equal(_spl("softly there", "*softly* there", 0, 6, "X"), "*X* there", "6-char word keeps its markers");
+assert.equal(_spl("bold text", "**bold** text", 0, 4, "X"), "**X** text", "4-char word keeps its markers");
 // unanchorable large input (no shared runs) returns null -> copy fallback
 assert.equal(_mapRenderedSpanToRaw("a".repeat(2001), "b".repeat(2001), 0, 1), null);
 console.log("selfcheck: span-alignment assertions passed");
