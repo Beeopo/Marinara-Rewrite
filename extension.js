@@ -2247,23 +2247,61 @@
       });
   }
 
-  function applyMerged(segments, pieces, cid, i, onDone) {
-    if (i >= segments.length) { if (onDone) onDone(); return; }
+  function applyMerged(segments, pieces, cid, i, onDone, results) {
+    results = results || [];
+    if (i >= segments.length) { if (onDone) onDone(results); return; }
     doCommit(pieces[i], { text: segments[i].text, mid: segments[i].mid, cid: cid }, function () {
+      results.push(true);
       // N8 fix: invalidate the message cache before recursing to the next segment.
       // doCommit already invalidates after its own match, but in chained auto-apply
       // the next call to doCommit may re-read the cached (pre-edit) content before
       // Marinara's store update flushes. Invalidating here ensures each chained
       // commit reads fresh data from the API rather than the stale cached baseline.
       invalidateMsgCache();
-      applyMerged(segments, pieces, cid, i + 1, onDone);
+      applyMerged(segments, pieces, cid, i + 1, onDone, results);
+    }, function () {
+      // B4 fix: doCommit already showed the specific failure reason via its own
+      // modal. What was missing is aggregation — stop the chain here (as before)
+      // but hand back which segments committed before the break, so the caller
+      // can surface one summary instead of leaving the user to guess whether
+      // earlier segments in the chain were already written to their chat.
+      results.push(false);
+      if (onDone) onDone(results);
     });
+  }
+
+  // B4 fix: build the "N of M applied" summary for a partially-failed merge
+  // chain. Segment labels reuse the same "Message k" scheme the merge preview
+  // and ledger already use, rather than inventing a new naming convention.
+  function mergeChainSummary(results, total) {
+    var applied = [], notApplied = [];
+    for (var i = 0; i < total; i++) {
+      var label = "Message " + (i + 1);
+      if (results[i]) applied.push(label); else notApplied.push(label);
+    }
+    return "Partial apply: " + applied.length + "/" + total + " applied" +
+      (applied.length ? " (" + applied.join(", ") + ")" : "") +
+      ". Not applied: " + notApplied.join(", ") + ".";
+  }
+
+  function mergeChainDone(segments, onFinished) {
+    return function (results) {
+      var total = segments.length;
+      var okCount = 0;
+      for (var k = 0; k < results.length; k++) if (results[k]) okCount++;
+      if (onFinished) onFinished();
+      if (okCount === total) {
+        showToast(null, "✓ Applied to " + total + " messages", "ok");
+      } else {
+        showToast(null, mergeChainSummary(results, total), "");
+      }
+    };
   }
 
   function showMergePreview(ov, body, profile, segments, pieces, cid) {
     if (cfg.autoApply) {
       ov.remove();
-      applyMerged(segments, pieces, cid, 0, function () { showToast(null, "✓ Applied to " + segments.length + " messages", "ok"); });
+      applyMerged(segments, pieces, cid, 0, mergeChainDone(segments));
       return;
     }
     body.innerHTML = "";
@@ -2281,7 +2319,7 @@
     ap(body, box);
     var ft = ap(body, mk("div", "rwa-foot"));
     ap(ft, mkBtn("Accept All", "rwa-accept", function () {
-      applyMerged(segments, pieces, cid, 0, function () { ov.remove(); showToast(null, "✓ Applied to " + segments.length + " messages", "ok"); });
+      applyMerged(segments, pieces, cid, 0, mergeChainDone(segments, function () { ov.remove(); }));
     })).style.flex = "2";
     ap(ft, mkBtn("Retry", null, function () { ov.remove(); doMergeRewrite(profile, segments); })).style.flex = "1";
     ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
@@ -2384,11 +2422,16 @@
   }
 
   // ── Commit — splice rewritten text into message ───────────────────────────
-  function doCommit(newText, savedSel, onDone) {
+  function doCommit(newText, savedSel, onDone, onFail) {
     var mid = savedSel.mid;
     var cid = savedSel.cid || getChatId();
+    // onFail is optional and additive: existing 3-arg callers see identical
+    // behaviour (showErr fires exactly as before). Callers that need to know
+    // a commit failed (e.g. the merge chain, to aggregate outcomes) pass a
+    // 4th callback and get the same message string handed to them too.
+    function fail(msg) { showErr(msg); if (onFail) onFail(msg); }
     if (!cid) {
-      showErr("Cannot detect active chat ID.\nTry clicking the chat in the sidebar first.");
+      fail("Cannot detect active chat ID.\nTry clicking the chat in the sidebar first.");
       return;
     }
 
@@ -2419,7 +2462,7 @@
         var rs = nthIndexOf(renderedFull, normSel, occ);
         if (rs === -1) rs = renderedFull.indexOf(normSel);
         if (rs === -1) {
-          showErr(
+          fail(
             "Could not locate the selected text in the rendered message.\n\n" +
             "The message may have changed since you selected. Re-select and try again."
           );
@@ -2430,7 +2473,7 @@
         // Map the rendered span into raw msg.content coordinates and splice.
         var span = mapRenderedSpanToRaw(renderedFull, rawContent, rs, re);
         if (!span) {
-          showErr(
+          fail(
             "Could not map the selection back to stored content (message too large\n" +
             "or unmappable). Use the Copy button and paste the rewrite manually."
           );
@@ -2454,11 +2497,11 @@
             if (onDone) onDone();
           })
           .catch(function (e) {
-            showErr("Save failed:\n" + (e && e.message ? e.message : String(e)));
+            fail("Save failed:\n" + (e && e.message ? e.message : String(e)));
           });
       })
       .catch(function (e) {
-        showErr("Commit failed:\n" + (e && e.message ? e.message : String(e)));
+        fail("Commit failed:\n" + (e && e.message ? e.message : String(e)));
       });
   }
 
