@@ -579,7 +579,7 @@ const _adopt = (ls) =>
 // from one shared list, so they cannot drift apart.
 {
   const CONN = JSON.parse(_SRC.match(/var CONN_KEYS = (\[[^\]]*\]);/)[1].replace(/'/g, '"'));
-  assert.deepEqual(CONN, ["apiKey", "apiUrl", "extenderUrl", "connMode"], "drift: CONN_KEYS changed");
+  assert.deepEqual(CONN, ["apiKey", "apiUrl", "extenderUrl", "connMode", "connectionId"], "drift: CONN_KEYS changed");
   // Pin each comparison to its OWN call site. Asserting only that both strings exist
   // somewhere lets them be swapped — a one-character edit each — which exports the
   // user's apiKey in plaintext and lets an imported file redirect apiUrl, with both
@@ -1190,3 +1190,148 @@ console.log("selfcheck: B2 stored-content re-check assertions passed");
   assert.ok(/occ: ledger\.occ \|\| 0, fp: ledger\.fp \|\| null/.test(_SRC), "drift: ledger assemble no longer revalidates its stored occ");
 }
 console.log("selfcheck: B3 context-fingerprint assertions passed");
+
+// ── Marinara-connection inference mode ──────────────────────────────────────
+// Runs the SHIPPED runInference, not a mirror. The previous round of this suite
+// tested a hand-copied aligner and stayed green while the real function was
+// gutted; do not reintroduce that. Everything below drives the extracted source.
+{
+  const _INF_SRC = _SRC.slice(
+    _SRC.indexOf("  var CONN_MODES = "),
+    _SRC.indexOf("  // List models from the direct endpoint"),
+  );
+  assert.ok(_INF_SRC.includes("function runInference("), "extraction: runInference not captured");
+
+  const makeInf = (cfg, apiFetchImpl) => {
+    const calls = [];
+    const marinara = {
+      apiFetch: (path, opts) => { calls.push({ path, opts }); return apiFetchImpl(path, opts); },
+    };
+    const logDbg = () => {};
+    const fn = new Function(
+      "cfg", "marinara", "logDbg", "fetch", "Headers",
+      _INF_SRC + "\nreturn runInference;",
+    )(cfg, marinara, logDbg, () => { throw new Error("direct fetch must not run"); }, class {});
+    return { fn, calls };
+  };
+
+  // 1. An unset connection refuses WITHOUT issuing a request. Pin both halves:
+  //    an error string alone would still pass if the request went out first.
+  {
+    const { fn, calls } = makeInf({ connMode: "marinara", connectionId: "" }, () => {
+      throw new Error("must not call apiFetch with no connection selected");
+    });
+    const r = await fn("sys", "usr");
+    assert.ok(r && /No Marinara connection selected/.test(r.error), "unset connection must refuse");
+    assert.equal(calls.length, 0, "unset connection must not issue a request");
+  }
+
+  // 2. A selected connection posts to /generate/raw with the id and both roles,
+  //    and shapes {content} into {result}.
+  {
+    const { fn, calls } = makeInf({ connMode: "marinara", connectionId: "conn-abc" },
+      () => Promise.resolve({ content: "REWRITTEN", runId: "r1" }));
+    const r = await fn("SYSTEM-P", "USER-P");
+    assert.equal(calls.length, 1, "expected exactly one request");
+    assert.equal(calls[0].path, "/generate/raw", "must use the connection-backed endpoint, not /sidecar/tracker");
+    assert.equal(calls[0].opts.method, "POST");
+    const body = JSON.parse(calls[0].opts.body);
+    assert.equal(body.connectionId, "conn-abc", "connectionId must be sent");
+    assert.equal(body.streaming, false, "streaming must be off — the caller reads one whole string");
+    assert.deepEqual(body.messages, [
+      { role: "system", content: "SYSTEM-P" },
+      { role: "user", content: "USER-P" },
+    ], "both prompts must travel, in order");
+    assert.equal(r.result, "REWRITTEN", "content must be shaped into result");
+    assert.ok(!("error" in r), "a good reply must not carry an error");
+  }
+
+  // 3. apiFetch resolves on 4xx/5xx, so an error body arrives as data, not a
+  //    rejection. It must surface as an error — never as an empty rewrite, which
+  //    would splice the model's failure into the user's message.
+  {
+    const { fn } = makeInf({ connMode: "marinara", connectionId: "c" },
+      () => Promise.resolve({ error: "Connection not found" }));
+    const r = await fn("s", "u");
+    assert.equal(r.error, "Connection not found", "a 4xx body must surface as an error");
+    assert.ok(typeof r.result !== "string", "a failed call must not produce a result string");
+  }
+
+  // 4. A non-JSON body (apiFetch resolves null) must not read as success either.
+  {
+    const { fn } = makeInf({ connMode: "marinara", connectionId: "c" }, () => Promise.resolve(null));
+    const r = await fn("s", "u");
+    assert.ok(r && r.error, "an unreadable body must surface as an error");
+    assert.ok(typeof r.result !== "string", "an unreadable body must not produce a result string");
+  }
+
+  // 5. An unknown/absent mode falls back to marinara, and the legacy "sidecar"
+  //    value still routes to the local-model endpoint so existing installs keep
+  //    whatever they had configured.
+  {
+    const { fn: f1, calls: c1 } = makeInf({ connMode: undefined, connectionId: "c" },
+      () => Promise.resolve({ content: "x" }));
+    await f1("s", "u");
+    assert.equal(c1[0].path, "/generate/raw", "an unset mode must default to the Marinara connection");
+
+    const { fn: f2, calls: c2 } = makeInf({ connMode: "sidecar", connectionId: "c" },
+      () => Promise.resolve({ result: "x" }));
+    await f2("s", "u");
+    assert.equal(c2[0].path, "/sidecar/tracker", "the legacy sidecar mode must keep its own endpoint");
+  }
+
+  // 6. The mode list itself, pinned — a dropped entry silently reroutes users.
+  const MODES = JSON.parse(_SRC.match(/var CONN_MODES = (\[[^\]]*\]);/)[1].replace(/'/g, '"'));
+  assert.deepEqual(MODES, ["marinara", "sidecar", "direct", "extender"], "drift: CONN_MODES changed");
+  assert.ok(/connMode: "marinara"/.test(_SRC), "drift: the default connection mode is no longer marinara");
+
+  // 7. Sanity: the assertions above must actually be able to fail. If the
+  //    endpoint literal is swapped, case 2 has to catch it.
+  assert.ok(_INF_SRC.includes('apiFetch("/generate/raw"'), "extraction sanity: endpoint literal missing from the extracted source");
+}
+console.log("selfcheck: Marinara-connection mode assertions passed");
+
+// ── connMode default migration ──────────────────────────────────────────────
+// Runs the SHIPPED cfg loader IIFE. Changing DEF_CFG's default reaches only
+// fresh installs — the merge takes stored over default — so v6.1 flips a stored
+// "sidecar" (the old baked-in default, which 503s without the downloaded local
+// model) to "marinara" exactly once, latched so a deliberate re-choice sticks.
+{
+  const _cfgStart = _SRC.indexOf("  var cfg = (function () {");
+  const _cfgEnd = _SRC.indexOf("  })();", _cfgStart) + "  })();".length;
+  assert.ok(_cfgStart > 0 && _cfgEnd > _cfgStart, "extraction: cfg loader IIFE not found");
+  const _CFG_SRC = _SRC.slice(_cfgStart, _cfgEnd);
+  assert.ok(_CFG_SRC.includes("connModeMigrated"), "extraction sanity: migration latch missing from the extracted loader");
+
+  const DEF = { connMode: "marinara", connModeMigrated: false, connectionId: "", cols: 2 };
+  const loadCfg = (stored) =>
+    new Function("loadObj", "K_CFG", "DEF_CFG", _CFG_SRC + "\nreturn cfg;")(() => stored, "k", DEF);
+
+  // Pre-v6.1 config: the old default gets flipped, and the latch is set.
+  let c = loadCfg({ connMode: "sidecar", cols: 4 });
+  assert.equal(c.connMode, "marinara", "a pre-latch stored sidecar must flip to marinara");
+  assert.equal(c.connModeMigrated, true, "the flip must set the latch");
+  assert.equal(c.cols, 4, "migration must not disturb other stored keys");
+
+  // Post-latch sidecar is a deliberate choice and must survive every load.
+  c = loadCfg({ connMode: "sidecar", connModeMigrated: true });
+  assert.equal(c.connMode, "sidecar", "a latched sidecar choice must never be flipped");
+
+  // Non-sidecar modes pass through untouched (latch still set, harmlessly).
+  for (const m of ["direct", "extender", "marinara"]) {
+    c = loadCfg({ connMode: m });
+    assert.equal(c.connMode, m, "migration must not touch stored mode " + m);
+  }
+
+  // Fresh install: defaults straight through.
+  c = loadCfg({});
+  assert.equal(c.connMode, "marinara", "a fresh install must default to marinara");
+
+  // The marinara-mode error label sibling: the fallthrough error bucket must be
+  // the connection mode, not the sidecar — pin both new branches.
+  assert.ok(/"Local model error: " : "Connection error: "/.test(_SRC),
+    "drift: marinara-mode errors no longer carry their own label");
+  assert.ok(/pick one of your configured Marinara connections/.test(_SRC),
+    "drift: marinara-mode errors no longer hint at the connection picker");
+}
+console.log("selfcheck: connMode migration assertions passed");

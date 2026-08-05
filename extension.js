@@ -223,10 +223,18 @@
     localContextEnabled: false, localContextWords: 150,
     useLorebookEntries: false, usePrevMessages: false, prevMessageCount: 2,
     charCardIds: [], reviewBeforeApply: false, useUserPersona: false,
-    // Connection: "sidecar" (Marinara local sidecar), "direct" (OpenAI-compatible
-    // endpoint such as Ollama/llama.cpp), or "extender" (Marinara Extender sidecar).
-    // Direct/Extender avoid running two models at once.
-    connMode: "sidecar", apiUrl: "http://127.0.0.1:11434/v1", apiModel: "", apiKey: "", directTemp: 0.7,
+    // Connection: "marinara" (a connection you already configured in Marinara —
+    // the key stays server-side), "sidecar" (Marinara's downloaded local model),
+    // "direct" (OpenAI-compatible endpoint such as Ollama/llama.cpp), or
+    // "extender" (Marinara Extender sidecar).
+    // "sidecar" is NOT your Marinara connection list — it is the local model from
+    // Settings → Connections → Local Model, and 503s if that was never downloaded.
+    connMode: "marinara", connectionId: "",
+    // One-shot latch for the sidecar→marinara flip in the cfg loader below.
+    // False only on configs saved before this mode existed; saveC persists it,
+    // after which a user-chosen "sidecar" is never flipped again.
+    connModeMigrated: false,
+    apiUrl: "http://127.0.0.1:11434/v1", apiModel: "", apiKey: "", directTemp: 0.7,
     // Model context window (tokens). Selections larger than ~1/6 of this are
     // windowed into slices and rewritten via the Ledger Pattern, not truncated.
     ctxTokens: 8192,
@@ -282,6 +290,16 @@
     var stored = loadObj(K_CFG, {});
     var merged = {};
     Object.keys(DEF_CFG).forEach(function (k) { merged[k] = stored[k] !== undefined ? stored[k] : DEF_CFG[k]; });
+    // Changing DEF_CFG's connMode default reaches only brand-new installs — the
+    // merge above pins every previously-saved config to whatever it stored, and
+    // "sidecar" was the old baked-in default, not a choice: it runs Marinara's
+    // downloaded local model and 503s on installs that never fetched one (most).
+    // Flip a pre-latch "sidecar" to the connection-backed mode once. Re-choosing
+    // sidecar in Settings saves the latch with it, so that choice sticks.
+    if (!merged.connModeMigrated) {
+      if (merged.connMode === "sidecar") merged.connMode = "marinara";
+      merged.connModeMigrated = true;
+    }
     return merged;
   })();
   var hist    = loadArr(K_HIST, []);
@@ -1823,13 +1841,42 @@
   }
 
   // ── Rewrite — opens generation modal ─────────────────────────────────────
-  // ── Inference: route to local sidecar or a direct OpenAI-compatible endpoint ─
+  // ── Inference: route to a Marinara connection, the local sidecar model, or a
+  //    direct OpenAI-compatible endpoint ────────────────────────────────────────
   // Resolves to { result: string } or { error: string } so callers stay identical.
+  var CONN_MODES = ["marinara", "sidecar", "direct", "extender"];
   function runInference(systemPrompt, userPrompt, signal) {
-    var mode = (cfg.connMode === "direct" || cfg.connMode === "extender") ? cfg.connMode : "sidecar";
+    var mode = CONN_MODES.indexOf(cfg.connMode) >= 0 ? cfg.connMode : "marinara";
     var started = Date.now();
     var p;
-    if (mode === "sidecar") {
+    if (mode === "marinara") {
+      // Runs through a connection already configured in Marinara. The key is
+      // stored (encrypted) server-side and never reaches the extension, so this
+      // needs no second copy of your credentials.
+      if (!cfg.connectionId) {
+        return Promise.resolve({ error: "No Marinara connection selected (Settings → Connection)." });
+      }
+      logDbg("inference.request", { mode: mode, connectionId: cfg.connectionId, system: systemPrompt, user: userPrompt });
+      p = marinara.apiFetch("/generate/raw", {
+        method: "POST",
+        body: JSON.stringify({
+          connectionId: cfg.connectionId,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          streaming: false,
+        }),
+        signal: signal,
+      }).then(function (j) {
+        // apiFetch resolves on 4xx/5xx, so an error body arrives here as data.
+        // null means the body was not JSON at all — hand it to the shared
+        // normalizer below rather than inventing a message here.
+        if (!j) return null;
+        if (j.error) return { error: typeof j.error === "string" ? j.error : JSON.stringify(j.error) };
+        return { result: typeof j.content === "string" ? j.content : "" };
+      });
+    } else if (mode === "sidecar") {
       logDbg("inference.request", { mode: mode, system: systemPrompt, user: userPrompt });
       // apiFetch spreads options into the native fetch, so `signal` is honoured —
       // cancelling aborts the sidecar request, not just the UI.
@@ -2081,13 +2128,18 @@
       .then(function (resp) {
         if (!resp || resp.aborted || !ov.parentNode) return;
         if (resp.error) {
+          // The fallthrough bucket is "marinara", matching runInference's mode
+          // resolution \u2014 an unknown stored mode runs there, so its error must
+          // point there too, not at the local-model sidecar.
           var hint = cfg.connMode === "direct"
             ? "Check Settings \u2192 Connection \u2014 API URL and model name must point to a running server."
             : cfg.connMode === "extender"
             ? "Check Settings \u2192 Connection \u2014 Extender server URL must point to a running Marinara Extender."
-            : "Check Settings \u2192 AI Models \u2014 a local model must be loaded.";
+            : cfg.connMode === "sidecar"
+            ? "Check Settings \u2192 Connections \u2014 Marinara's local model must be downloaded and loaded, or switch Model source to a Marinara connection."
+            : "Check Settings \u2192 Connection \u2014 pick one of your configured Marinara connections.";
           showModalErr(ov, body,
-            (cfg.connMode === "direct" ? "Direct API error: " : cfg.connMode === "extender" ? "Extender error: " : "Sidecar error: ") + resp.error +
+            (cfg.connMode === "direct" ? "Direct API error: " : cfg.connMode === "extender" ? "Extender error: " : cfg.connMode === "sidecar" ? "Local model error: " : "Connection error: ") + resp.error +
             "\n\n" + hint + "\n\nRaw: " +
             JSON.stringify(resp).slice(0, 300)
           );
@@ -2899,7 +2951,7 @@
   // Connection settings are user-owned and never travel in an export/import.
   // apiKey is the secret; the other three decide WHERE that secret gets sent, so
   // filtering only the key would still let an import redirect it.
-  var CONN_KEYS = ["apiKey", "apiUrl", "extenderUrl", "connMode"];
+  var CONN_KEYS = ["apiKey", "apiUrl", "extenderUrl", "connMode", "connectionId"];
 
   function exportProfiles(opts) {
     opts = opts || { profiles: true, config: true, customs: true, autoProfs: true };
@@ -3210,12 +3262,51 @@
         var db = pane;
         paneHead(pane, "Connection", "Where rewrites are generated.");
         var modeSel = mk("select", "rwa-sel");
-        [["sidecar", "Local Sidecar (default)"], ["direct", "Direct API (Ollama / llama.cpp)"], ["extender", "Marinara Extender (one sidecar)"]].forEach(function (opt) {
+        [["marinara", "Marinara connection (recommended)"], ["sidecar", "Local model (downloaded sidecar)"], ["direct", "Direct API (Ollama / llama.cpp)"], ["extender", "Marinara Extender (one sidecar)"]].forEach(function (opt) {
           var o = mk("option", "", opt[1]); o.value = opt[0];
-          if ((cfg.connMode || "sidecar") === opt[0]) o.selected = true;
+          if ((cfg.connMode || "marinara") === opt[0]) o.selected = true;
           modeSel.appendChild(o);
         });
-        row(db, "Model source", modeSel, "Direct API skips the Marinara sidecar, so Ollama won’t load a second model.");
+        row(db, "Model source", modeSel, "“Marinara connection” reuses a connection you already set up — no second copy of your API key. “Local model” is Marinara’s downloaded sidecar model, not your connection list.");
+
+        // Marinara-connection fields — shown only when relevant.
+        var mari = mk("div", "");
+        ap(db, mari);
+        ap(mari, mk("div", "rwa-grp", "Connection"));
+        var connSel = mk("select", "rwa-sel");
+        var connOpt0 = mk("option", "", "Loading connections…"); connOpt0.value = "";
+        connSel.appendChild(connOpt0);
+        connSel.addEventListener("change", function () { cfg.connectionId = connSel.value; saveC(); });
+        field(mari, "Marinara connection", connSel, "Your configured connections. The API key stays on the Marinara server and is never copied into this extension.");
+        var mariStatus = mk("div", ""); mariStatus.style.cssText = "font-size:11px;margin-top:8px;line-height:1.5;color:var(--muted-foreground);";
+        marinara.apiFetch("/connections").then(function (j) {
+          var list = Array.isArray(j) ? j : (j && j.connections) || [];
+          // Image/video endpoints can't answer a chat completion — hide them
+          // rather than let someone pick one and get an opaque provider error.
+          list = list.filter(function (c) { return c && c.id && !/image|video|comfy/i.test(String(c.provider || "")); });
+          connSel.innerHTML = "";
+          var none = mk("option", "", list.length ? "— select a connection —" : "No usable connections found");
+          none.value = ""; connSel.appendChild(none);
+          list.forEach(function (c) {
+            var o = mk("option", "", c.name + (c.model ? "  (" + c.model + ")" : ""));
+            o.value = c.id;
+            if (cfg.connectionId === c.id) o.selected = true;
+            connSel.appendChild(o);
+          });
+        }).catch(function () {
+          connSel.innerHTML = "";
+          var o = mk("option", "", "Could not load connections"); o.value = "";
+          connSel.appendChild(o);
+        });
+        var mariTestBtn = mkBtn("Test connection", null, function () {
+          mariStatus.textContent = "Testing…"; mariStatus.style.color = "var(--muted-foreground)";
+          runInference("You are a test.", "Reply with the single word: ok").then(function (resp) {
+            if (resp && resp.error) { mariStatus.textContent = "✗ " + resp.error; mariStatus.style.color = "var(--destructive, #ef4444)"; }
+            else { mariStatus.textContent = "✓ Connected. Replied: " + ((resp && resp.result) || "").slice(0, 60); mariStatus.style.color = "var(--primary)"; }
+          });
+        });
+        ap(mari, mariTestBtn).style.width = "100%";
+        ap(mari, mariStatus);
 
         // Direct-mode fields (URL, model, key, temp) — shown only when relevant.
         var direct = mk("div", "");
@@ -3335,6 +3426,7 @@
         ap(extender, exTestStatus);
 
         function syncMode() {
+          mari.style.display     = ((cfg.connMode || "marinara") === "marinara") ? "" : "none";
           direct.style.display   = (cfg.connMode === "direct")   ? "" : "none";
           extender.style.display = (cfg.connMode === "extender") ? "" : "none";
         }
