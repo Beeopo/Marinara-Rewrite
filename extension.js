@@ -431,11 +431,17 @@
     // serves up to 2s old data, which is the whole width of the race.
     invalidateMsgCache();
     return cachedMessages(cid).then(function (msgs) {
+      // apiFetch resolves the parsed body on 4xx/5xx and null on a non-JSON body, so
+      // a FAILED re-read arrives resolved and non-array, not as a rejection. Reading
+      // that as "the message isn't in the list" let the cur == null escape below wave
+      // the write through — disabling the guard precisely when the engine is
+      // unhealthy and a concurrent clobber is most likely. Refuse instead.
+      if (!Array.isArray(msgs)) {
+        throw new Error("Could not re-read the message to check for concurrent edits — nothing was written.");
+      }
       var cur = null;
-      if (Array.isArray(msgs)) {
-        for (var i = 0; i < msgs.length; i++) {
-          if (msgs[i].id === mid) { cur = msgs[i].content; break; }
-        }
+      for (var i = 0; i < msgs.length; i++) {
+        if (msgs[i].id === mid) { cur = msgs[i].content; break; }
       }
       // expected == null: history entry written by an older build recorded no
       // pre-image, so there is nothing to compare. cur == null: the message is no
@@ -1724,7 +1730,11 @@
 
   // Review mode: show the spliced raw content in an editable textarea and only
   // PATCH (with whatever the user edited) when they click Apply.
-  function reviewThenPatch(cid, mid, oldContent, proposed, onDone) {
+  // onFail mirrors doCommit's: applyMerged recurses from onDone and aggregates from
+  // onFail, so every exit that is neither a write nor a retry must call one of them
+  // or a multi-message chain stalls with no partial-apply summary. That applies to
+  // the review modal too — declining the overwrite, and Cancel, both end the chain.
+  function reviewThenPatch(cid, mid, oldContent, proposed, onDone, onFail) {
     var ov = mkOv(10010);
     var body = mkWin(ov, "560px", "Review & edit before applying");
     var ta = ap(body, mk("textarea", "rwa-inp"));
@@ -1738,7 +1748,9 @@
       // the widest of any write path here. Re-read and compare before writing.
       guardedPatch(cid, mid, oldContent, content, "review")
         .then(function (res) {
-          if (!res) return; // declined — nothing written, no history entry, modal stays
+          // Declined: nothing written, no history entry, and the modal stays so the
+          // rewrite is still recoverable — but the chain has ended, so say so.
+          if (!res) { if (onFail) onFail(null); return; }
           var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
           hist.unshift({ mid: mid, cid: cid, old: oldContent, post: content, when: Date.now() });
           if (hist.length > depth) hist.length = depth;
@@ -1750,7 +1762,7 @@
         })
         .catch(function (e) { showErr("Save failed:\n" + (e && e.message ? e.message : String(e))); });
     })).style.flex = "2";
-    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); })).style.flex = "1";
+    ap(ft, mkBtn("Cancel", null, function () { ov.remove(); if (onFail) onFail(null); })).style.flex = "1";
   }
 
   // ── Toast ─────────────────────────────────────────────────────────────────
@@ -2629,14 +2641,19 @@
 
         invalidateMsgCache();
         if (cfg.reviewBeforeApply) {
-          reviewThenPatch(cid, mid, msg.content, updated, onDone);
+          reviewThenPatch(cid, mid, msg.content, updated, onDone, onFail);
           return;
         }
         // B2: `updated` was spliced into the content we just read, which may itself
         // have come from the 2s cache. Compare against what is stored right now.
         guardedPatch(cid, mid, msg.content, updated, "rewrite")
           .then(function (res) {
-            if (!res) return; // declined — nothing written, no history entry, no toast
+            // Declined is not success, but it is also not silence: applyMerged
+            // recurses from onDone and aggregates from onFail, so returning without
+            // either stalls a multi-message chain mid-way and suppresses the
+            // partial-apply summary. onFail(null) — doCommit's modal is what shows a
+            // reason, and there is none to show here; the user chose this.
+            if (!res) { if (onFail) onFail(null); return; }
             var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
             hist.unshift({ mid: mid, cid: cid, old: msg.content, post: updated, when: Date.now() });
             if (hist.length > depth) hist.length = depth;
