@@ -884,3 +884,345 @@ console.log("selfcheck: fence-escaping assertions passed");
 }
 console.log("selfcheck: merge-chain aggregation assertions passed");
 console.log("selfcheck: prompt-budget assertions passed");
+
+// 13) B2: no PATCH without re-checking what is stored right now.
+// The engine's PATCH route is bare last-write-wins (chats.routes.ts -> storage's
+// updateMessageContent; withPatchQueue serializes per id for atomicity only and
+// never compares an expected prior value), and swipe/regenerate/background
+// autonomous messaging write the same rows. undo, redo and review-apply all used
+// to PATCH straight from an in-memory snapshot. Runs the SHIPPED guardedPatch,
+// doUndo, doRedo and reviewThenPatch against stubs — not hand-mirrored logic.
+{
+  const _gpStart = _SRC.indexOf("function guardedPatch");
+  const _gpEnd = _SRC.indexOf("// The mismatch prompt");
+  assert.ok(_gpStart !== -1 && _gpEnd !== -1 && _gpEnd > _gpStart, "could not extract guardedPatch from extension.js");
+  const _gpSrc = _SRC.slice(_gpStart, _gpEnd);
+
+  // Every PATCH must go through the guard. patchMessage( appears exactly twice in
+  // the shipped source: its own definition, and the one call inside guardedPatch.
+  // A third occurrence means some path writes without re-checking.
+  assert.equal((_SRC.match(/patchMessage\(/g) || []).length, 2,
+    "drift: patchMessage is called outside guardedPatch — that path can overwrite a concurrent change unchecked");
+
+  // Build a guardedPatch whose message store is controlled by the test. The
+  // cachedMessages stub models the real 2s TTL cache: until invalidated it serves
+  // the STALE snapshot, so a guard that forgets to invalidate reads its own
+  // outdated copy and concludes nothing changed.
+  function mkGuard({ stale, fresh, answer = false, patchThrows = false }) {
+    const log = { confirms: 0, patches: [], reads: 0 };
+    let invalidated = false;
+    const invalidateMsgCache = () => { invalidated = true; };
+    const cachedMessages = () => {
+      log.reads++;
+      return Promise.resolve(invalidated ? fresh : stale);
+    };
+    const confirmOverwrite = (what, cur) => { log.confirms++; log.lastWhat = what; log.lastCur = cur; return Promise.resolve(answer); };
+    const patchMessage = (cid, mid, content) => {
+      log.patches.push({ cid, mid, content });
+      return patchThrows ? Promise.reject(new Error("boom")) : Promise.resolve({ id: mid, content });
+    };
+    const guardedPatch = new Function(
+      "invalidateMsgCache", "cachedMessages", "confirmOverwrite", "patchMessage",
+      _gpSrc + "\nreturn guardedPatch;",
+    )(invalidateMsgCache, cachedMessages, confirmOverwrite, patchMessage);
+    return { guardedPatch, log };
+  }
+  const msgs = (content) => [{ id: "other", content: "unrelated" }, { id: "m1", content }];
+
+  // (a) stored content still matches the pre-image -> write, no prompt.
+  {
+    const { guardedPatch, log } = mkGuard({ stale: msgs("PRE"), fresh: msgs("PRE") });
+    const res = await guardedPatch("c1", "m1", "PRE", "NEW", "undo");
+    assert.equal(log.confirms, 0, "unchanged message must not prompt");
+    assert.deepEqual(log.patches, [{ cid: "c1", mid: "m1", content: "NEW" }], "unchanged message must be written exactly once, with the new content");
+    assert.ok(res && res.id === "m1", "a completed write must resolve to the patch result, not null");
+  }
+
+  // (b) THE BUG: someone else wrote since. Cancel must leave the stored message
+  // completely untouched — this is the assertion that stands between a stale
+  // snapshot and the user's chat.
+  {
+    const { guardedPatch, log } = mkGuard({ stale: msgs("PRE"), fresh: msgs("SOMEONE ELSE WROTE THIS"), answer: false });
+    const res = await guardedPatch("c1", "m1", "PRE", "NEW", "undo");
+    assert.equal(log.confirms, 1, "a changed message must prompt exactly once");
+    assert.deepEqual(log.patches, [], "declined overwrite must issue NO PATCH at all");
+    assert.equal(res, null, "a declined write must resolve null so callers skip their success path");
+    assert.equal(log.lastWhat, "undo", "the prompt must name the operation that is about to overwrite");
+    assert.equal(log.lastCur, "SOMEONE ELSE WROTE THIS", "the prompt must show what is stored now, not the assumed pre-image");
+  }
+
+  // (c) same mismatch, user explicitly accepts -> the write goes through.
+  {
+    const { guardedPatch, log } = mkGuard({ stale: msgs("PRE"), fresh: msgs("CHANGED"), answer: true });
+    const res = await guardedPatch("c1", "m1", "PRE", "NEW", "rewrite");
+    assert.equal(log.confirms, 1, "accepting still requires the prompt to have been shown");
+    assert.deepEqual(log.patches, [{ cid: "c1", mid: "m1", content: "NEW" }], "an explicit overwrite must write the new content");
+    assert.ok(res && res.content === "NEW", "an accepted write resolves to the patch result");
+  }
+
+  // (d) the cache must not be able to answer the question. Stale copy says "PRE"
+  // (would pass), fresh says otherwise — reading the cache silently overwrites.
+  {
+    const { guardedPatch, log } = mkGuard({ stale: msgs("PRE"), fresh: msgs("CHANGED"), answer: false });
+    await guardedPatch("c1", "m1", "PRE", "NEW", "undo");
+    assert.equal(log.confirms, 1, "the staleness check must re-fetch: a 2s-cached copy of the pre-image must not satisfy it");
+    assert.deepEqual(log.patches, [], "a cached read must never be enough to authorize the write");
+  }
+
+  // (e) message no longer in the list, and a pre-image the history never recorded
+  // (entries written by an older build): nothing to compare, so proceed and let
+  // the PATCH itself produce the real error rather than inventing one.
+  {
+    const g1 = mkGuard({ stale: [], fresh: [] });
+    await g1.guardedPatch("c1", "m1", "PRE", "NEW", "undo");
+    assert.equal(g1.log.patches.length, 1, "a message missing from the list must fall through to the PATCH, which reports the real error");
+    const g2 = mkGuard({ stale: msgs("PRE"), fresh: msgs("CHANGED") });
+    await g2.guardedPatch("c1", "m1", undefined, "NEW", "undo");
+    assert.equal(g2.log.confirms, 0, "no recorded pre-image means nothing to compare — must not prompt on every legacy history entry");
+    assert.equal(g2.log.patches.length, 1, "no recorded pre-image still writes");
+  }
+
+  // (f) a failed re-read must reject, not fall through to a blind write.
+  {
+    const guardedPatch = new Function(
+      "invalidateMsgCache", "cachedMessages", "confirmOverwrite", "patchMessage",
+      _gpSrc + "\nreturn guardedPatch;",
+    )(() => {}, () => Promise.reject(new Error("offline")), () => Promise.resolve(true), () => { throw new Error("patched despite a failed re-check"); });
+    let rejected = null;
+    await guardedPatch("c1", "m1", "PRE", "NEW", "undo").catch((e) => { rejected = e; });
+    assert.ok(rejected && /offline/.test(rejected.message), "a failed re-read must reject (callers already surface it), never write blind");
+  }
+
+  // ── the three call sites, running the SHIPPED undo/redo bodies ──
+  const _urSrc = _SRC.slice(_SRC.indexOf("function doUndo"), _SRC.indexOf("// ── Custom prompt"));
+  assert.ok(_urSrc.includes("function doRedo"), "could not extract doUndo/doRedo from extension.js");
+  function mkUndoRedo(guardResult) {
+    const log = { guard: [], toasts: [], errs: [] };
+    const hist = [{ mid: "m1", cid: "c1", old: "BEFORE", post: "AFTER", when: 1 }];
+    const redo = [];
+    const guardedPatch = (cid, mid, expected, content, what) => {
+      log.guard.push({ cid, mid, expected, content, what });
+      return Promise.resolve(guardResult);
+    };
+    const mod = new Function(
+      "guardedPatch", "hist", "redo", "cfg", "getChatId", "saveH", "saveRedo", "showToast", "killPopup", "showErr",
+      _urSrc + "\nreturn { doUndo: doUndo, doRedo: doRedo };",
+    )(guardedPatch, hist, redo, { historyDepth: 5 }, () => "c1", () => {}, () => {},
+      (a, m) => log.toasts.push(m), () => {}, (m) => log.errs.push(m));
+    return { mod, hist, redo, log };
+  }
+
+  // undo asks about the text the rewrite WROTE (post) and restores old. Getting
+  // these the wrong way round would compare against the value it is about to
+  // write — a check that can never fire.
+  {
+    const { mod, hist, redo, log } = mkUndoRedo({ id: "m1" });
+    mod.doUndo();
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(log.guard.length, 1, "undo must go through the guard");
+    assert.equal(log.guard[0].expected, "AFTER", "undo's pre-image is what the rewrite wrote (h.post)");
+    assert.equal(log.guard[0].content, "BEFORE", "undo writes the pre-rewrite text (h.old)");
+    assert.equal(hist.length, 0, "a completed undo pops the history entry");
+    assert.equal(redo.length, 1, "a completed undo makes the change redoable");
+    assert.ok(log.toasts.join(" ").indexOf("Undone") !== -1, "a completed undo says so");
+  }
+  // declined undo: nothing written, nothing said, and the entry stays undoable.
+  {
+    const { mod, hist, redo, log } = mkUndoRedo(null);
+    mod.doUndo();
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(hist.length, 1, "a declined undo must not consume the history entry");
+    assert.equal(redo.length, 0, "a declined undo must not push a redo entry");
+    assert.deepEqual(log.toasts, [], 'a declined undo must not claim "Undone" — that was the whole complaint');
+  }
+  // redo is the mirror: pre-image is what undo restored (old), it writes post.
+  {
+    const { mod, redo, log } = mkUndoRedo({ id: "m1" });
+    redo.push({ mid: "m1", cid: "c1", old: "BEFORE", post: "AFTER", when: 1 });
+    mod.doRedo();
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(log.guard.length, 1, "redo must go through the guard");
+    assert.equal(log.guard[0].expected, "BEFORE", "redo's pre-image is the text undo restored (r.old)");
+    assert.equal(log.guard[0].content, "AFTER", "redo re-writes the rewritten text (r.post)");
+  }
+  {
+    const { mod, redo, log } = mkUndoRedo(null);
+    redo.push({ mid: "m1", cid: "c1", old: "BEFORE", post: "AFTER", when: 1 });
+    mod.doRedo();
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(redo.length, 1, "a declined redo must not consume the redo entry");
+    assert.deepEqual(log.toasts, [], 'a declined redo must not claim "Redone"');
+  }
+
+  // review-apply: the widest window of the three — `proposed` is spliced before the
+  // modal opens and the modal has no timeout. Runs the SHIPPED reviewThenPatch with
+  // stubbed DOM builders and clicks its real Apply handler.
+  {
+    const _rtpSrc = _SRC.slice(_SRC.indexOf("function reviewThenPatch"), _SRC.indexOf("// ── Toast"));
+    assert.ok(_rtpSrc.includes("guardedPatch("), "drift: reviewThenPatch no longer routes Apply through the guard");
+    function runReview(guardResult, edited) {
+      const log = { guard: [], toasts: [], errs: [], done: 0 };
+      const hist = [], redo = [], buttons = [], made = [];
+      const mk = (tag, cls) => {
+        const el = { tag, cls, style: {}, children: [], value: "", classList: { add() {}, remove() {} }, remove() {} };
+        made.push(el); return el;
+      };
+      const ap = (p, c) => { if (p && c) p.children.push(c); return c; };
+      const mkBtn = (label, cls, fn) => { const b = mk("button", cls); b.label = label; b.click = fn; buttons.push(b); return b; };
+      const mod = new Function(
+        "mkOv", "mkWin", "mk", "ap", "mkBtn", "guardedPatch", "cfg", "hist", "redo", "saveH", "saveRedo", "showToast", "showErr",
+        _rtpSrc + "\nreturn reviewThenPatch;",
+      )(() => mk("div"), () => mk("div"), mk, ap, mkBtn,
+        (cid, mid, expected, content, what) => { log.guard.push({ cid, mid, expected, content, what }); return Promise.resolve(guardResult); },
+        { historyDepth: 5 }, hist, redo, () => {}, () => {}, (a, m) => log.toasts.push(m), (m) => log.errs.push(m));
+      mod("c1", "m1", "STORED-WHEN-OPENED", "PROPOSED", () => { log.done++; });
+      const ta = made.find((e) => e.cls === "rwa-inp");
+      if (edited !== undefined) ta.value = edited;
+      buttons.find((b) => b.label === "Apply").click();
+      return { log, hist, ta };
+    }
+    {
+      const { log, hist, ta } = runReview({ id: "m1" }, "PROPOSED, then hand-edited");
+      await new Promise((r) => setTimeout(r, 5));
+      assert.equal(ta.value, "PROPOSED, then hand-edited", "the textarea starts from the spliced proposal and is editable");
+      assert.equal(log.guard.length, 1, "Apply must go through the guard");
+      assert.equal(log.guard[0].expected, "STORED-WHEN-OPENED", "review's pre-image is the content read before the modal opened");
+      assert.equal(log.guard[0].content, "PROPOSED, then hand-edited", "review writes whatever is in the textarea at Apply time");
+      assert.equal(hist.length, 1, "a completed review-apply records history");
+      assert.equal(log.done, 1, "a completed review-apply runs its onDone");
+    }
+    {
+      const { log, hist } = runReview(null);
+      await new Promise((r) => setTimeout(r, 5));
+      assert.equal(hist.length, 0, "a declined review-apply must not record history for a write that never happened");
+      assert.equal(log.done, 0, "a declined review-apply must not run onDone (it chains further commits)");
+      assert.deepEqual(log.toasts, [], 'a declined review-apply must not claim "Applied"');
+    }
+  }
+}
+console.log("selfcheck: B2 stored-content re-check assertions passed");
+
+// 14) B3: a context fingerprint must gate the splice.
+// nthIndexOf is a bare walk-forward over indexOf. `occ` is captured at selection
+// time; if the phrase's occurrence count shifted since (an earlier instance added
+// or removed by a swipe, a regenerate, or an autonomous background message), the
+// same index resolves to a DIFFERENT occurrence, the text still matches, and the
+// old code spliced it and toasted "Applied". Ledgers make it worse: pruned by
+// count, never by age, so a resumed ledger can carry a days-old occ. Runs the
+// SHIPPED nthIndexOf/ctxFingerprint/fingerprintOk and the SHIPPED doCommit.
+{
+  const _fpStart = _SRC.indexOf("function nthIndexOf");
+  const _fpEnd = _SRC.indexOf("// Map a [rs,re) span");
+  assert.ok(_fpStart !== -1 && _fpEnd !== -1 && _fpEnd > _fpStart, "could not extract the fingerprint helpers from extension.js");
+  const _fpSrc = _SRC.slice(_fpStart, _fpEnd);
+  const fp = new Function(_fpSrc +
+    "\nreturn { nthIndexOf: nthIndexOf, ctxFingerprint: ctxFingerprint, ctxFingerprintAt: ctxFingerprintAt, fingerprintOk: fingerprintOk, FP_LEN: FP_LEN };")();
+
+  // The tail after "hello" is identical in every unit, so the AFTER half of the
+  // fingerprint matches at both occurrences and only the BEFORE half tells them
+  // apart. A check that accepts either half instead of both cannot see this.
+  const TAIL = ", and then the very same long tail sentence appears here.";
+  const R0 = "Alpha: hello" + TAIL + "\nBeta: hello" + TAIL;
+  const R1 = "Gamma: hello" + TAIL + "\n" + R0; // an earlier matching occurrence appears
+  const SEL = "hello";
+
+  const captured = fp.ctxFingerprint(R0, SEL, 1);              // what the user selected: Beta's
+  assert.ok(captured && captured.b && captured.a, "a mid-message selection must fingerprint both sides");
+  assert.ok(captured.b.length <= fp.FP_LEN && captured.a.length <= fp.FP_LEN, "fingerprint halves must stay bounded");
+
+  // Sanity: the scenario really is the silent one — same index, same text, no error.
+  const i0 = fp.nthIndexOf(R0, SEL, 1), i1 = fp.nthIndexOf(R1, SEL, 1);
+  assert.equal(R0.slice(i0, i0 + SEL.length), R1.slice(i1, i1 + SEL.length), "both resolve to matching text — nothing else can catch this");
+  assert.notEqual(R0.slice(0, i0), R1.slice(0, i1), "but they are different places in the message");
+  const at1 = fp.ctxFingerprintAt(R1, i1, SEL.length);
+  assert.equal(at1.a, captured.a, "scenario check: the AFTER half is identical at the wrong occurrence");
+  assert.notEqual(at1.b, captured.b, "scenario check: only the BEFORE half differs");
+
+  assert.equal(fp.fingerprintOk(captured, R0, i0, SEL.length), true, "an unchanged message must still splice");
+  assert.equal(fp.fingerprintOk(captured, R1, i1, SEL.length), false,
+    "occ 1 now resolves to a different occurrence — the splice must be refused");
+
+  // both halves differing is also caught, and so is a rewritten neighbourhood
+  assert.equal(fp.fingerprintOk(captured, "Beta: hello world entirely different", 6, SEL.length), false, "unrelated surroundings must be refused");
+  assert.equal(fp.fingerprintOk(captured, R0, -1, SEL.length), false, "an unresolvable index must be refused, not treated as a match");
+
+  // edges: a selection at the very start or end has no context on one side, and
+  // must still fingerprint and still verify.
+  const EDGE = "hello there, world";
+  const startFp = fp.ctxFingerprint(EDGE, "hello", 0);
+  assert.equal(startFp.b, "", "a selection at the start of a message has no before-context");
+  assert.equal(fp.fingerprintOk(startFp, EDGE, 0, 5), true, "a start-of-message selection must still verify");
+  assert.equal(fp.fingerprintOk(startFp, "well, hello there, world", 6, 5), false, "text inserted before a start-of-message selection must be caught");
+  const endFp = fp.ctxFingerprint(EDGE, "world", 0);
+  assert.equal(endFp.a, "", "a selection at the end of a message has no after-context");
+  assert.equal(fp.fingerprintOk(endFp, EDGE, 13, 5), true, "an end-of-message selection must still verify");
+
+  // whitespace-only re-rendering (wrapping, indentation) must not fail closed —
+  // the fingerprint is normalized, not literal.
+  assert.equal(fp.fingerprintOk(captured, R0.replace(/ /g, "  ").replace(/\n/g, "\n\n"), R0.replace(/ /g, "  ").replace(/\n/g, "\n\n").indexOf(SEL, 20), SEL.length), true,
+    "whitespace re-flow must not be mistaken for a moved selection");
+
+  // no fingerprint recorded (a ledger stored by an older build) -> allowed, so
+  // upgrading does not brick every saved ledger.
+  assert.equal(fp.fingerprintOk(null, R1, i1, SEL.length), true, "a missing fingerprint must not hard-fail legacy ledgers");
+
+  // ── the shipped doCommit must actually refuse, and must not PATCH ──
+  const _dcSrc = _SRC.slice(_SRC.indexOf("function doCommit"), _SRC.indexOf("// ── Undo"));
+  assert.ok(_dcSrc.includes("fingerprintOk("), "drift: doCommit no longer verifies the fingerprint before splicing");
+  function runCommit(rendered, savedSel) {
+    const log = { patches: [], errs: [], done: 0, failed: [] };
+    const mod = new Function(
+      "getChatId", "showErr", "cachedMessages", "renderedTextForMid", "mapRenderedSpanToRaw",
+      "invalidateMsgCache", "cfg", "reviewThenPatch", "guardedPatch", "hist", "redo", "saveH", "saveRedo", "showToast",
+      _fpSrc + _dcSrc + "\nreturn doCommit;",
+    )(
+      () => "c1",
+      (m) => log.errs.push(m),
+      () => Promise.resolve([{ id: "m1", content: rendered }]), // raw === rendered here
+      () => rendered,
+      (R, A, rs, re) => ({ as: rs, ae: re }),                   // identity map: no transforms
+      () => {}, { historyDepth: 5 }, () => { throw new Error("review path not under test"); },
+      (cid, mid, expected, content) => { log.patches.push({ expected, content }); return Promise.resolve({ id: mid }); },
+      [], [], () => {}, () => {}, () => {},
+    );
+    mod("REWRITTEN", savedSel, () => { log.done++; }, (m) => log.failed.push(m));
+    return log;
+  }
+  // control: nothing moved -> commits, and into the occurrence the user picked
+  {
+    const log = runCommit(R0, { text: SEL, mid: "m1", cid: "c1", occ: 1, fp: captured });
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(log.patches.length, 1, "an unchanged message must still commit");
+    assert.equal(log.patches[0].expected, R0,
+      "the commit's pre-image must be the stored content it spliced into — comparing the payload against itself is a check that can never fire");
+    assert.equal(log.patches[0].content, R0.slice(0, i0) + "REWRITTEN" + R0.slice(i0 + SEL.length),
+      "the splice must land on the occurrence the user selected (Beta's), not the first match");
+    assert.equal(log.done, 1, "a successful commit runs onDone");
+  }
+  // the defect: an earlier matching occurrence appeared -> refuse, write nothing
+  {
+    const log = runCommit(R1, { text: SEL, mid: "m1", cid: "c1", occ: 1, fp: captured });
+    await new Promise((r) => setTimeout(r, 5));
+    assert.deepEqual(log.patches, [], "a moved occurrence must produce NO write");
+    assert.equal(log.done, 0, "a refused commit must not run onDone");
+    assert.equal(log.failed.length, 1, "a refused commit must report failure to its caller");
+    assert.ok(/Could not locate the selected text/.test(log.errs[0] || ""),
+      "refusal must reuse the existing could-not-locate error family, got: " + log.errs[0]);
+  }
+  // a ledger from before this build carries no fingerprint: unchanged behaviour
+  {
+    const log = runCommit(R0, { text: SEL, mid: "m1", cid: "c1", occ: 1 });
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(log.patches.length, 1, "a fingerprint-less savedSel must keep working");
+  }
+
+  // the fingerprint has to travel with occ everywhere occ travels, or the check
+  // silently no-ops on that path.
+  assert.ok(/fp: ctxFingerprint\(renderedTextForMid\(order\[k\]\), t, o\)/.test(_SRC), "drift: selection capture no longer records a fingerprint");
+  for (const carrier of ["segments\\[0\\]", "sel", "seg", "savedSel", "ledger", "segments\\[i\\]"]) {
+    assert.ok(new RegExp("fp: " + carrier + "\\.fp \\|\\| null").test(_SRC),
+      "drift: a path that carries occ stopped carrying its fingerprint (" + carrier.replace(/\\/g, "") + ")");
+  }
+  assert.ok(/occ: ledger\.occ \|\| 0, fp: ledger\.fp \|\| null/.test(_SRC), "drift: ledger assemble no longer revalidates its stored occ");
+}
+console.log("selfcheck: B3 context-fingerprint assertions passed");

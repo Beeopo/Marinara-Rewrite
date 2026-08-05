@@ -412,6 +412,78 @@
     });
   }
 
+  // ── B2: last-write-wins guard ────────────────────────────────────────────
+  // The engine's PATCH route is a bare overwrite — chats.routes.ts's handler calls
+  // storage.updateMessageContent, and chats.storage.ts's withPatchQueue serializes
+  // per message id for ATOMICITY only; it never compares against an expected prior
+  // value. There is no version, etag, or conditional write to ask for, so the check
+  // has to live here. And concurrent modification is routine, not theoretical: swipe
+  // and regenerate write the same rows from several routes, and the background
+  // autonomous-messaging hook mutates chat state with no user action at all.
+  //
+  // Every PATCH this extension issues therefore goes through here: re-read the
+  // stored content, compare it to the pre-image the operation assumed, and on a
+  // mismatch ask instead of overwriting. Resolves to null when the user declined
+  // (nothing was written), the patch result otherwise. A failed re-read rejects —
+  // callers already surface that, and refusing to write is the safe outcome.
+  function guardedPatch(cid, mid, expected, content, what) {
+    // A staleness check that reads a stale cache is worthless: cachedMessages
+    // serves up to 2s old data, which is the whole width of the race.
+    invalidateMsgCache();
+    return cachedMessages(cid).then(function (msgs) {
+      var cur = null;
+      if (Array.isArray(msgs)) {
+        for (var i = 0; i < msgs.length; i++) {
+          if (msgs[i].id === mid) { cur = msgs[i].content; break; }
+        }
+      }
+      // expected == null: history entry written by an older build recorded no
+      // pre-image, so there is nothing to compare. cur == null: the message is no
+      // longer in the list — let the PATCH itself produce the real error.
+      if (expected == null || cur == null || cur === expected) return true;
+      return confirmOverwrite(what, cur);
+    }).then(function (ok) {
+      if (!ok) return null;
+      return patchMessage(cid, mid, content);
+    });
+  }
+
+  // The mismatch prompt. Cancel is the default in both senses: it is the primary
+  // button, and every exit that is not the explicit "Overwrite anyway" click — the
+  // X, Cancel — resolves false, so a dismissed dialog can never destroy the other
+  // writer's change. No merge is offered; guessing how to combine two edits to the
+  // same message is how you lose both.
+  function confirmOverwrite(what, cur) {
+    return new Promise(function (resolve) {
+      var settled = false;
+      var ov = mkOv(10030);
+      function finish(v) {
+        if (settled) return;
+        settled = true;
+        ov.remove();
+        resolve(v);
+      }
+      var win = ap(ov, mk("div", "rwa-win"));
+      win.style.width = "480px";
+      ap(win, mk("div", "rwa-bar"));
+      var hdr = ap(win, mk("div", "rwa-hdr"));
+      ap(hdr, mk("div", "rwa-title", "⚠️ This message changed"));
+      ap(hdr, xBtn(function () { finish(false); }));
+      var body = ap(win, mk("div", "rwa-body"));
+      ap(body, mk("div", "rwa-err",
+        "The stored message is no longer what this " + (what || "change") + " assumed.\n\n" +
+        "Something else wrote to it since — a swipe, a regenerate, or an automatic " +
+        "background message. Applying now replaces that newer text, and it is not " +
+        "recoverable from here.\n\nCancel, look at the message, and try again."));
+      ap(body, mk("div", "rwa-plbl", "Stored right now"));
+      var prev = ap(body, mk("div", "rwa-prev", String(cur == null ? "" : cur).slice(0, 600)));
+      prev.style.cssText = "white-space:pre-wrap;max-height:140px;overflow:auto;margin:4px 0 10px;font-size:11px;";
+      var ft = ap(body, mk("div", "rwa-foot"));
+      ap(ft, mkBtn("Cancel", "rwa-accept", function () { finish(false); })).style.flex = "2";
+      ap(ft, mkBtn("Overwrite anyway", null, function () { finish(true); })).style.flex = "1";
+    });
+  }
+
   var _loreCache = { key: null, result: null, ts: 0 };
   var _charListCache = null;
 
@@ -856,6 +928,56 @@
     for (var k = 0; k < n && idx !== -1; k++) idx = hay.indexOf(needle, idx + needle.length);
     return idx;
   }
+
+  // ── B3: surrounding-context fingerprint ──────────────────────────────────
+  // nthIndexOf is a bare walk-forward with nothing to validate against. The
+  // occurrence index `occ` is captured at SELECTION time; if the phrase's
+  // occurrence count shifted since (an earlier instance added or removed by a
+  // swipe, a regenerate, or background autonomous messaging), the same index
+  // resolves to a DIFFERENT occurrence. The text still matches, so no error
+  // fires and the toast still reads "Applied" — the splice just lands in the
+  // wrong place. Ledgers make it worse: they persist in localStorage with no
+  // TTL, so a resumed ledger can carry a days-old `occ`.
+  //
+  // So record what surrounds the selection at capture time and re-verify it at
+  // the resolved index before splicing. Whitespace-normalized (render
+  // whitespace is not stable), bounded to FP_LEN chars, and empty on whichever
+  // side the selection touches the edge of the message.
+  //
+  // This answers "is this the same PLACE in the rendered text?". The separate
+  // question "is the STORED content still the pre-image we assumed?" is
+  // answered in exactly one other place — guardedPatch. Neither substitutes
+  // for the other: the DOM can lag the store, and the store carries no
+  // position.
+  var FP_LEN = 24;
+  function fpNorm(s) { return s.replace(/\s+/g, " ").trim(); }
+  // Fingerprint the text either side of [idx, idx+len). Reads a wider raw window
+  // than FP_LEN so that collapsing whitespace cannot shorten the kept slice, then
+  // keeps the FP_LEN chars nearest the selection — the far edge of the window is
+  // what a mid-word cut would corrupt, and it is exactly what gets dropped.
+  function ctxFingerprintAt(fullText, idx, len) {
+    if (idx == null || idx < 0) return null;
+    var end = idx + len;
+    return {
+      b: fpNorm(fullText.slice(Math.max(0, idx - FP_LEN * 4), idx)).slice(-FP_LEN),
+      a: fpNorm(fullText.slice(end, end + FP_LEN * 4)).slice(0, FP_LEN),
+    };
+  }
+  // Capture-time: locate the occurrence the user picked, then fingerprint it.
+  // Normalizes the needle exactly as doCommit does, so both sides agree.
+  function ctxFingerprint(fullText, needle, occ) {
+    var n = String(needle == null ? "" : needle).trim().replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (!n) return null;
+    return ctxFingerprintAt(fullText, nthIndexOf(fullText, n, occ || 0), n.length);
+  }
+  // Commit-time: does the resolved splice site still look the way it did?
+  // No fingerprint recorded (a ledger written by an older build) means there is
+  // nothing to compare against — allow, rather than break every stored ledger.
+  function fingerprintOk(fp, fullText, idx, len) {
+    if (!fp) return true;
+    var now = ctxFingerprintAt(fullText, idx, len);
+    return !!now && now.b === fp.b && now.a === fp.a;
+  }
   // Map a [rs,re) span in the rendered text to a [as,ae) span in raw msg.content.
   // The engine renders raw content through macro/quote/markdown transforms; this
   // LCS-aligns the two strings so a selection captured from the DOM can be spliced
@@ -1188,6 +1310,7 @@
       text: segments[0].text,
       mid: segments[0].mid,
       occ: segments[0].occ || 0,
+      fp: segments[0].fp || null,
       cid: cid,
     };
 
@@ -1610,9 +1733,12 @@
     var ft = ap(body, mk("div", "rwa-foot"));
     ap(ft, mkBtn("Apply", "rwa-accept", function () {
       var content = ta.value;
-      invalidateMsgCache();
-      patchMessage(cid, mid, content)
-        .then(function () {
+      // B2: `proposed` was spliced together BEFORE this modal opened and the modal
+      // has no timeout, so the race window is however long the user left it open —
+      // the widest of any write path here. Re-read and compare before writing.
+      guardedPatch(cid, mid, oldContent, content, "review")
+        .then(function (res) {
+          if (!res) return; // declined — nothing written, no history entry, modal stays
           var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
           hist.unshift({ mid: mid, cid: cid, old: oldContent, post: content, when: Date.now() });
           if (hist.length > depth) hist.length = depth;
@@ -1784,12 +1910,12 @@
     // queue: { segments:[{mid,text}], index }. Built from sel on first call so a
     // multi-message selection is rewritten one message at a time.
     if (!queue) {
-      var segs = (sel.segments && sel.segments.length) ? sel.segments : [{ mid: sel.mid, text: sel.text, occ: sel.occ || 0 }];
+      var segs = (sel.segments && sel.segments.length) ? sel.segments : [{ mid: sel.mid, text: sel.text, occ: sel.occ || 0, fp: sel.fp || null }];
       queue = { segments: segs, index: 0 };
     }
     var seg = queue.segments[queue.index];
     var total = queue.segments.length;
-    var savedSel = { text: seg.text, mid: seg.mid, cid: sel.cid, occ: seg.occ || 0 };
+    var savedSel = { text: seg.text, mid: seg.mid, cid: sel.cid, occ: seg.occ || 0, fp: seg.fp || null };
     killPopup();
     if (!savedSel.cid) savedSel.cid = getChatId();
 
@@ -2038,6 +2164,9 @@
       var win = windowText(savedSel.text, sliceBudget());
       ledger = {
         key: key, mid: savedSel.mid, cid: savedSel.cid, occ: savedSel.occ || 0,
+        // B3: ledgers outlive the page — pruned by count, never by age — so the
+        // fingerprint travels with the stored occ or a day-old resume splices blind.
+        fp: savedSel.fp || null,
         profileId: profile.id, orig: savedSel.text,
         slices: win.map(function (s) { return { text: s.text, sep: s.sep, result: null, status: "pending" }; }),
         createdAt: Date.now(),
@@ -2122,7 +2251,7 @@
       }).join("");
       logDbg("ledger.assemble", { mid: ledger.mid, slices: total, chars: assembled.length });
       ov.remove();
-      doCommit(assembled, { text: ledger.orig, mid: ledger.mid, cid: ledger.cid, occ: ledger.occ || 0 }, function () {
+      doCommit(assembled, { text: ledger.orig, mid: ledger.mid, cid: ledger.cid, occ: ledger.occ || 0, fp: ledger.fp || null }, function () {
         clearLedger(ledger.key);
         showToast(null, "✓ Applied (" + total + " slices)", "ok");
         if (queue && queue.index + 1 < queue.segments.length) doRewrite(profile, { segments: queue.segments, index: queue.index + 1 });
@@ -2250,7 +2379,10 @@
   function applyMerged(segments, pieces, cid, i, onDone, results) {
     results = results || [];
     if (i >= segments.length) { if (onDone) onDone(results); return; }
-    doCommit(pieces[i], { text: segments[i].text, mid: segments[i].mid, cid: cid }, function () {
+    // B3: the merge chain used to drop occ AND carry no fingerprint, so every
+    // segment spliced at occurrence 0 with nothing checking the place. Both travel
+    // with the segment — collectSelectionSegments captured them.
+    doCommit(pieces[i], { text: segments[i].text, mid: segments[i].mid, cid: cid, occ: segments[i].occ || 0, fp: segments[i].fp || null }, function () {
       results.push(true);
       // N8 fix: invalidate the message cache before recursing to the next segment.
       // doCommit already invalidates after its own match, but in chained auto-apply
@@ -2470,6 +2602,20 @@
         }
         var re = rs + normSel.length;
 
+        // B3: matching text is not proof of the right PLACE. If an earlier instance
+        // of the phrase was added or removed since selection, `occ` resolves to a
+        // different occurrence that still matches — old code spliced it and toasted
+        // "Applied". Verify the captured surroundings at the resolved index and fail
+        // closed into the existing "could not locate" family.
+        if (!fingerprintOk(savedSel.fp, renderedFull, rs, normSel.length)) {
+          fail(
+            "Could not locate the selected text in the rendered message.\n\n" +
+            "The text around your selection has changed since you selected it, so the\n" +
+            "same phrase now points somewhere else. Re-select and try again."
+          );
+          return;
+        }
+
         // Map the rendered span into raw msg.content coordinates and splice.
         var span = mapRenderedSpanToRaw(renderedFull, rawContent, rs, re);
         if (!span) {
@@ -2486,8 +2632,11 @@
           reviewThenPatch(cid, mid, msg.content, updated, onDone);
           return;
         }
-        patchMessage(cid, mid, updated)
-          .then(function () {
+        // B2: `updated` was spliced into the content we just read, which may itself
+        // have come from the 2s cache. Compare against what is stored right now.
+        guardedPatch(cid, mid, msg.content, updated, "rewrite")
+          .then(function (res) {
+            if (!res) return; // declined — nothing written, no history entry, no toast
             var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
             hist.unshift({ mid: mid, cid: cid, old: msg.content, post: updated, when: Date.now() });
             if (hist.length > depth) hist.length = depth;
@@ -2511,9 +2660,12 @@
     if (!hist.length) return;
     var h = hist[0];
     var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
-    invalidateMsgCache();
-    patchMessage(h.cid || getChatId(), h.mid, h.old)
-      .then(function () {
+    // B2: undo assumed the message still holds what the rewrite wrote (h.post). If
+    // it does not, restoring h.old discards whatever came after — and the old code
+    // still toasted "Undone" as though nothing was lost.
+    guardedPatch(h.cid || getChatId(), h.mid, h.post, h.old, "undo")
+      .then(function (res) {
+        if (!res) return; // declined — history untouched, so undo stays available
         hist.shift();
         saveH();
         if (h.post != null) { redo.unshift(h); if (redo.length > depth) redo.length = depth; saveRedo(); }
@@ -2529,9 +2681,11 @@
     var r = redo[0];
     if (r.post == null) { redo.shift(); saveRedo(); return; }
     var depth = Math.max(1, Math.min(20, cfg.historyDepth || 5));
-    invalidateMsgCache();
-    patchMessage(r.cid || getChatId(), r.mid, r.post)
-      .then(function () {
+    // B2: redo assumes the message still holds the pre-rewrite text undo restored
+    // (r.old); anything else means something wrote in between.
+    guardedPatch(r.cid || getChatId(), r.mid, r.old, r.post, "redo")
+      .then(function (res) {
+        if (!res) return; // declined — redo entry stays, nothing written
         redo.shift();
         saveRedo();
         hist.unshift(r);
@@ -3521,7 +3675,12 @@
     var segs = [];
     for (var k = 0; k < order.length; k++) {
       var t = selectionTextInMessage(range, order[k]);
-      if (t && t.length >= 2) segs.push({ mid: order[k], text: t, occ: selectionOccurrence(range, order[k], t) });
+      if (t && t.length >= 2) {
+        var o = selectionOccurrence(range, order[k], t);
+        // B3: `occ` alone is not proof of place — record what surrounds the chosen
+        // occurrence now, so the commit can tell "same phrase" from "same spot".
+        segs.push({ mid: order[k], text: t, occ: o, fp: ctxFingerprint(renderedTextForMid(order[k]), t, o) });
+      }
     }
     return segs;
   }
