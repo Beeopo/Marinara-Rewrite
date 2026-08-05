@@ -253,6 +253,11 @@ assert.equal(_spanIsBalanced("<abc123>content</abc>", 9, 16), true,
   // [0,9) is "a <br/> b": the <br/> opaque token is covered whole, the <i> pair
   // is entirely outside it.
   assert.equal(_spanIsBalanced("a <br/> b <i>x</i> c", 0, 9), true, "an unrelated self-closer overlapped whole is fine and pairs elsewhere are untouched");
+  // A URL attribute ending in "/" must not read as self-closing — the "/"
+  // is followed by a quote, not ">", so the real pair still forms. Verified
+  // tripwire: simplifying the self-closer test to /\// flips this to true.
+  const V = 'see <a href="http://x/">link</a> end';
+  assert.equal(_spanIsBalanced(V, 0, 6), false, "trailing-slash attribute: the real pair must still form and refuse orphaning");
 }
 function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
 // clean boundaries MUST splice exactly:
