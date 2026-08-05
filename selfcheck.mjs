@@ -213,18 +213,42 @@ function _alignExact(R, A, rs, re) {
   const dirtyStart = as > 0 && as < m && !matchedRaw[as - 1] && !matchedRaw[as];
   const dirtyEnd = ae > 0 && ae < m && !matchedRaw[ae - 1] && !matchedRaw[ae];
   if (dirtyStart || dirtyEnd) return null;
-  if (!_spanIsBalanced(A.slice(as, ae))) return null;
+  if (!_spanIsBalanced(A, as, ae)) return null;
   return { as, ae };
 }
-// mirror of extension.js spanIsBalanced
-function _spanIsBalanced(s) {
-  // <<< keep this mirror IDENTICAL in logic to extension.js's spanIsBalanced >>>
-  if ((s.match(/\{\{/g) || []).length !== (s.match(/\}\}/g) || []).length) return false;
-  if ((s.match(/\*/g) || []).length % 2) return false;
-  if ((s.match(/`/g) || []).length % 2) return false;
-  if ((s.match(/_/g) || []).length % 2) return false;
-  return true;
-}
+// <<< mirror of extension.js spanIsBalanced — keep IDENTICAL in logic >>>
+  var _OPAQUE_RE = /\{\{[\s\S]*?\}\}|```[\s\S]*?```|`[^`\n]*`|!\[[^\]\n]*\]\([^)\s]*\)|\\[\s\S]|<[A-Za-z][^<>]*\/>/g;
+  var _EMPH_RE   = /(\*\*\*|\*\*|~~|==|__|\*|_)(?!\1)([\s\S]*?)\1/g;
+  var _LINK_RE   = /\[([^\]\n]*)\]\(([^)\s]*)\)/g;
+  var _TAG_RE    = /<([A-Za-z][A-Za-z0-9]*)[^<>]*>[\s\S]*?<\/\1\s*>/g;
+  function _spanIsBalanced(A, as, ae) {
+    var t, m, i, pairs = [], ov = function (s, e) { return as < e && ae > s; };
+    _OPAQUE_RE.lastIndex = 0;
+    while ((t = _OPAQUE_RE.exec(A))) {
+      var os = t.index, oe = os + t[0].length;
+      if (ov(os, oe) && !(as <= os && ae >= oe)) return false;
+    }
+    _EMPH_RE.lastIndex = 0;
+    while ((m = _EMPH_RE.exec(A))) {
+      var d = m[1].length, s0 = m.index, e0 = s0 + m[0].length;
+      pairs.push([s0, s0 + d, e0 - d, e0]);
+    }
+    _LINK_RE.lastIndex = 0;
+    while ((m = _LINK_RE.exec(A))) {
+      var ls = m.index;
+      pairs.push([ls, ls + 1, ls + 1 + m[1].length, ls + m[0].length]);
+    }
+    _TAG_RE.lastIndex = 0;
+    while ((m = _TAG_RE.exec(A))) {
+      var ts = m.index, raw = m[0];
+      pairs.push([ts, ts + raw.indexOf(">") + 1, ts + raw.lastIndexOf("</"), ts + raw.length]);
+    }
+    // Exactly one delimiter of a pair inside the cut orphans the other.
+    for (i = 0; i < pairs.length; i++) {
+      if (ov(pairs[i][0], pairs[i][1]) !== ov(pairs[i][2], pairs[i][3])) return false;
+    }
+    return true;
+  }
 // mirror of extension.js findCleanAnchor
 function _findCleanAnchor(R, A, pos, side, LEN, MAXSPAN) {
   const step = 8;
@@ -270,7 +294,7 @@ function _mapRenderedSpanToRaw(R, A, rs, re) {
   const startSpan = _windowMap(R, A, rs, rs + 1);
   const endSpan = _windowMap(R, A, re - 1, re);
   if (!startSpan || !endSpan || endSpan.ae < startSpan.as) return null;
-  if (!_spanIsBalanced(A.slice(startSpan.as, endSpan.ae))) return null;
+  if (!_spanIsBalanced(A, startSpan.as, endSpan.ae)) return null;
   return { as: startSpan.as, ae: endSpan.ae };
 }
 function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
@@ -299,6 +323,41 @@ assert.equal(_spl("hey there", "**hey** there", 0, 3, "X"), "**X** there", "3-ch
 assert.equal(_spl("hi there", "*hi* there", 0, 2, "X"), "*X* there", "2-char word keeps its italic markers");
 assert.equal(_spl("softly there", "*softly* there", 0, 6, "X"), "*X* there", "6-char word keeps its markers");
 assert.equal(_spl("bold text", "**bold** text", 0, 4, "X"), "**X** text", "4-char word keeps its markers");
+// The containment rule, in all three directions. An earlier version counted
+// delimiter parity and was wrong twice over: "ld** text" holds one run's closing **
+// and has an even count, so it passed and orphaned the opening ** — the same
+// corruption class, through the delimiter the check exists to guard — while
+// transform-free prose like "the 3 * 4 grid" was refused for no reason.
+const _bisect = (A, R, sel) => { const i = R.indexOf(sel); return _spl(R, A, i, i + sel.length, "X"); };
+// (a) must REFUSE: replacing this span would orphan half a token
+for (const [A, R, sel, why] of [
+  ["Hi {{char50}} there.", "Hi PersonName50 there.", "Hi PersonNa", "macro, 2-char coincidence"],
+  ["Hi {{charABC}} there.", "Hi NameABC there.", "Hi NameA", "macro, 3-char coincidence"],
+  ["**bold** text", "bold text", "ld text", "orphans the opening **"],
+  ["*one two* three *four five*", "one two three four five", "two three four", "takes one closing and one opening *"],
+  ["`aa` bb `cc`", "aa bb cc", "a bb c", "orphans code-span backticks"],
+  ["_aa_ bb _cc_", "aa bb cc", "a bb c", "orphans underscores"],
+  ["Hi ~~struck~~ word.", "Hi struck word.", "Hi stru", "strikethrough"],
+  ["Hi ==marked== word.", "Hi marked word.", "Hi mark", "highlight"],
+  ["Hi __emph__ word.", "Hi emph word.", "Hi em", "dunder emphasis"],
+  ["Hi [label](https://e.co) word.", "Hi label word.", "Hi lab", "link"],
+  ["Hi ![alt](https://e.co/i.png) word.", "Hi alt word.", "Hi al", "image"],
+  ["Hi <b>text</b> word.", "Hi text word.", "Hi tex", "html tag pair"],
+]) assert.equal(_bisect(A, R, sel), null, "must refuse (" + why + "): " + JSON.stringify(A));
+// (b) must SPLICE: cutting through CONTENT between delimiters is the common case
+for (const [A, R, sel, want] of [
+  ["**hey** there", "hey there", "hey", "**X** there"],
+  ["*hi* there", "hi there", "hi", "*X* there"],
+  ["**bold** text", "bold text", "bold", "**X** text"],
+  ["*softly* there", "softly there", "softly", "*X* there"],
+]) assert.equal(_bisect(A, R, sel), want, "markers must survive: " + JSON.stringify(A));
+// (c) must SPLICE: transform-free prose. R === A, the map is the identity and the
+// splice is provably exact — a literal * or _ is not a delimiter here.
+for (const [A, sel, want] of [
+  ["The answer is 2 * 3 = 6.", "2 * 3 = 6", "The answer is X."],
+  ["Open foo_bar.txt now.", "foo_bar.txt now", "Open X."],
+  ["She checked the log_file for the 3 * 4 grid.", "log_file for the 3 * 4 grid", "She checked the X."],
+]) assert.equal(_bisect(A, A, sel), want, "must not refuse transform-free prose: " + JSON.stringify(sel));
 // unanchorable large input (no shared runs) returns null -> copy fallback
 assert.equal(_mapRenderedSpanToRaw("a".repeat(2001), "b".repeat(2001), 0, 1), null);
 console.log("selfcheck: span-alignment assertions passed");
