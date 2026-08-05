@@ -817,4 +817,70 @@ console.log("selfcheck: fence-escaping assertions passed");
   const stillOver = hugeFixed + Object.keys(allDropped).reduce((a, k) => a + allDropped[k].length, 0);
   assert.ok(stillOver > _budget.PROMPT_BUDGET, "sanity: an oversized selection alone must stay over budget even with every context block dropped");
 }
+
+// 12) B4: merge-chain partial-failure aggregation. applyMerged recurses into
+// doCommit for each segment of a multi-message merged rewrite, only from
+// doCommit's success callback. Every doCommit failure branch (bad chat id,
+// message not found, selection not located, unmappable span, save failed)
+// already shows its own modal via showErr — but nothing told the user how
+// many EARLIER segments in the chain had already been committed before the
+// break. Runs the SHIPPED applyMerged/mergeChainSummary against a stubbed
+// doCommit rather than a hand-mirrored copy of the chain logic.
+{
+  const _amStart = _SRC.indexOf("function applyMerged");
+  const _amEnd = _SRC.indexOf("function showMergePreview");
+  assert.ok(_amStart !== -1 && _amEnd !== -1, "could not extract applyMerged/mergeChainSummary from extension.js");
+  const _chainSrc = _SRC.slice(_amStart, _amEnd);
+  assert.ok(_chainSrc.includes("function mergeChainSummary"), "drift: mergeChainSummary missing from extracted range");
+
+  function runChain(total, failAt) {
+    const calls = [];
+    const stubDoCommit = (newText, savedSel, onDone, onFail) => {
+      calls.push(savedSel.mid);
+      if (savedSel.mid === failAt) { onFail("stub failure at segment " + savedSel.mid); return; }
+      onDone();
+    };
+    const stubInvalidate = () => {};
+    const mod = new Function(
+      "doCommit", "invalidateMsgCache",
+      _chainSrc + "\nreturn { applyMerged: applyMerged, mergeChainSummary: mergeChainSummary };"
+    )(stubDoCommit, stubInvalidate);
+
+    const segments = [];
+    const pieces = [];
+    for (let i = 0; i < total; i++) { segments.push({ text: "orig" + i, mid: i }); pieces.push("new" + i); }
+    let finalResults = null;
+    mod.applyMerged(segments, pieces, "chat1", 0, (results) => { finalResults = results; });
+    return { mod, segments, results: finalResults, calls };
+  }
+
+  // Full success: every segment commits, nothing is skipped.
+  {
+    const { results, calls } = runChain(4, -1);
+    assert.deepEqual(results, [true, true, true, true], "full success: all four segments must report applied");
+    assert.deepEqual(calls, [0, 1, 2, 3], "full success: every segment must be attempted, in order");
+  }
+
+  // Partial failure: segment 3 of 4 (index 2) fails.
+  {
+    const { mod, segments, results, calls } = runChain(4, 2);
+    assert.deepEqual(results, [true, true, false],
+      "chain must stop at the failing segment and report exactly the first k-1 as applied, the failing one as not");
+    assert.deepEqual(calls, [0, 1, 2], "chain must not attempt any segment after the failure (segment 4 never called)");
+    const summary = mod.mergeChainSummary(results, segments.length);
+    assert.ok(summary.indexOf("2/4") !== -1, "summary must report 2 of 4 applied, got: " + summary);
+    assert.ok(summary.indexOf("Message 1") !== -1 && summary.indexOf("Message 2") !== -1,
+      "summary must name the applied messages by their merge-preview label, got: " + summary);
+    assert.ok(summary.indexOf("Message 3") !== -1 && summary.indexOf("Message 4") !== -1,
+      "summary must name BOTH the failed segment and the never-attempted trailing segment as not applied, got: " + summary);
+  }
+
+  // Failure on the very first segment: nothing committed at all.
+  {
+    const { results, calls } = runChain(3, 0);
+    assert.deepEqual(results, [false], "first-segment failure: nothing committed, chain stops immediately");
+    assert.deepEqual(calls, [0], "first-segment failure: only the first segment is attempted, not the other two");
+  }
+}
+console.log("selfcheck: merge-chain aggregation assertions passed");
 console.log("selfcheck: prompt-budget assertions passed");
