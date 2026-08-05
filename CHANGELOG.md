@@ -30,6 +30,30 @@ nothing. This release ports the extension to the new full-page runtime.
   prompts. The namespace is now a fixed literal independent of any engine id, the
   manifest name no longer carries the version, and a first run copies a previous
   install's keys across without deleting them.
+- **Fixed:** rewrites no longer corrupt formatting. Locating a selection could cut
+  through a `{{macro}}` or one half of a formatting pair, leaving orphaned syntax in
+  the message that could never render again — `{{char50}}` becoming `50}}`, or
+  `**bold**` losing its opening marker. The aligner now refuses any splice that would
+  take one delimiter without its partner, including nested formatting and
+  `<speaker="…">` wrappers, rather than risking a bad write.
+- **Fixed:** applying, undoing, or redoing no longer silently overwrites a message
+  that changed in the meantime. Marinara's save endpoint is last-write-wins and
+  several things write to messages — swipes, regenerates, automatic background
+  messages — so the extension now re-reads and compares first, and asks before
+  replacing newer text. A selection whose surroundings moved is refused rather than
+  applied to the wrong occurrence.
+- **Fixed:** connection settings no longer travel through export or import. Export
+  already stripped the API key, but nothing filtered on the way in, so an imported
+  file could point your rewrites at another host — and your existing key went with
+  them. API key, API URL, Extender URL, and connection mode are now user-owned in
+  both directions.
+- **Fixed:** oversized prompts are trimmed instead of rejected. Context pieces were
+  capped individually but never summed, so a large selection with everything enabled
+  exceeded the engine's limit and produced an unhelpful validation error. The
+  lowest-priority context is now dropped first and you are told what went.
+- **Fixed:** a multi-message apply that fails partway now says which messages were
+  written. Previously the chain stopped with only the failing segment's error, so
+  there was no way to tell what had already committed.
 - **Changed:** styles moved from the removed `marinara.addStyle` call into
   `extension.css`, shipped in the manifest's `css` field so the engine creates and
   removes the stylesheet node itself.

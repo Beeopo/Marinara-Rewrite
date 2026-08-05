@@ -78,6 +78,9 @@ section of text in a message using an AI model. Select text, choose a mode, and 
 - Per-profile color coding, drag-to-reorder, and **hide from the popup** (keeps the profile, removes its button).
 - **Search** on the Profiles and Characters lists.
 - **Selective export/import** — choose whether to include profiles, settings, custom prompts, and auto-profiles.
+  Connection settings (API key, API URL, Extender URL, connection mode) never travel in either direction: an
+  exported file cannot leak your key, and an imported one cannot redirect where your rewrites are sent. Set those
+  by hand on each machine.
 - **Debug log** — exportable record of prompts and replies for troubleshooting (API key redacted).
 - All settings persist between sessions.
 
@@ -144,7 +147,19 @@ and splice the new text in. Most failures happen at that second step, not the ge
   diffing, with anchor-windowing for long messages. Each step reports its own error — "could not locate the
   selected text in the rendered message", and "could not map the selection back to stored content". A selection
   whose edges land inside a formatting marker or a macro refuses rather than risk a bad splice; trimming the
-  selection to whole words, clear of markers, usually resolves it.
+  selection to whole words, clear of markers, usually resolves it. The same applies to nested formatting
+  (`**bold with *inner* italic**`) and to `<speaker="…">` wrappers in group chats — taking one delimiter without
+  its partner would leave the other stranded in the message, so the rewrite is refused instead.
+- **The message may have changed since you selected the text.** Marinara writes to messages from several places —
+  swipes, regenerates, and automatic background messages — and its save endpoint is last-write-wins. Before
+  applying, undoing, or redoing, the extension re-reads the message and compares it. If something else wrote to it
+  in the meantime you get a prompt naming what happened, with **Cancel** as the default; nothing is overwritten
+  unless you choose to. Independently, if the surrounding text moved enough that the extension can no longer be
+  sure which occurrence you picked, it refuses rather than rewriting the wrong one.
+- **Very large prompts get trimmed.** Marinara's inference endpoint caps the prompt, so if your selection plus all
+  enabled context exceeds the budget, the lowest-priority context is dropped first (previous messages, then
+  Extender memory, lorebook, character card, persona, surrounding prose) and a toast tells you what was dropped.
+  Your selection is never trimmed — if it alone is over budget, the rewrite is refused with a message saying so.
 - **Output quality depends entirely on the configured model.** Small local models in particular may ignore the
   length target, leak the surrounding context into the rewrite, or return commentary instead of just the passage.
 - **Context costs tokens and attention.** Enabling surrounding text, previous messages, lorebook entries, Extender
