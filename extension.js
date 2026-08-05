@@ -415,6 +415,57 @@
   var _loreCache = { key: null, result: null, ts: 0 };
   var _charListCache = null;
 
+  // ── Fence escaping ───────────────────────────────────────────────────────
+  // Context text (lorebook entries, character cards, personas, prior
+  // messages, memory) is interpolated into <tag>...</tag> fences. Most of it
+  // arrives automatically from downloaded character cards and shared
+  // lorebooks the user never reviewed — a literal closing tag inside that
+  // text terminates the fence early and lands the remainder wherever the
+  // system prompt says real instructions live. Neutralize literal open/close
+  // occurrences of the fence tag actually in use. Not general XML escaping —
+  // that would mangle ordinary prose containing "<" and ">", which is common
+  // in fiction.
+  function escFence(text, tag) {
+    if (!text) return text;
+    var openRe  = new RegExp("<\\s*" + tag + "\\b[^>]*>", "gi");
+    var closeRe = new RegExp("<\\s*/\\s*" + tag + "\\s*>", "gi");
+    return String(text).replace(closeRe, "[/" + tag + "]").replace(openRe, "[" + tag + "]");
+  }
+
+  // ── Prompt budget ────────────────────────────────────────────────────────
+  // The engine hard-caps systemPrompt AND userPrompt at 16000 chars each
+  // (packages/server/src/routes/sidecar.routes.ts) via a schema.parse() that
+  // runs before the route's own try/catch, so blowing the cap produces a
+  // generic Fastify validation error, not anything actionable. Each context
+  // piece is capped individually, but nothing ever summed them — a realistic
+  // selection with card + memory + persona + lore + local + prev context
+  // enabled can sum well past 16000. Stay comfortably under the engine's cap
+  // so there's headroom for the task/scaffold text this budget doesn't count.
+  var PROMPT_BUDGET = 14000;
+
+  // Drop context pieces lowest-priority-first until `fixedLen` (the part that
+  // is never trimmed: speaker note + task text + the fenced selection) plus
+  // the surviving pieces fits PROMPT_BUDGET. Mutates `parts` in place,
+  // clearing dropped keys to "", and returns the dropped names in drop order
+  // (empty if nothing needed dropping). Priority, lowest to highest: previous
+  // messages -> extender memory -> lorebook entries -> character card ->
+  // persona -> local surrounding context. The selection itself is never in
+  // `parts` — callers must check `fixedLen` against the budget separately.
+  var CTX_DROP_ORDER = ["prev", "memory", "lore", "card", "persona", "local"];
+  function trimContextToBudget(parts, fixedLen) {
+    var dropped = [];
+    var total = fixedLen;
+    CTX_DROP_ORDER.forEach(function (k) { total += (parts[k] || "").length; });
+    for (var i = 0; i < CTX_DROP_ORDER.length && total > PROMPT_BUDGET; i++) {
+      var k = CTX_DROP_ORDER[i];
+      if (!parts[k]) continue;
+      total -= parts[k].length;
+      parts[k] = "";
+      dropped.push(k);
+    }
+    return dropped;
+  }
+
   // ── Helpers ───────────────────────────────────────────────────────────────
   function getChatId() {
     var fromStore = localStorage.getItem("marinara-active-chat-id");
@@ -423,9 +474,12 @@
     return el ? el.getAttribute("data-chat-id") : null;
   }
 
+  // Capped at 8 characters — a group chat's character list is otherwise
+  // unbounded and, summed with the other context pieces, was the main
+  // contributor to prompts blowing past the engine's 16000-char cap.
   function buildCharCardContext(chars) {
     var parts = [];
-    chars.forEach(function (char) {
+    chars.slice(0, 8).forEach(function (char) {
       var data = {};
       try { data = typeof char.data === "string" ? JSON.parse(char.data) : char.data || {}; } catch (e) {}
       var name        = data.name        || char.name        || "";
@@ -437,7 +491,7 @@
       if (description) lines.push("Description: " + description.slice(0, 200));
       if (lines.length) parts.push(lines.join("\n"));
     });
-    return parts.length ? "\n\n<character note=\"Match this character's voice, register, and speech style.\">\n" + parts.join("\n\n") + "\n</character>" : "";
+    return parts.length ? "\n\n<character note=\"Match this character's voice, register, and speech style.\">\n" + escFence(parts.join("\n\n"), "character") + "\n</character>" : "";
   }
 
   function fetchCharCard(cid) {
@@ -476,7 +530,7 @@
         var combined = parts.join("\n");
         var ws = combined.split(/\s+/);
         if (ws.length > 500) combined = ws.slice(0, 500).join(" ") + "\u2026";
-        var result = "\n\n<lore note=\"World facts for continuity — reference only.\">\n" + combined + "\n</lore>";
+        var result = "\n\n<lore note=\"World facts for continuity — reference only.\">\n" + escFence(combined, "lore") + "\n</lore>";
         _loreCache = { key: key, result: result, ts: Date.now() };
         return result;
       })
@@ -493,9 +547,9 @@
       if (idx < 1) return "";
       var sl = msgs.slice(Math.max(0, idx - n), idx);
       if (!sl.length) return "";
-      return "\n\n<context note=\"Preceding messages — reference only, do not rewrite.\">\n" + sl.map(function (m) {
+      return "\n\n<context note=\"Preceding messages — reference only, do not rewrite.\">\n" + escFence(sl.map(function (m) {
         return (m.role || "user").toUpperCase() + ": " + (m.content || "").slice(0, 300);
-      }).join("\n") + "\n</context>";
+      }).join("\n"), "context") + "\n</context>";
     }).catch(function () { return ""; });
   }
 
@@ -507,7 +561,7 @@
     if (p.personality) lines.push("Personality: " + String(p.personality).slice(0, 200));
     if (p.appearance)  lines.push("Appearance: " + String(p.appearance).slice(0, 150));
     return lines.length
-      ? "\n\n<persona note=\"This is the human user's persona. When rewriting their own message, keep their voice and self-description.\">\n" + lines.join("\n") + "\n</persona>"
+      ? "\n\n<persona note=\"This is the human user's persona. When rewriting their own message, keep their voice and self-description.\">\n" + escFence(lines.join("\n"), "persona") + "\n</persona>"
       : "";
   }
 
@@ -592,7 +646,7 @@
     var parts = [];
     if (ctxBefore) parts.push("Before: " + ctxBefore);
     if (ctxAfter)  parts.push("After: "  + ctxAfter);
-    return parts.length ? "\n\n<context note=\"Surrounding prose — reference only, do not rewrite.\">\n" + parts.join("\n\n") + "\n</context>" : "";
+    return parts.length ? "\n\n<context note=\"Surrounding prose — reference only, do not rewrite.\">\n" + escFence(parts.join("\n\n"), "context") + "\n</context>" : "";
   }
 
   // ── Marinara Extender: character-memory fetch ─────────────────────────────
@@ -612,9 +666,13 @@
   }
 
   function fenceMemory(inner) {
-    return inner
-      ? "\n\n<memory note=\"Character & world memory — reference only, do not rewrite.\">\n" + inner + "\n</memory>"
-      : "";
+    if (!inner) return "";
+    // Was uncapped — unlike lore/local/prev/persona, which all already cap
+    // their contribution. Mirror lore's word cap so one big memory block
+    // can't dominate the prompt budget on its own.
+    var ws = inner.split(/\s+/);
+    if (ws.length > 400) inner = ws.slice(0, 400).join(" ") + "…";
+    return "\n\n<memory note=\"Character & world memory — reference only, do not rewrite.\">\n" + escFence(inner, "memory") + "\n</memory>";
   }
 
   function fetchExtenderLorebookIds() {
@@ -1801,6 +1859,28 @@
             target + " words (range " + lo + "\u2013" + hi + ").";
         }
 
+        // Task/selection scaffold — never trimmed; the selection is sent whole
+        // or not at all.
+        var taskBlock = "Task: " + profile.prompt + lengthNote +
+          "\n\nRewrite only the text inside <rewrite_this>. Output the rewritten passage and nothing else.\n" +
+          "<rewrite_this>\n" + escFence(safeText, "rewrite_this") + "\n</rewrite_this>";
+        var fixedLen = speakerCtx.length + taskBlock.length + 2; // +2 for the ctxBlock/task join
+        if (fixedLen > PROMPT_BUDGET) {
+          showModalErr(ov, body,
+            "The selected text alone (~" + fixedLen + " chars) exceeds the " + PROMPT_BUDGET +
+            "-char prompt budget even with no other context. Select a smaller passage."
+          );
+          return;
+        }
+        var ctxParts = { card: cardCtx, memory: memCtx, persona: personaCtx, lore: loreCtx, local: localCtx, prev: prevCtx };
+        var trimmedOut = trimContextToBudget(ctxParts, fixedLen);
+        cardCtx = ctxParts.card; memCtx = ctxParts.memory; personaCtx = ctxParts.persona;
+        loreCtx = ctxParts.lore; localCtx = ctxParts.local; prevCtx = ctxParts.prev;
+        if (trimmedOut.length) {
+          logDbg("rewrite.budget.trim", { dropped: trimmedOut, budget: PROMPT_BUDGET });
+          showToast(null, "Context trimmed to fit the prompt size limit (dropped: " + trimmedOut.join(", ") + ")", "");
+        }
+
         // Order: speaker first, then card -> memory -> persona -> lore -> local -> prev.
         var ctxBlock = (speakerCtx + cardCtx + memCtx + personaCtx + loreCtx + localCtx + prevCtx).replace(/^\n+/, "");
         logDbg("rewrite.assemble", {
@@ -1808,12 +1888,9 @@
           lengthNote: lengthNote || null,
           ctxChars: { speaker: speakerCtx.length, character: cardCtx.length, memory: memCtx.length, persona: personaCtx.length, lore: loreCtx.length, surrounding: localCtx.length, prevMessages: prevCtx.length },
           ctxEnabled: { charCard: !!cfg.useCharCard, userPersona: !!cfg.useUserPersona, lorebook: !!cfg.useLorebookEntries, surrounding: !!cfg.localContextEnabled, prevMessages: !!cfg.usePrevMessages, extenderMemory: !!cfg.useExtenderMemory, speakerAware: !!cfg.speakerAware },
+          budgetDropped: trimmedOut.length ? trimmedOut : null,
         });
-        var userPrompt =
-          (ctxBlock ? ctxBlock + "\n\n" : "") +
-          "Task: " + profile.prompt + lengthNote +
-          "\n\nRewrite only the text inside <rewrite_this>. Output the rewritten passage and nothing else.\n" +
-          "<rewrite_this>\n" + safeText + "\n</rewrite_this>";
+        var userPrompt = (ctxBlock ? ctxBlock + "\n\n" : "") + taskBlock;
 
         // Token estimate: total = system + full user prompt; highlighted = the
         // selection; prompt = everything else (system + task + context + scaffold).
@@ -1947,7 +2024,7 @@
     if (before) parts.push("Preceding section (end): …" + before.slice(-300));
     if (after)  parts.push("Following section (start): " + after.slice(0, 300) + "…");
     return parts.length
-      ? "<context note=\"Surrounding sections — reference only, do not rewrite.\">\n" + parts.join("\n\n") + "\n</context>"
+      ? "<context note=\"Surrounding sections — reference only, do not rewrite.\">\n" + escFence(parts.join("\n\n"), "context") + "\n</context>"
       : "";
   }
 
@@ -2027,7 +2104,7 @@
       var userPrompt = (ctxNote ? ctxNote + "\n\n" : "") +
         "Task: " + profile.prompt + lengthNote +
         "\n\nThis is one section of a longer passage. Rewrite only the text inside <rewrite_this>, keeping continuity with the surrounding sections. Output the rewritten passage and nothing else.\n" +
-        "<rewrite_this>\n" + sl.text + "\n</rewrite_this>";
+        "<rewrite_this>\n" + escFence(sl.text, "rewrite_this") + "\n</rewrite_this>";
       runInference(sysPrompt(), userPrompt, controller.signal).then(function (resp) {
         if (!ov.parentNode || !resp || resp.aborted) return;
         if (resp.error) { sl.status = "error"; saveLedger(ledger.key, ledger); renderList(); updateStatus(); return; }
@@ -2108,17 +2185,34 @@
           var lo = Math.max(1, Math.round(target * 0.85)), hi = Math.round(target * 1.15);
           lengthNote = "\n\nLength: the original is " + ow + " words; rewrite to approximately " + target + " words (range " + lo + "–" + hi + ").";
         }
-        // Order: speaker first, then card -> memory -> persona -> lore -> local -> prev.
-        var ctxBlock = (speakerCtxM + cardCtxM + memCtxM + personaCtxM + loreCtxM + localCtxMerge + prevCtxM).replace(/^\n+/, "");
         var markerNote = "\n\nThe passage contains " + (segments.length - 1) +
           " markers like [[SECTION 2]], [[SECTION 3]] that separate parts which belong to different messages. " +
           "Keep every [[SECTION n]] marker exactly as written, on its own line, in the same order. Do not add, remove, renumber, or move them.";
-        var userPrompt =
-          (ctxBlock ? ctxBlock + "\n\n" : "") +
-          "Task: " + profile.prompt + lengthNote + markerNote +
+        // Task/selection scaffold — never trimmed; the merged selection is
+        // sent whole or not at all (its own 12000-char cap is applied above).
+        var taskBlockM = "Task: " + profile.prompt + lengthNote + markerNote +
           "\n\nRewrite only the text inside <rewrite_this>, preserving the [[SECTION n]] markers. Output the rewritten passage and nothing else.\n" +
-          "<rewrite_this>\n" + safeMerged + "\n</rewrite_this>";
-        logDbg("rewrite.merge.request", { messages: segments.length, mergedChars: merged.length });
+          "<rewrite_this>\n" + escFence(safeMerged, "rewrite_this") + "\n</rewrite_this>";
+        var fixedLenM = speakerCtxM.length + taskBlockM.length + 2;
+        if (fixedLenM > PROMPT_BUDGET) {
+          showModalErr(ov, body,
+            "The merged selection alone (~" + fixedLenM + " chars) exceeds the " + PROMPT_BUDGET +
+            "-char prompt budget even with no other context. Merge fewer messages or select less text."
+          );
+          return;
+        }
+        var ctxPartsM = { card: cardCtxM, memory: memCtxM, persona: personaCtxM, lore: loreCtxM, local: localCtxMerge, prev: prevCtxM };
+        var trimmedOutM = trimContextToBudget(ctxPartsM, fixedLenM);
+        cardCtxM = ctxPartsM.card; memCtxM = ctxPartsM.memory; personaCtxM = ctxPartsM.persona;
+        loreCtxM = ctxPartsM.lore; localCtxMerge = ctxPartsM.local; prevCtxM = ctxPartsM.prev;
+        if (trimmedOutM.length) {
+          logDbg("rewrite.merge.budget.trim", { dropped: trimmedOutM, budget: PROMPT_BUDGET });
+          showToast(null, "Context trimmed to fit the prompt size limit (dropped: " + trimmedOutM.join(", ") + ")", "");
+        }
+        // Order: speaker first, then card -> memory -> persona -> lore -> local -> prev.
+        var ctxBlock = (speakerCtxM + cardCtxM + memCtxM + personaCtxM + loreCtxM + localCtxMerge + prevCtxM).replace(/^\n+/, "");
+        var userPrompt = (ctxBlock ? ctxBlock + "\n\n" : "") + taskBlockM;
+        logDbg("rewrite.merge.request", { messages: segments.length, mergedChars: merged.length, budgetDropped: trimmedOutM.length ? trimmedOutM : null });
         return runInference(sysPrompt() + "\n- Preserve any [[SECTION n]] markers exactly, on their own lines, in order.", userPrompt, controller.signal);
       })
       .then(function (resp) {
