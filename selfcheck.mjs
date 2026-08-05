@@ -569,4 +569,25 @@ const _adopt = (ls) =>
   for (const k of CONN) assert.ok(!(k in exported), k + " must not appear in an export");
 }
 console.log("selfcheck: connection-settings isolation assertions passed");
+
+// 9) a null inference response must surface as an error, not as a cancellation.
+// The shim resolves null for a non-JSON body by design, and sidecar mode passes
+// apiFetch's value straight through. Every caller folds `!resp` into the same
+// branch as `resp.aborted`, so without normalization the modal hangs open with no
+// error at all. Normalizing in runInference's shared tail fixes all three callers.
+{
+  assert.ok(_SRC.includes('if (!resp) resp = { error:'), "drift: runInference no longer normalizes a null response");
+  // the shape all three callers then take
+  const handle = (resp) => {
+    if (!resp) resp = { error: "The server returned an unreadable response (not JSON)." };
+    if (resp.aborted) return "silent-cancel";
+    if (resp.error) return "error:" + resp.error;
+    return "result:" + resp.result;
+  };
+  assert.ok(handle(null).startsWith("error:"), "a null response must reach an error path");
+  assert.equal(handle({ aborted: true }), "silent-cancel", "a genuine abort must still no-op");
+  assert.equal(handle({ result: "hi" }), "result:hi", "a good response is unaffected");
+  assert.ok(handle({ error: "HTTP 500" }).startsWith("error:"), "an explicit error still surfaces");
+}
+console.log("selfcheck: null-response handling assertions passed");
 console.log("selfcheck: legacy-namespace adoption assertions passed");

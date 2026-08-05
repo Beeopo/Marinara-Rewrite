@@ -1592,6 +1592,15 @@
         });
     }
     return p.then(function (resp) {
+      // Sidecar mode returns apiFetch's value untouched, and apiFetch resolves null
+      // when the body isn't JSON at all (a proxy error page, a crashed process).
+      // Every caller tests `!resp || resp.aborted` in a single branch, so a null read
+      // as "user cancelled": the Generating… modal stayed open forever with no error,
+      // and a ledger slice sat on "rewriting…" with Accept-all disabled. Genuine
+      // cancels never needed that branch — the Cancel button tears the modal down
+      // itself. Shape it here, the one place all three callers pass through, rather
+      // than teaching each of them the difference.
+      if (!resp) resp = { error: "The server returned an unreadable response (not JSON)." };
       logDbg("inference.response", {
         mode: mode,
         ms: Date.now() - started,
