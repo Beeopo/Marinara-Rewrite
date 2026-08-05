@@ -923,25 +923,20 @@
   //            <b>..</b>). Cutting through the CONTENT is fine and is the common
   //            case; taking one delimiter without its partner is not.
   //
-  // ponytail: regex heuristic, not the engine's tokenizer; upgrade path for
-  // block macros is reusing macro-engine's findBalancedMacroEnd.
+  // ponytail: regex tokens + name stacks, not the engine's tokenizer — it does
+  // not know the engine's tag allowlist or macro arity; upgrade path for block
+  // macros is reusing macro-engine's findBalancedMacroEnd.
   var OPAQUE_RE = /\{\{[\s\S]*?\}\}|```[\s\S]*?```|`[^`\n]*`|!\[[^\]\n]*\]\([^)\s]*\)|\\[\s\S]|<[A-Za-z][^<>]*\/>/g;
   var EMPH_RE   = /(\*\*\*|\*\*|~~|==|__|\*|_)(?!\1)([\s\S]*?)\1/g;
   var LINK_RE   = /\[([^\]\n]*)\]\(([^)\s]*)\)/g;
-  // (?![A-Za-z0-9]) pins the tag-name boundary: without it, the name atom
-  // [A-Za-z0-9]* and the attribute atom [^<>]* both match the same run of
-  // characters, so on an unclosed "<" + long alnum run every failed overall
-  // match re-partitions the run between them — quadratic backtracking. For
-  // any well-formed tag the lookahead is vacuous (whitespace, =, ", /, or >
-  // follows the name); it only prunes the doomed re-partitions.
-  var TAG_RE    = /<([A-Za-z][A-Za-z0-9]*)(?![A-Za-z0-9])[^<>]*>[\s\S]*?<\/\1\s*>/g;
-  // A block macro's two delimiters each match OPAQUE_RE on their own, so the
-  // OPAQUE rule only stops a cut THROUGH one of them — a span could take
-  // {{#if}} whole and leave {{/if}} behind, halving the construct. Pairing them
-  // is what refuses that. (?![\w-]) pins the name boundary for the same reason
-  // TAG_RE needs it: the name atom and [^{}]* both match word characters, so an
-  // unclosed "{{#" + long run re-partitions quadratically without it.
-  var BLOCK_RE  = /\{\{#([A-Za-z_][\w-]*)(?![\w-])[^{}]*\}\}[\s\S]*?\{\{\/\1\s*\}\}/g;
+  // Tags and block macros pair by NAME with proper LIFO nesting. A lazy
+  // open-to-close regex pairs an outer opener with an inner closer on
+  // same-named nesting, leaving the TRUE outer closer in no pair at all —
+  // a span could then take it, or everything before it, and orphan it.
+  // One linear scan, no backtracking ambiguity (boundary lookaheads: without
+  // them the name atom and the attribute atom match the same run, so an
+  // unclosed "<" or "{{#" plus a long word run re-partitions quadratically).
+  var PAIR_TOK_RE = /<(\/?)([A-Za-z][A-Za-z0-9]*)(?![A-Za-z0-9])[^<>]*>|\{\{(#|\/)([A-Za-z_][\w-]*)(?![\w-])[^{}]*\}\}/g;
   function spanIsBalanced(A, as, ae) {
     var t, m, i, pairs = [], ov = function (s, e) { return as < e && ae > s; };
     OPAQUE_RE.lastIndex = 0;
@@ -966,22 +961,24 @@
       var ls = m.index;
       pairs.push([ls, ls + 1, ls + 1 + m[1].length, ls + m[0].length]);
     }
-    TAG_RE.lastIndex = 0;
-    while ((m = TAG_RE.exec(A))) {
-      var ts = m.index, raw = m[0];
-      pairs.push([ts, ts + raw.indexOf(">") + 1, ts + raw.lastIndexOf("</"), ts + raw.length]);
-      // Same nesting problem as emphasis, and worse here: the engine renders
-      // <speaker="…">…</speaker> as a wrapper, so in any multi-character chat every
-      // inner <b>/<i> is a nested pair.
-      TAG_RE.lastIndex = ts + 1;
-    }
-    BLOCK_RE.lastIndex = 0;
-    while ((m = BLOCK_RE.exec(A))) {
-      var bs = m.index, braw = m[0];
-      pairs.push([bs, bs + braw.indexOf("}}") + 2, bs + braw.lastIndexOf("{{/"), bs + braw.length]);
-      // Nested blocks: same rescan trick as TAG_RE — a /g/ scan leaves
-      // lastIndex past the close, so an inner block never registers.
-      BLOCK_RE.lastIndex = bs + 1;
+    // Nesting is the whole point here: the engine renders <speaker="…">…</speaker>
+    // as a wrapper, so in any multi-character chat every inner <b>/<i> is a nested
+    // pair, and blocks nest by name too. A stack per name closes each opener with
+    // its OWN closer, so all of them register — including the outermost.
+    var stacks = {};
+    PAIR_TOK_RE.lastIndex = 0;
+    while ((m = PAIR_TOK_RE.exec(A))) {
+      // Key by kind + name so a <if> tag can never pair a {{/if}} macro.
+      var isClose = m[1] === "/" || m[3] === "/";
+      var key = (m[2] !== undefined ? "t:" + m[2] : "m:" + m[4]);
+      if (!isClose) {
+        (stacks[key] || (stacks[key] = [])).push([m.index, m.index + m[0].length]);
+      } else {
+        var open = stacks[key] && stacks[key].pop();
+        // An unmatched closer (empty stack) or an unmatched opener (left on the
+        // stack at the end) forms no pair — nothing to orphan, so nothing to refuse.
+        if (open) pairs.push([open[0], open[1], m.index, m.index + m[0].length]);
+      }
     }
     // Exactly one delimiter of a pair inside the cut orphans the other.
     for (i = 0; i < pairs.length; i++) {

@@ -189,28 +189,18 @@ assert.equal(typeof _alignExact, "function", "aligner extraction failed — asse
 assert.equal(typeof _spanIsBalanced, "function", "spanIsBalanced extraction failed");
 assert.equal(_spanIsBalanced("**bold** text", 2, 9), false, "extraction sanity: the shipped guard must reject an orphaning span");
 assert.equal(_spanIsBalanced("plain text here", 0, 5), true, "extraction sanity: the shipped guard must allow a clean span");
-// TAG_RE ReDoS guard: "<" + long alnum run made the name/attr alternation
-// ambiguous — each failed close re-split the run, quadratically. 618 ms at
-// 40k chars, in the hot path of every splice on large messages.
-{
-  const evil = "<" + "a".repeat(40000) + " end";
+// ReDoS guard for the pair tokenizer, both constructs. An unclosed "<" or
+// "{{#" followed by a long word run makes the name atom and the attribute atom
+// ambiguous — each failed close re-splits the run, quadratically. Measured
+// 618 ms (tag) and 686 ms (macro) at 40k chars without the name-boundary
+// lookaheads, in the hot path of every splice on large messages.
+for (const evil of ["<" + "a".repeat(40000) + " end", "{{#" + "a".repeat(40000)]) {
   const t0 = Date.now();
   _spanIsBalanced(evil, 5, 25);
   const ms = Date.now() - t0;
-  assert.ok(ms < 100, "TAG_RE quadratic backtracking is back: " + ms + "ms on 40k pathological input");
+  assert.ok(ms < 100, "quadratic backtracking is back: " + ms + "ms on 40k of " + evil.slice(0, 3));
 }
-// BLOCK_RE has the same shape and the same trap: the name atom and the
-// attribute atom both match word characters, so an unclosed "{{#" + long run
-// re-partitions it on every failed close. Measured 686 ms at 40k without the
-// name-boundary lookahead.
-{
-  const evil = "{{#" + "a".repeat(40000);
-  const t0 = Date.now();
-  _spanIsBalanced(evil, 5, 25);
-  const ms = Date.now() - t0;
-  assert.ok(ms < 100, "BLOCK_RE quadratic backtracking: " + ms + "ms on 40k pathological input");
-}
-// The lookahead must not change verdicts on well-formed input.
+// The lookaheads must not change verdicts on well-formed input.
 assert.equal(_spanIsBalanced("x <b>bold</b> y", 0, 6), false, "cut through an open-tag delimiter must refuse");
 assert.equal(_spanIsBalanced("x <b>bold</b> y", 2, 13), true, "covering the whole tag pair is fine");
 assert.equal(_spanIsBalanced('say <speaker="A">line</speaker> end', 0, 8), false, "cut through a speaker wrapper must refuse");
@@ -241,6 +231,18 @@ assert.equal(_spanIsBalanced("<abc123>content</abc>", 9, 16), true,
   // Unchanged behaviour:
   assert.equal(_spanIsBalanced("say {{char}} here", 2, 8), false, "plain macro mid-cut still refuses (OPAQUE rule)");
   assert.equal(_spanIsBalanced("open {{#if x}} never closed", 0, 14), true, "unclosed block degrades to independent tokens");
+  // Same-named nesting: the lazy-regex approach paired the outer opener
+  // with the INNER closer, leaving the true outer closer in no pair.
+  const S = "{{#if a}}x{{#if b}}y{{/if}}z{{/if}}";
+  const outerClose = S.lastIndexOf("{{/if}}");
+  assert.equal(_spanIsBalanced(S, 0, outerClose), false, "same-name nested: taking all but the outer closer must refuse");
+  assert.equal(_spanIsBalanced(S, outerClose, S.length), false, "same-name nested: taking only the outer closer must refuse");
+  const T = "<b>x<b>y</b>z</b>";
+  assert.equal(_spanIsBalanced(T, 0, T.lastIndexOf("</b>")), false, "same-name nested tags: outer closer must not be orphanable");
+  // [4,12) is exactly the inner <b>y</b> — both ends of the inner pair inside,
+  // both ends of the outer pair outside. The mis-scoped outer pair (opener at 0,
+  // closer wrongly at the INNER close) straddled this span and refused it.
+  assert.equal(_spanIsBalanced(T, 4, 12), true, "same-name nested tags: the inner pair covered whole is fine");
 }
 function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
 // clean boundaries MUST splice exactly:
