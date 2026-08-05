@@ -923,9 +923,8 @@
   //            <b>..</b>). Cutting through the CONTENT is fine and is the common
   //            case; taking one delimiter without its partner is not.
   //
-  // ponytail: regex heuristic, not the engine's tokenizer. Block macros
-  // ({{#if}}..{{/if}}) still pass as two independent tokens and can be halved;
-  // upgrade path is reusing macro-engine's findBalancedMacroEnd.
+  // ponytail: regex heuristic, not the engine's tokenizer; upgrade path for
+  // block macros is reusing macro-engine's findBalancedMacroEnd.
   var OPAQUE_RE = /\{\{[\s\S]*?\}\}|```[\s\S]*?```|`[^`\n]*`|!\[[^\]\n]*\]\([^)\s]*\)|\\[\s\S]|<[A-Za-z][^<>]*\/>/g;
   var EMPH_RE   = /(\*\*\*|\*\*|~~|==|__|\*|_)(?!\1)([\s\S]*?)\1/g;
   var LINK_RE   = /\[([^\]\n]*)\]\(([^)\s]*)\)/g;
@@ -936,6 +935,13 @@
   // any well-formed tag the lookahead is vacuous (whitespace, =, ", /, or >
   // follows the name); it only prunes the doomed re-partitions.
   var TAG_RE    = /<([A-Za-z][A-Za-z0-9]*)(?![A-Za-z0-9])[^<>]*>[\s\S]*?<\/\1\s*>/g;
+  // A block macro's two delimiters each match OPAQUE_RE on their own, so the
+  // OPAQUE rule only stops a cut THROUGH one of them — a span could take
+  // {{#if}} whole and leave {{/if}} behind, halving the construct. Pairing them
+  // is what refuses that. (?![\w-]) pins the name boundary for the same reason
+  // TAG_RE needs it: the name atom and [^{}]* both match word characters, so an
+  // unclosed "{{#" + long run re-partitions quadratically without it.
+  var BLOCK_RE  = /\{\{#([A-Za-z_][\w-]*)(?![\w-])[^{}]*\}\}[\s\S]*?\{\{\/\1\s*\}\}/g;
   function spanIsBalanced(A, as, ae) {
     var t, m, i, pairs = [], ov = function (s, e) { return as < e && ae > s; };
     OPAQUE_RE.lastIndex = 0;
@@ -968,6 +974,14 @@
       // <speaker="…">…</speaker> as a wrapper, so in any multi-character chat every
       // inner <b>/<i> is a nested pair.
       TAG_RE.lastIndex = ts + 1;
+    }
+    BLOCK_RE.lastIndex = 0;
+    while ((m = BLOCK_RE.exec(A))) {
+      var bs = m.index, braw = m[0];
+      pairs.push([bs, bs + braw.indexOf("}}") + 2, bs + braw.lastIndexOf("{{/"), bs + braw.length]);
+      // Nested blocks: same rescan trick as TAG_RE — a /g/ scan leaves
+      // lastIndex past the close, so an inner block never registers.
+      BLOCK_RE.lastIndex = bs + 1;
     }
     // Exactly one delimiter of a pair inside the cut orphans the other.
     for (i = 0; i < pairs.length; i++) {

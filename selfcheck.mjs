@@ -199,6 +199,17 @@ assert.equal(_spanIsBalanced("plain text here", 0, 5), true, "extraction sanity:
   const ms = Date.now() - t0;
   assert.ok(ms < 100, "TAG_RE quadratic backtracking is back: " + ms + "ms on 40k pathological input");
 }
+// BLOCK_RE has the same shape and the same trap: the name atom and the
+// attribute atom both match word characters, so an unclosed "{{#" + long run
+// re-partitions it on every failed close. Measured 686 ms at 40k without the
+// name-boundary lookahead.
+{
+  const evil = "{{#" + "a".repeat(40000);
+  const t0 = Date.now();
+  _spanIsBalanced(evil, 5, 25);
+  const ms = Date.now() - t0;
+  assert.ok(ms < 100, "BLOCK_RE quadratic backtracking: " + ms + "ms on 40k pathological input");
+}
 // The lookahead must not change verdicts on well-formed input.
 assert.equal(_spanIsBalanced("x <b>bold</b> y", 0, 6), false, "cut through an open-tag delimiter must refuse");
 assert.equal(_spanIsBalanced("x <b>bold</b> y", 2, 13), true, "covering the whole tag pair is fine");
@@ -215,6 +226,22 @@ assert.equal(_spanIsBalanced("a < b and c > d", 0, 5), true, "comparison operato
 // backtracking. See commit 0f688fe.
 assert.equal(_spanIsBalanced("<abc123>content</abc>", 9, 16), true,
   "mismatched-name pseudo-tags must not register as a pair");
+// Block macros: {{#if}}...{{/if}} was two independent OPAQUE tokens - a span
+// could take the opener without the closer and halve the construct.
+{
+  const D = "start {{#if flag}}inside text{{/if}} end";
+  const o0 = D.indexOf("{{#if"), o1 = D.indexOf("}}", o0) + 2;
+  const c0 = D.indexOf("{{/if}}"), c1 = c0 + "{{/if}}".length;
+  assert.equal(_spanIsBalanced(D, 0, o1), false, "taking the opener without the closer must refuse");
+  assert.equal(_spanIsBalanced(D, c0, D.length), false, "taking the closer without the opener must refuse");
+  assert.equal(_spanIsBalanced(D, o1, c0), true, "editing the content between the delimiters is fine");
+  assert.equal(_spanIsBalanced(D, o0, c1), true, "covering the whole block is fine");
+  const N = "{{#if a}}x{{#if b}}y{{/if}}z{{/if}}";
+  assert.equal(_spanIsBalanced(N, 0, N.indexOf("y")), false, "nested inner-delimiter cut must refuse");
+  // Unchanged behaviour:
+  assert.equal(_spanIsBalanced("say {{char}} here", 2, 8), false, "plain macro mid-cut still refuses (OPAQUE rule)");
+  assert.equal(_spanIsBalanced("open {{#if x}} never closed", 0, 14), true, "unclosed block degrades to independent tokens");
+}
 function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
 // clean boundaries MUST splice exactly:
 assert.equal(_spl("hello world", "hello world", 6, 11, "X"), "hello X");           // identity
