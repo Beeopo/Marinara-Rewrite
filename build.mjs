@@ -31,11 +31,11 @@ try {
 //    See packages/client/src/lib/personal-extension-import.ts in the engine.
 const MANIFEST = {
   name: "Rewrite Assistant",
-  version: "6.0.0",
+  version: "6.1.0",
   description:
-    "Highlight text in any message to rewrite with AI. v6.0: Marinara Engine v2.4 " +
-    "Personal Extensions — full-page capability, host compatibility shim, " +
-    "manifest-owned stylesheet, and a fixed storage namespace that survives re-imports.",
+    "Highlight text in any message to rewrite with AI. v6.1: rewrites run through " +
+    "your existing Marinara connections by default — the API key stays server-side, " +
+    "the extension never stores a copy. Built for Marinara Engine v2.4 Personal Extensions.",
   runtime: "client",
   capabilities: ["full_page_access"],
 };

@@ -56,8 +56,12 @@ section of text in a message using an AI model. Select text, choose a mode, and 
 
 ### Connection
 
-- The built-in **Marinara sidecar**, the **Marinara Extender** proxy (one local model serves rewrites and memory),
-  or a **direct OpenAI-compatible API** (Ollama, LM Studio, llama.cpp, etc.).
+- **Your Marinara connections** (the default) — pick any chat connection you already configured in Marinara
+  (OpenRouter, NanoGPT, a local endpoint, …) from a dropdown. The rewrite runs through the Marinara server, so
+  your API key stays there — the extension never sees or stores it.
+- Alternatively: Marinara's **downloaded local model** (the sidecar — requires downloading it in Marinara's
+  Connections panel first), the **Marinara Extender** proxy (one local model serves rewrites and memory), or a
+  **direct OpenAI-compatible API** (Ollama, LM Studio, llama.cpp, etc.).
 - For direct mode: endpoint **presets** for common local servers, a **Discover models** button, optional API key,
   and a temperature control.
 
@@ -116,7 +120,8 @@ Source lives in [`extension.js`](extension.js) and [`extension.css`](extension.c
 
 ## Direct API configuration
 
-By default the extension uses the Marinara sidecar. To use a local OpenAI-compatible endpoint instead:
+By default the extension runs rewrites through a Marinara connection you pick in Settings → Connection. To use a
+local OpenAI-compatible endpoint directly instead:
 
 1. Open Settings → Connection and select Direct API.
 2. Set the URL (use a preset, or e.g. `http://localhost:11434/v1` for Ollama), then **Discover models** or type the
@@ -154,11 +159,13 @@ and splice the new text in. Most failures happen at that second step, not the ge
   (`**bold with *inner* italic**`) and to `<speaker="…">` wrappers in group chats — taking one delimiter without
   its partner would leave the other stranded in the message, so the rewrite is refused instead.
 - **The message may have changed since you selected the text.** Marinara writes to messages from several places —
-  swipes, regenerates, and automatic background messages — and its save endpoint is last-write-wins. Before
-  applying, undoing, or redoing, the extension re-reads the message and compares it. If something else wrote to it
-  in the meantime you get a prompt naming what happened, with **Cancel** as the default; nothing is overwritten
-  unless you choose to. Independently, if the surrounding text moved enough that the extension can no longer be
-  sure which occurrence you picked, it refuses rather than rewriting the wrong one.
+  swipes, regenerates, and automatic background messages — and its save endpoint is last-write-wins. Every write
+  the extension makes re-reads the stored message first. An **apply** re-locates your selection in the current
+  text and splices into it, so a write that landed since you selected is preserved around the rewrite — and if the
+  surrounding text moved enough that the extension can no longer be sure which occurrence you picked, it refuses
+  rather than rewriting the wrong one. **Undo and redo** compare against what the extension itself last wrote: if
+  something else wrote to the message in between, you get a prompt naming what happened, with **Cancel** as the
+  default — nothing is replaced unless you choose to.
 - **Very large prompts get trimmed.** Marinara's inference endpoint caps the prompt, so if your selection plus all
   enabled context exceeds the budget, the lowest-priority context is dropped first (previous messages, then
   Extender memory, lorebook, character card, persona, surrounding prose) and a toast tells you what was dropped.

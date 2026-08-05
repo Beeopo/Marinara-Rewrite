@@ -1,5 +1,21 @@
 # Changelog
 
+## v6.1 — Marinara-connection mode
+
+- **Added:** a new default **Model source: Marinara connection** — rewrites run
+  through any chat connection you already configured in Marinara, picked from a
+  dropdown in Settings → Connection. The API key stays on the Marinara server; the
+  extension never sees or stores a copy.
+- **Fixed:** the old default ("Local Sidecar") pointed at Marinara's *downloaded
+  local model* and failed with "Sidecar model is not available" on every install
+  that never downloaded one. Existing configs still carrying that default are
+  migrated to the new mode once; picking the local model in Settings afterwards is
+  respected and never overridden again.
+- **Fixed:** errors in the new mode are labelled "Connection error" and point at
+  the connection picker, instead of blaming the local sidecar.
+- The selected connection id is excluded from settings export/import, like every
+  other connection setting.
+
 ## v6.0 — Marinara Engine v2.4 Personal Extensions
 
 Marinara 2.4 replaced its extension system (`extensions` → `personal-extensions`,
