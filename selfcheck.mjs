@@ -289,6 +289,20 @@ for (const [A, sel, want] of [
   ["Open foo_bar.txt now.", "foo_bar.txt now", "Open X."],
   ["She checked the log_file for the 3 * 4 grid.", "log_file for the 3 * 4 grid", "She checked the X."],
 ]) assert.equal(_bisect(A, A, sel), want, "must not refuse transform-free prose: " + JSON.stringify(sel));
+// Transform-free identity: if rendered === stored, the engine transformed
+// nothing, so no marker is active formatting and refusal protects nothing.
+{
+  const doc = "prices: 5 * 3 * 2 * 1 sale";
+  assert.deepEqual(_mapRenderedSpanToRaw(doc, doc, 10, 16), { as: 10, ae: 16 },
+    "transform-free prose must identity-map across literal markers, not refuse");
+  const doc2 = "plain text_with_underscores here";
+  assert.deepEqual(_mapRenderedSpanToRaw(doc2, doc2, 6, 20), { as: 6, ae: 20 },
+    "identity map must also cover literal underscores");
+  // Bounds checks still run BEFORE the identity shortcut:
+  assert.equal(_mapRenderedSpanToRaw(doc, doc, -1, 5), null, "negative start still refused");
+  assert.equal(_mapRenderedSpanToRaw(doc, doc, 5, doc.length + 1), null, "overlong end still refused");
+  assert.equal(_mapRenderedSpanToRaw("", "", 0, 0), null, "empty strings still refused");
+}
 // unanchorable large input (no shared runs) returns null -> copy fallback
 assert.equal(_mapRenderedSpanToRaw("a".repeat(2001), "b".repeat(2001), 0, 1), null);
 console.log("selfcheck: span-alignment assertions passed");

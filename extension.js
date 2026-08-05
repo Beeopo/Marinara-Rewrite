@@ -1200,6 +1200,13 @@
     var n = R.length, m = A.length;
     if (!n || !m) return null;
     if (rs < 0 || re > n || re < rs) return null;
+    // Rendered text identical to stored text means the engine transformed
+    // NOTHING in this message: no macro expanded, no marker stripped, no quote
+    // curled. Every "*" or "_" the user sees is a literal character, not
+    // formatting — orphaning is impossible, and the splice replaces exactly
+    // what was on screen. The balance heuristic exists to protect transforms;
+    // with none present it can only false-refuse. Identity-map and skip it.
+    if (R === A) return { as: rs, ae: re };
     if (n * m <= 4000000) return alignExact(R, A, rs, re);
     var whole = windowMap(R, A, rs, re);
     if (whole) return whole;
