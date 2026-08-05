@@ -882,6 +882,35 @@ console.log("selfcheck: fence-escaping assertions passed");
     assert.deepEqual(calls, [0], "first-segment failure: only the first segment is attempted, not the other two");
   }
 }
+// A DECLINED concurrent-edit overwrite is not success, but it must not be silence
+// either: applyMerged recurses from onDone and aggregates from onFail, so returning
+// without either stalls the chain mid-way and suppresses the very summary this
+// section tests. Under autoApply the overlay is already gone, so feedback is zero.
+// Guard the shipped decline branch directly — it is one `if` and easy to regress.
+{
+  // Every guardedPatch decline that sits on a CHAIN must report. doUndo and doRedo
+  // are standalone, so returning silently there is correct; doCommit and
+  // reviewThenPatch are both reachable from applyMerged, so both must call onFail.
+  // Counting the sites, not matching one, is deliberate: the first version of this
+  // fix patched doCommit and left reviewThenPatch stalling through the same door.
+  assert.equal((_SRC.match(/if \(!res\) \{ if \(onFail\) onFail\(null\); return; \}/g) || []).length, 2,
+    "drift: both chained decline sites (doCommit and reviewThenPatch) must call onFail — one alone still stalls a merge");
+  assert.ok(/function reviewThenPatch\(cid, mid, oldContent, proposed, onDone, onFail\)/.test(_SRC),
+    "drift: reviewThenPatch no longer accepts onFail, so its decline and Cancel cannot report");
+  assert.ok(/reviewThenPatch\(cid, mid, msg\.content, updated, onDone, onFail\)/.test(_SRC),
+    "drift: doCommit no longer forwards onFail into the review path");
+  assert.ok(/mkBtn\("Cancel", null, function \(\) \{ ov\.remove\(\); if \(onFail\) onFail\(null\); \}\)/.test(_SRC),
+    "drift: the review modal's Cancel no longer ends the chain");
+
+  // and the aggregation itself must render that as a partial, not a success
+  const _amSrc = _SRC.slice(_SRC.indexOf("function applyMerged"), _SRC.indexOf("function showMergePreview"));
+  const _sumSrc = _SRC.slice(_SRC.indexOf("function mergeChainSummary"), _SRC.indexOf("function mergeChainDone"));
+  const mergeChainSummary = new Function(_sumSrc + "\nreturn mergeChainSummary;")();
+  assert.match(mergeChainSummary([true, false], 3), /1\/3/,
+    "a decline on segment 2 of 3 must report 1 applied, not silence");
+  assert.match(mergeChainSummary([true, false], 3), /Message 2, Message 3/,
+    "the not-applied list must name the declined segment AND the never-attempted ones");
+}
 console.log("selfcheck: merge-chain aggregation assertions passed");
 console.log("selfcheck: prompt-budget assertions passed");
 
@@ -991,6 +1020,29 @@ console.log("selfcheck: prompt-budget assertions passed");
     let rejected = null;
     await guardedPatch("c1", "m1", "PRE", "NEW", "undo").catch((e) => { rejected = e; });
     assert.ok(rejected && /offline/.test(rejected.message), "a failed re-read must reject (callers already surface it), never write blind");
+  }
+
+  // (f2) ...and a re-read that FAILS WITHOUT REJECTING must refuse too. apiFetch
+  // resolves the parsed body on 4xx/5xx and null on a non-JSON body, so this is the
+  // normal shape of a failed GET — not the rejection case (f) covers. Reading it as
+  // "the message isn't in the list" once let cur == null wave the write through,
+  // disabling the guard exactly when the engine is unhealthy. Twelve earlier
+  // mutations all missed this because every one of them assumed a healthy read.
+  for (const [label, body] of [
+    ["HTTP 500 with an {error} envelope", { error: "Internal Server Error" }],
+    ["Fastify error envelope", { statusCode: 500, error: "Internal Server Error", message: "boom" }],
+    ["non-JSON body (apiFetch resolves null)", null],
+    ["unexpected object instead of an array", { items: [] }],
+  ]) {
+    const patched = [];
+    const guardedPatch = new Function(
+      "invalidateMsgCache", "cachedMessages", "confirmOverwrite", "patchMessage",
+      _gpSrc + "\nreturn guardedPatch;",
+    )(() => {}, () => Promise.resolve(body), () => Promise.resolve(true), (c, m, content) => { patched.push(content); return Promise.resolve({ id: m }); });
+    let threw = null;
+    await guardedPatch("c1", "m1", "PRE", "MY-STALE-REWRITE", "undo").catch((e) => { threw = e; });
+    assert.equal(patched.length, 0, "a non-array re-read (" + label + ") must NOT write — the check failed, it did not pass");
+    assert.ok(threw, "a non-array re-read (" + label + ") must surface as an error, not a silent success");
   }
 
   // ── the three call sites, running the SHIPPED undo/redo bodies ──
