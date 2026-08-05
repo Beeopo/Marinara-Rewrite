@@ -1,0 +1,12 @@
+* text=auto
+
+# extension.js and extension.css are embedded verbatim inside
+# rewrite-assistant.json, with their newlines escaped as CRLF (see build.mjs).
+# selfcheck.mjs compares the two byte-for-byte to catch a forgotten rebuild, so
+# these three must check out with CRLF on every platform — under a plain LF
+# checkout the guard fires a false "stale bundle" on a clean tree.
+extension.js           text eol=crlf
+extension.css          text eol=crlf
+rewrite-assistant.json text eol=crlf
+
+*.png binary
