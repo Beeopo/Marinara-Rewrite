@@ -125,18 +125,30 @@
       // written so far, rather than leaving the current load to boot on a mixed
       // legacy/default state. The sentinel-last ordering still makes a *later*
       // retry safe; this makes the *current* load safe too.
+      // Snapshot the PRIOR value of each key before overwriting it, so a rollback can
+      // restore rather than delete. Recording only "I touched this" and removing it
+      // would erase a real pre-existing value — turning "overwritten with a stale
+      // legacy value" into "gone, fall back to hardcoded defaults", which is worse
+      // than the bug the rollback exists to prevent.
       var written = [];
       try {
         for (var j = 0; j < SUFFIXES.length; j++) {
           var v = localStorage.getItem(old + SUFFIXES[j]);
           if (v !== null) {
+            written.push([SUFFIXES[j], localStorage.getItem(NS + SUFFIXES[j])]);
             localStorage.setItem(NS + SUFFIXES[j], v);
-            written.push(SUFFIXES[j]);
           }
         }
       } catch (e) {
+        // Two phases, and the order matters: restoring with setItem alone fails under
+        // the very quota condition that triggered the rollback. Clear everything this
+        // run touched FIRST — that frees the space — then put the prior values back.
         for (var r = 0; r < written.length; r++) {
-          try { localStorage.removeItem(NS + written[r]); } catch (e2) {}
+          try { localStorage.removeItem(NS + written[r][0]); } catch (e2) {}
+        }
+        for (var r2 = 0; r2 < written.length; r2++) {
+          if (written[r2][1] === null) continue;
+          try { localStorage.setItem(NS + written[r2][0], written[r2][1]); } catch (e3) {}
         }
         return null;
       }
@@ -911,6 +923,13 @@
     while ((m = EMPH_RE.exec(A))) {
       var d = m[1].length, s0 = m.index, e0 = s0 + m[0].length;
       pairs.push([s0, s0 + d, e0 - d, e0]);
+      // Rescan from just past the OPENING delimiter, not past the whole match: a
+      // /g/ scan leaves lastIndex after the close, so a pair nested in the content
+      // never registers, and a pair that never registers can never be checked.
+      // The engine recurses emphasis six deep, so **bold with *inner* italic** is a
+      // live construct — cutting through it used to orphan the inner delimiter.
+      // s0 + d strictly advances, so this cannot loop.
+      EMPH_RE.lastIndex = s0 + d;
     }
     LINK_RE.lastIndex = 0;
     while ((m = LINK_RE.exec(A))) {
@@ -921,6 +940,10 @@
     while ((m = TAG_RE.exec(A))) {
       var ts = m.index, raw = m[0];
       pairs.push([ts, ts + raw.indexOf(">") + 1, ts + raw.lastIndexOf("</"), ts + raw.length]);
+      // Same nesting problem as emphasis, and worse here: the engine renders
+      // <speaker="…">…</speaker> as a wrapper, so in any multi-character chat every
+      // inner <b>/<i> is a nested pair.
+      TAG_RE.lastIndex = ts + 1;
     }
     // Exactly one delimiter of a pair inside the cut orphans the other.
     for (i = 0; i < pairs.length; i++) {
@@ -1134,6 +1157,13 @@
     if ((whi - wlo) * (hi - lo) > 4000000) return null;             // window (incl. whole selection) too big
     var loc = alignExact(R.slice(wlo, whi), A.slice(lo, hi), rs - wlo, re - wlo);
     if (!loc) return null;
+    // alignExact validated the WINDOW SLICE. Window edges are 40-char verbatim
+    // anchors, and inside a long emphasised run the content is verbatim in raw — so
+    // an anchor can legally land BETWEEN a pair's opening and closing delimiter. The
+    // slice then holds one lone delimiter, which yields no pair, and the check waves
+    // through exactly the orphaning it exists to stop. Re-check against the whole
+    // document, the way the per-edge path below already does.
+    if (!spanIsBalanced(A, lo + loc.as, lo + loc.ae)) return null;
     return { as: lo + loc.as, ae: lo + loc.ae };
   }
   // Map a rendered span [rs,re) into raw msg.content coords. Small message: exact
@@ -1760,7 +1790,15 @@
           showToast(null, "✓ Applied", "ok");
           if (onDone) onDone();
         })
-        .catch(function (e) { showErr("Save failed:\n" + (e && e.message ? e.message : String(e))); });
+        .catch(function (e) {
+          // The THIRD exit from this modal, and the one that stayed broken after the
+          // decline and Cancel paths were fixed: a save failure showed its modal and
+          // returned without calling either callback, so a reviewed multi-message
+          // merge stalled with no partial-apply summary — exactly the bug the summary
+          // was added to prevent. Every exit that is not a write must report.
+          showErr("Save failed:\n" + (e && e.message ? e.message : String(e)));
+          if (onFail) onFail("Save failed");
+        });
     })).style.flex = "2";
     ap(ft, mkBtn("Cancel", null, function () { ov.remove(); if (onFail) onFail(null); })).style.flex = "1";
   }
