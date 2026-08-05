@@ -189,6 +189,23 @@ assert.equal(typeof _alignExact, "function", "aligner extraction failed — asse
 assert.equal(typeof _spanIsBalanced, "function", "spanIsBalanced extraction failed");
 assert.equal(_spanIsBalanced("**bold** text", 2, 9), false, "extraction sanity: the shipped guard must reject an orphaning span");
 assert.equal(_spanIsBalanced("plain text here", 0, 5), true, "extraction sanity: the shipped guard must allow a clean span");
+// TAG_RE ReDoS guard: "<" + long alnum run made the name/attr alternation
+// ambiguous — each failed close re-split the run, quadratically. 618 ms at
+// 40k chars, in the hot path of every splice on large messages.
+{
+  const evil = "<" + "a".repeat(40000) + " end";
+  const t0 = Date.now();
+  _spanIsBalanced(evil, 5, 25);
+  const ms = Date.now() - t0;
+  assert.ok(ms < 100, "TAG_RE quadratic backtracking is back: " + ms + "ms on 40k pathological input");
+}
+// The lookahead must not change verdicts on well-formed input.
+assert.equal(_spanIsBalanced("x <b>bold</b> y", 0, 6), false, "cut through an open-tag delimiter must refuse");
+assert.equal(_spanIsBalanced("x <b>bold</b> y", 2, 13), true, "covering the whole tag pair is fine");
+assert.equal(_spanIsBalanced('say <speaker="A">line</speaker> end', 0, 8), false, "cut through a speaker wrapper must refuse");
+assert.equal(_spanIsBalanced("a <b><i>x</i></b> c", 0, 9), false, "nested inner-delimiter cut must refuse");
+assert.equal(_spanIsBalanced("plain <b>unclosed text", 0, 10), true, "an unclosed tag forms no pair");
+assert.equal(_spanIsBalanced("a < b and c > d", 0, 5), true, "comparison operators are not tags");
 function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
 // clean boundaries MUST splice exactly:
 assert.equal(_spl("hello world", "hello world", 6, 11, "X"), "hello X");           // identity
