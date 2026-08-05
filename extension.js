@@ -704,27 +704,64 @@
     if (words.length < 3 && s.trim().length > 10) return Math.ceil(s.trim().length / 2);
     return words.length;
   }
-  // Would replacing this raw span orphan half of a transform token?
+  // Would replacing raw span [as,ae) orphan half of a transform token?
   //
   // The aligner's clean-edge test asks whether each cut sits between two raw-only
   // chars. That misses the case where a macro's raw spelling shares a run with its
   // own rendered expansion: {{char50}} rendering as PersonName50 makes "50" look
   // matched, so a cut lands mid-token and the splice leaves "50}}" behind as literal
-  // text the macro can never expand from again. Checking the SPAN instead of the
-  // edges catches it — "Hi {{char" has an opening {{ with no close.
+  // text the macro can never expand from again. Refuse rather than snap outward:
+  // refusing degrades to the copy fallback — annoying but reversible — whereas
+  // snapping silently eats the emphasis markers around short words (*no*, **hi**).
   //
-  // Refuse rather than snap outward over the token: refusing degrades to the copy
-  // fallback, which is annoying but reversible, whereas snapping would silently eat
-  // the user's emphasis markers around short words (*no*, **hi**).
+  // The rule is CONTAINMENT, not delimiter counting. Counting was tried and is
+  // wrong twice over: "ld** text" holds one run's closing ** and has an even count,
+  // so parity passed it and the splice orphaned the opening ** — the same corruption
+  // class, through the delimiter the check exists to guard. And it refused on
+  // transform-free prose ("the 3 * 4 grid", "log_file"), where the map is the
+  // identity and the splice is provably exact.
   //
-  // ponytail: counts delimiters, does not parse markdown. A selection that
-  // legitimately straddles one marker also refuses — correct, since replacing it
-  // would orphan the other half either way. Upgrade path is a real tokenizer.
-  function spanIsBalanced(s) {
-    if ((s.match(/\{\{/g) || []).length !== (s.match(/\}\}/g) || []).length) return false;
-    if ((s.match(/\*/g) || []).length % 2) return false;
-    if ((s.match(/`/g) || []).length % 2) return false;
-    if ((s.match(/_/g) || []).length % 2) return false;
+  // Two kinds of construct:
+  //   OPAQUE — the whole token is structural ({{macro}}, code span, image, escape,
+  //            self-closing tag). Overlapping it without covering it whole bisects it.
+  //   PAIRED — an opening and a closing delimiter stripped during render while the
+  //            text between survives (*em*, **b**, ~~s~~, ==h==, _i_, [label](url),
+  //            <b>..</b>). Cutting through the CONTENT is fine and is the common
+  //            case; taking one delimiter without its partner is not.
+  //
+  // ponytail: regex heuristic, not the engine's tokenizer. Block macros
+  // ({{#if}}..{{/if}}) still pass as two independent tokens and can be halved;
+  // upgrade path is reusing macro-engine's findBalancedMacroEnd.
+  var OPAQUE_RE = /\{\{[\s\S]*?\}\}|```[\s\S]*?```|`[^`\n]*`|!\[[^\]\n]*\]\([^)\s]*\)|\\[\s\S]|<[A-Za-z][^<>]*\/>/g;
+  var EMPH_RE   = /(\*\*\*|\*\*|~~|==|__|\*|_)(?!\1)([\s\S]*?)\1/g;
+  var LINK_RE   = /\[([^\]\n]*)\]\(([^)\s]*)\)/g;
+  var TAG_RE    = /<([A-Za-z][A-Za-z0-9]*)[^<>]*>[\s\S]*?<\/\1\s*>/g;
+  function spanIsBalanced(A, as, ae) {
+    var t, m, i, pairs = [], ov = function (s, e) { return as < e && ae > s; };
+    OPAQUE_RE.lastIndex = 0;
+    while ((t = OPAQUE_RE.exec(A))) {
+      var os = t.index, oe = os + t[0].length;
+      if (ov(os, oe) && !(as <= os && ae >= oe)) return false;
+    }
+    EMPH_RE.lastIndex = 0;
+    while ((m = EMPH_RE.exec(A))) {
+      var d = m[1].length, s0 = m.index, e0 = s0 + m[0].length;
+      pairs.push([s0, s0 + d, e0 - d, e0]);
+    }
+    LINK_RE.lastIndex = 0;
+    while ((m = LINK_RE.exec(A))) {
+      var ls = m.index;
+      pairs.push([ls, ls + 1, ls + 1 + m[1].length, ls + m[0].length]);
+    }
+    TAG_RE.lastIndex = 0;
+    while ((m = TAG_RE.exec(A))) {
+      var ts = m.index, raw = m[0];
+      pairs.push([ts, ts + raw.indexOf(">") + 1, ts + raw.lastIndexOf("</"), ts + raw.length]);
+    }
+    // Exactly one delimiter of a pair inside the cut orphans the other.
+    for (i = 0; i < pairs.length; i++) {
+      if (ov(pairs[i][0], pairs[i][1]) !== ov(pairs[i][2], pairs[i][3])) return false;
+    }
     return true;
   }
   // Index of the n-th (0-based) non-overlapping occurrence of needle in haystack, or -1.
@@ -836,7 +873,7 @@
     var dirtyStart = as > 0 && as < m && !matchedRaw[as - 1] && !matchedRaw[as];
     var dirtyEnd = ae > 0 && ae < m && !matchedRaw[ae - 1] && !matchedRaw[ae];
     if (dirtyStart || dirtyEnd) return null;
-    if (!spanIsBalanced(A.slice(as, ae))) return null;
+    if (!spanIsBalanced(A, as, ae)) return null;
     return { as: as, ae: ae };
   }
   // Find a "clean anchor": a verbatim run of rendered text near `pos` that occurs
@@ -906,7 +943,7 @@
     if (!startSpan || !endSpan || endSpan.ae < startSpan.as) return null;
     // Each edge was validated against its own window; the span BETWEEN them never
     // was, and that interior is what gets replaced. Re-check the composed span.
-    if (!spanIsBalanced(A.slice(startSpan.as, endSpan.ae))) return null;
+    if (!spanIsBalanced(A, startSpan.as, endSpan.ae)) return null;
     return { as: startSpan.as, ae: endSpan.ae };
   }
   function wcDiff(a, b) {
