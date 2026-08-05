@@ -243,6 +243,16 @@ assert.equal(_spanIsBalanced("<abc123>content</abc>", 9, 16), true,
   // both ends of the outer pair outside. The mis-scoped outer pair (opener at 0,
   // closer wrongly at the INNER close) straddled this span and refused it.
   assert.equal(_spanIsBalanced(T, 4, 12), true, "same-name nested tags: the inner pair covered whole is fine");
+  // Self-closing tags must not hijack a real pair's LIFO slot: <b/> matched the
+  // OPEN alternative, so the real </b> popped the phantom and the real <b> was
+  // left unpaired and orphanable.
+  const X = "<b>text<b/>more</b>";
+  assert.equal(_spanIsBalanced(X, 0, 3), false, "self-closer between a real pair: orphaning the real opener must refuse");
+  assert.equal(_spanIsBalanced(X, 0, X.lastIndexOf("</b>")), false, "self-closer between a real pair: excluding the real closer must refuse");
+  assert.equal(_spanIsBalanced(X, 0, X.length), true, "covering the whole construct is fine");
+  // [0,9) is "a <br/> b": the <br/> opaque token is covered whole, the <i> pair
+  // is entirely outside it.
+  assert.equal(_spanIsBalanced("a <br/> b <i>x</i> c", 0, 9), true, "an unrelated self-closer overlapped whole is fine and pairs elsewhere are untouched");
 }
 function _spl(R, A, rs, re, x) { const s = _mapRenderedSpanToRaw(R, A, rs, re); return s ? A.slice(0, s.as) + x + A.slice(s.ae) : null; }
 // clean boundaries MUST splice exactly:

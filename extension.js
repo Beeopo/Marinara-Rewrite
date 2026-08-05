@@ -968,6 +968,10 @@
     var stacks = {};
     PAIR_TOK_RE.lastIndex = 0;
     while ((m = PAIR_TOK_RE.exec(A))) {
+      // A self-closing tag (<x/>) is atomic — OPAQUE_RE already protects it
+      // whole. It must NOT enter the stack: pushed as a phantom opener it
+      // hijacks the real pair's LIFO slot, and the real opener never pairs.
+      if (m[2] !== undefined && /\/\s*>$/.test(m[0])) continue;
       // Key by kind + name so a <if> tag can never pair a {{/if}} macro.
       var isClose = m[1] === "/" || m[3] === "/";
       var key = (m[2] !== undefined ? "t:" + m[2] : "m:" + m[4]);
