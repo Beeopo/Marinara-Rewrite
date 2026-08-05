@@ -35,6 +35,12 @@
       // would silently drop the CSRF header on a write.
       var headers = new Headers(o.headers || {});
       if (method !== "GET" && method !== "HEAD") headers.set("x-marinara-csrf", "1");
+      // The 2.x bridge set this on every request; the 2.4 host object does not, and
+      // dropping it silently broke the DEFAULT sidecar mode: with no Content-Type the
+      // browser sends text/plain, Fastify hands the route a raw string, and the zod
+      // schema rejects it ("Expected object, received string") before the handler runs.
+      // Restore the old contract here rather than at each call site.
+      if (o.body != null && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
       return fetch("/api" + path, Object.assign({}, o, { headers: headers, cache: o.cache || "no-store" }))
         .then(function (r) { return r.json().catch(function () { return null; }); });
     },
