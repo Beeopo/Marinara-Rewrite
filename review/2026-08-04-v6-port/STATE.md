@@ -10,13 +10,13 @@
 |---|---|
 | 0 MAP | done |
 | 1 COMB | **done** — 7/7 finders returned, 23 candidates in `candidates.md`. Tier 1+2 equivalent (region generalists + 3 conditional lenses, all preconditions present). Deep tier NOT run (not `--exhaustive`) — so this is a standard-tier dry, not a clean bill of health. |
-| 2 VERIFY | 4 adversarial skeptics dispatched, batched by cluster: A security/import/prompt · B concurrency/commit · C adoption/storage · D guards/build/perf/docs. 2 candidates skip skeptic review — orchestrator-confirmed with live evidence (C-R1-1 sidecar Content-Type via curl against :7860; C-RT-1 alignExact bisection reproduced against the shipped function). |
-| ~~1 COMB~~ | ~~wave 1 dispatched~~ — 7 agents, standard tier, read-only: R1 shim/storage/adoption · R2 inference/LLM-output · R3 commit path · R5 build/manifest · round-trip lens · claims lens · trust-boundary lens. R4 (UI/settings) and R6 (docs) folded into the claims + trust-boundary lenses per the honest-yield note. |
-| 2 VERIFY | pending |
-| 3 PLAN | pending |
-| GATE | pending |
-| 4 FIX | pending |
-| 4.5 SIGN-OFF | pending |
+| 2 VERIFY | **done** — 4 skeptics batched by file cluster; all 23 candidates carry a verdict. 18 CONFIRMED, 2 REFUTED, 3 dropped. 2 skipped skeptic review as orchestrator-confirmed with live evidence. |
+| 3 PLAN | done — `PLAN.md`, 3 tracks, 15 tasks |
+| GATE | **approved** — user selected Tracks A + B + C (all) |
+| 4 FIX | **done** — all 15 tasks across Tracks A+B+C. 11 commits `5c9c662..c741ed1`. Every fix carries a test proven to fail when the behaviour it guards is broken (not merely deleted). |
+| 4.5 SIGNOFF r1 | **done** — 3 skeptics; defects in all three groups. B1's parity rule was outright wrong (`**bold**` + select `"ld text"` → `"**boX"`, plus 7 more constructs corrupting and false refusals on transform-free prose); **no guard read the shipped artifact**, which had genuinely drifted; empty-profile resurrection; an abort-race that would turn cancels into error dialogs; two guards pinning the condition not the effect (scoping Content-Type to PATCH, or swapping the CONN_KEYS comparisons — the latter would export the API key in plaintext). Fixed in `5fd6b3f`, `833ab7b`, `ec0d137`. |
+| LIVE VERIFY | **done** on `:7999` (engine restarted on a new port; `:7860` instance had died). Current build re-approved after the code change cleared `approvedHash` — itself a live confirmation of a README claim. Round-trip: 2nd occurrence rewritten, 1st untouched, `*…*` markers and `{{char}}` intact. **B2 proven under attack** — a real concurrent write produced the confirm modal and was NOT overwritten; Cancel left it intact. Throwaway chat deleted, config restored, mock stopped. |
+| 4.5 SIGNOFF r2 | in progress — 3 skeptics over all 11 fix commits, weighted to the write path (`c741ed1`) and to the corrections (`5fd6b3f` is the SECOND attempt at the aligner guard, and attempt 1 shipped green and wrong). |
 | 5 DOCS | pending |
 | 6 REPORT | pending |
 
