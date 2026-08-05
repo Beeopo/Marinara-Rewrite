@@ -82,14 +82,26 @@ assert.ok(_SRC.includes("fetchSpeakerNote"), "drift: fetchSpeakerNote missing");
 assert.ok(!/\baddStyle\s*\(/.test(_SRC), "drift: extension.js still calls addStyle(...) (removed in Marinara 2.4)");
 const _CSS = _rf(new URL("./extension.css", import.meta.url), "utf8");
 assert.ok(_CSS.includes(".rwa{"), "drift: extension.css missing the base .rwa rule");
-assert.ok(_CSS.includes(".rwa-win "), "drift: extension.css missing the .rwa-win rules");
+// ".rwa-win{" not ".rwa-win " — the trailing-space form only ever matched the
+// descendant-combinator scrollbar rules, so the base rule (background, border,
+// width, shadow) could be deleted and this still passed, leaving all three modal
+// surfaces unstyled with a green suite.
+assert.ok(_CSS.includes(".rwa-win{"), "drift: extension.css missing the .rwa-win base rule");
+assert.ok(_CSS.includes(".rwa-win ::-webkit-scrollbar"), "drift: extension.css missing the .rwa-win scrollbar rules");
 // v6.0: Marinara 2.4's full-page host object dropped apiFetch/on/addStyle/extensionId.
 // The shim rebuilds them so the 5.1 body needs no call-site changes.
 assert.ok(/^\(function \(host\) \{/m.test(_SRC), "drift: IIFE parameter is not `host` (shim missing)");
 assert.ok(_SRC.includes("var marinara = {"), "drift: compat shim object missing");
 assert.ok(_SRC.includes('"x-marinara-csrf"'), "drift: apiFetch shim not sending the CSRF header");
 assert.ok(_SRC.includes('fetch("/api" + path'), "drift: apiFetch shim not prefixing /api");
-assert.ok(_SRC.includes("removeEventListener"), "drift: on() shim not registering teardown");
+// Match the shim's OWN teardown, not the bare word: extension.js has three
+// unrelated removeEventListener call sites (drag handling, a focus listener), so
+// the bare-word form passed even with the shim's teardown deleted.
+assert.ok(/target\.removeEventListener\(type, handler, options\)/.test(_SRC), "drift: on() shim not registering teardown");
+// A body with no Content-Type makes the browser send text/plain; Fastify then hands
+// the route a raw string and the zod schema rejects it before the handler runs. This
+// silently broke the default sidecar mode once already.
+assert.ok(/o\.body != null && !headers\.has\("Content-Type"\)/.test(_SRC), "drift: apiFetch no longer defaults Content-Type on a body");
 // v6.0: the storage namespace is a fixed literal. Deriving it from the engine's
 // extension id stranded the user's data on every re-import.
 assert.ok(_SRC.includes("function adoptLegacyNamespace"), "drift: adoptLegacyNamespace missing");
