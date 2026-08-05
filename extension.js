@@ -2470,12 +2470,17 @@
   watchForChatSwitch();
 
   // ── Settings ──────────────────────────────────────────────────────────────
+  // Connection settings are user-owned and never travel in an export/import.
+  // apiKey is the secret; the other three decide WHERE that secret gets sent, so
+  // filtering only the key would still let an import redirect it.
+  var CONN_KEYS = ["apiKey", "apiUrl", "extenderUrl", "connMode"];
+
   function exportProfiles(opts) {
     opts = opts || { profiles: true, config: true, customs: true, autoProfs: true };
     var data = { type: "rwa-profiles-export", version: 1 };
     var picked = [];
     if (opts.profiles)  { data.profiles = profiles;        picked.push("profiles"); }
-    if (opts.config)    { var safeCfg = {}; Object.keys(cfg).forEach(function (k) { if (k !== "apiKey") safeCfg[k] = cfg[k]; }); data.config = safeCfg; picked.push("settings"); }
+    if (opts.config)    { var safeCfg = {}; Object.keys(cfg).forEach(function (k) { if (CONN_KEYS.indexOf(k) === -1) safeCfg[k] = cfg[k]; }); data.config = safeCfg; picked.push("settings"); }
     if (opts.customs)   { data.customs = customs;          picked.push("custom prompts"); }
     if (opts.autoProfs) { data.autoProfiles = autoProfs;   picked.push("auto-profiles"); }
     if (!picked.length) { showToast(null, "Select at least one thing to export."); return; }
@@ -2513,6 +2518,7 @@
           // from reaching code that expects specific types (e.g. charCardIds.join,
           // historyDepth arithmetic, profile fields). Track dropped entries for toast.
           var dropped = 0;
+          var skippedConn = 0;
 
           // profiles/customs: must be arrays; entries must be objects with string
           // id, name, prompt — validProfileEntry is defined once near the loader.
@@ -2550,6 +2556,12 @@
           if (data.config && typeof data.config === "object" && !Array.isArray(data.config)) {
             Object.keys(data.config).forEach(function (k) {
               if (!cfg.hasOwnProperty(k)) return;
+              // Never let an imported file decide WHERE inference goes. Export already
+              // strips apiKey, but that only protects the file's author: an import that
+              // sets connMode "direct" and apiUrl at an attacker's host makes the NEXT
+              // rewrite send the user's own stored key there as a bearer token — the
+              // file never needs to contain a key at all. These stay user-owned.
+              if (CONN_KEYS.indexOf(k) !== -1) { skippedConn++; return; }
               var defVal = DEF_CFG[k];
               var impVal = data.config[k];
               // Array-typed defaults: accept only arrays.
@@ -2563,9 +2575,10 @@
             });
             saveC();
           }
-          var msg = dropped > 0
-            ? "Imported (" + dropped + " malformed " + (dropped === 1 ? "entry" : "entries") + " dropped)"
-            : "Imported!";
+          var parts = [];
+          if (dropped > 0) parts.push(dropped + " malformed " + (dropped === 1 ? "entry" : "entries") + " dropped");
+          if (skippedConn > 0) parts.push("connection settings ignored");
+          var msg = parts.length ? "Imported (" + parts.join("; ") + ")" : "Imported!";
           showToast(null, msg, "ok");
           render();
         } catch (e) { showToast(null, "Import failed: invalid JSON."); }

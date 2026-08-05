@@ -531,4 +531,42 @@ const _adopt = (ls) =>
   const allBad = run('[null,null]');
   assert.ok(allBad.length > 0, "an all-malformed array must fall back to DEF_PROFILES, not empty");
 }
+// 8) connection settings never travel through export or import.
+// Export already stripped apiKey, but that only protects the file's author. An
+// import that sets connMode "direct" and apiUrl at an attacker's host makes the
+// NEXT rewrite send the user's own stored key there as a bearer token — the
+// malicious file never needs to contain a key at all. Both directions are filtered
+// from one shared list, so they cannot drift apart.
+{
+  const CONN = JSON.parse(_SRC.match(/var CONN_KEYS = (\[[^\]]*\]);/)[1].replace(/'/g, '"'));
+  assert.deepEqual(CONN, ["apiKey", "apiUrl", "extenderUrl", "connMode"], "drift: CONN_KEYS changed");
+  assert.ok(_SRC.includes("CONN_KEYS.indexOf(k) === -1"), "drift: export no longer filters connection keys");
+  assert.ok(_SRC.includes("CONN_KEYS.indexOf(k) !== -1"), "drift: import no longer skips connection keys");
+
+  // mirror of the import config merge
+  const DEF_CFG = { cols: 2, connMode: "sidecar", apiUrl: "http://127.0.0.1:11434/v1", apiKey: "", extenderUrl: "x" };
+  const merge = (cfg, imported) => {
+    let skippedConn = 0;
+    Object.keys(imported).forEach((k) => {
+      if (!Object.prototype.hasOwnProperty.call(cfg, k)) return;
+      if (CONN.indexOf(k) !== -1) { skippedConn++; return; }
+      if (typeof imported[k] === typeof DEF_CFG[k]) cfg[k] = imported[k];
+    });
+    return skippedConn;
+  };
+
+  // the exact attack: no apiKey field, just a redirect
+  const cfg = { ...DEF_CFG, apiKey: "sk-REAL-USER-SECRET", connMode: "direct", apiUrl: "https://openrouter.ai/api/v1" };
+  const skipped = merge(cfg, { connMode: "direct", apiUrl: "https://attacker.example/v1", cols: 4 });
+  assert.equal(cfg.apiUrl, "https://openrouter.ai/api/v1", "import must not redirect apiUrl");
+  assert.equal(cfg.apiKey, "sk-REAL-USER-SECRET", "the user's key must stay put");
+  assert.equal(cfg.cols, 4, "non-connection settings still import");
+  assert.equal(skipped, 2, "both connection keys reported as skipped");
+
+  // export side: none of the four leave the machine
+  const exported = {};
+  Object.keys(cfg).forEach((k) => { if (CONN.indexOf(k) === -1) exported[k] = cfg[k]; });
+  for (const k of CONN) assert.ok(!(k in exported), k + " must not appear in an export");
+}
+console.log("selfcheck: connection-settings isolation assertions passed");
 console.log("selfcheck: legacy-namespace adoption assertions passed");
