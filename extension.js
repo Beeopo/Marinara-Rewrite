@@ -2238,7 +2238,18 @@
       if (cur && (cur + s).length > maxChars) { out.push(cur); cur = s; } else { cur += s; }
     });
     if (cur) out.push(cur);
-    return out.length ? out : [text];
+    if (!out.length) out = [text];
+    // The sentence regex above folds the whitespace between sentences onto the
+    // tail of each chunk (the trailing \s* in the match). Left embedded there
+    // it looks fine for an untouched slice, but a REWRITTEN slice's model
+    // response gets .trim()-ed before it's stored (see processSlice), so
+    // whitespace living inside the slice text silently vanishes at the join.
+    // Pull it out into its own separator so it travels alongside the slice
+    // instead of inside it, and survives the trim.
+    return out.map(function (part) {
+      var m = part.match(/\s+$/);
+      return m ? { text: part.slice(0, -m[0].length), sep: m[0] } : { text: part, sep: "" };
+    });
   }
   function windowText(text, maxTokens) {
     var maxChars = Math.max(400, maxTokens * 4);
@@ -2249,9 +2260,26 @@
     units.forEach(function (u) {
       if (u.text.length <= maxChars) { slices.push(u); return; }
       var parts = splitToSize(u.text, maxChars);
-      for (var i = 0; i < parts.length; i++) slices.push({ text: parts[i], sep: i === parts.length - 1 ? u.sep : "" });
+      for (var i = 0; i < parts.length; i++) {
+        var isLast = i === parts.length - 1;
+        // The last chunk of a split unit still owes the unit's own boundary
+        // separator (a paragraph break, or "" at end of text) — append it
+        // after whatever trailing whitespace splitToSize already pulled off
+        // that chunk, so nothing is dropped or duplicated.
+        slices.push({ text: parts[i].text, sep: isLast ? parts[i].sep + u.sep : parts[i].sep });
+      }
     });
     return slices.filter(function (s) { return s.text.length || s.sep.length; });
+  }
+  // Join in order: rewritten result where done, original text where skipped,
+  // each followed by its recorded separator. `sep` may be undefined on a
+  // slice from a ledger persisted by a build older than this fix — treat
+  // that as "" rather than crash; the join is lossy for that slice exactly
+  // like it always was, resuming is still safe.
+  function assembleLedgerText(slices) {
+    return slices.map(function (s) {
+      return (s.status === "done" && s.result != null ? s.result : s.text) + (s.sep || "");
+    }).join("");
   }
   function stripWrapQuotes(s) {
     var openQ = s.match(/^["“‘«]/), closeQ = s.match(/["”’»]$/);
@@ -2378,10 +2406,7 @@
       });
     }
     function assembleAndCommit() {
-      // Join in order: rewritten result where done, original text where skipped.
-      var assembled = ledger.slices.map(function (s) {
-        return (s.status === "done" && s.result != null ? s.result : s.text) + s.sep;
-      }).join("");
+      var assembled = assembleLedgerText(ledger.slices);
       logDbg("ledger.assemble", { mid: ledger.mid, slices: total, chars: assembled.length });
       ov.remove();
       doCommit(assembled, { text: ledger.orig, mid: ledger.mid, cid: ledger.cid, occ: ledger.occ || 0, fp: ledger.fp || null }, function () {

@@ -1419,3 +1419,99 @@ console.log("selfcheck: Marinara-connection mode assertions passed");
     "drift: marinara-mode errors no longer hint at the connection picker");
 }
 console.log("selfcheck: connMode migration assertions passed");
+
+// ── Ledger Pattern: inter-slice whitespace survives split -> rewrite -> assemble ──
+// Bug: a large selection windowed into slices dropped exactly one boundary
+// character (space/newline) at each join once a slice was actually rewritten.
+// Root cause: splitToSize's sentence regex folds the whitespace BETWEEN
+// sentences onto the tail of the earlier chunk's text instead of recording it
+// as a separator; that trailing whitespace survives fine in an untouched
+// slice, but the model's response for a REWRITTEN slice is .trim()-ed before
+// storage (processSlice), so the embedded whitespace vanishes at assembly.
+// Fix: splitToSize now extracts trailing whitespace into its own `sep` field
+// at split time, windowText combines it with any paragraph-level separator,
+// and assembly reinserts `sep` after each slice's (possibly rewritten) text.
+{
+  const _ledgerSrc = _SRC.slice(
+    _SRC.indexOf("  function splitToSize(text, maxChars) {"),
+    _SRC.indexOf("  function stripWrapQuotes(s) {"),
+  );
+  assert.ok(_ledgerSrc.includes("function splitToSize"), "extraction: splitToSize not found");
+  assert.ok(_ledgerSrc.includes("function windowText"), "extraction: windowText not found");
+  assert.ok(_ledgerSrc.includes("function assembleLedgerText"), "extraction: assembleLedgerText not found");
+  const _LDG = new Function(
+    _ledgerSrc + "\nreturn { windowText: windowText, assembleLedgerText: assembleLedgerText };",
+  )();
+  const windowText = _LDG.windowText, assembleLedgerText = _LDG.assembleLedgerText;
+
+  // Mirrors processSlice: a real rewrite round-trips the slice text through
+  // the model and .trim()s the response. "Rewritten to itself" == identity
+  // content, but still through the trim a real response gets.
+  function roundTrip(text, maxTokens) {
+    const slices = windowText(text, maxTokens).map((s) => ({
+      text: s.text, sep: s.sep, status: "done", result: s.text.trim(),
+    }));
+    return assembleLedgerText(slices);
+  }
+
+  // Single-space boundaries (sentences in one paragraph, long enough to force
+  // splitToSize to cut mid-paragraph). This is the shape of the live repro.
+  {
+    let sentences = [];
+    for (let i = 0; i < 60; i++) sentences.push("Entry " + i + " covers routine supplies for the unit.");
+    const text = sentences.join(" "); // single spaces only, one paragraph
+    const win = windowText(text, 100); // maxChars = max(400, 400) = 400
+    assert.ok(win.length > 1, "test setup: expected the paragraph to be split into multiple slices");
+    assert.equal(roundTrip(text, 100), text, "round-trip must be byte-identical for single-space boundaries");
+  }
+
+  // Single "\n" boundaries (same splitToSize path — \s* also matches \n).
+  {
+    let sentences = [];
+    for (let i = 0; i < 60; i++) sentences.push("Line " + i + " records a single supply entry.");
+    const text = sentences.join("\n");
+    const win = windowText(text, 100);
+    assert.ok(win.length > 1, "test setup: expected the paragraph to be split into multiple slices");
+    assert.equal(roundTrip(text, 100), text, "round-trip must be byte-identical for single-\\n boundaries");
+  }
+
+  // "\n\n" paragraph boundary combined with a mid-paragraph split: the first
+  // paragraph alone is long enough to need splitToSize, and its last chunk's
+  // own trailing whitespace must combine correctly with the paragraph's "\n\n".
+  {
+    let sentences = [];
+    for (let i = 0; i < 60; i++) sentences.push("Entry " + i + " covers routine supplies for the unit.");
+    const text = sentences.join(" ") + "\n\nSecond paragraph follows after the break.";
+    const win = windowText(text, 100);
+    assert.ok(win.length > 1, "test setup: expected the text to be split into multiple slices");
+    assert.equal(roundTrip(text, 100), text, "round-trip must be byte-identical across a \\n\\n paragraph boundary");
+  }
+
+  // A rewritten (changed) middle slice keeps both surrounding separators intact.
+  {
+    const slices = [
+      { text: "Entry one.", sep: " ", status: "done", result: "First entry rewritten." },
+      { text: "Entry two.", sep: "\n\n", status: "done", result: "Second entry, now different!" },
+      { text: "Entry three.", sep: "", status: "done", result: "Third entry rewritten." },
+    ];
+    assert.equal(
+      assembleLedgerText(slices),
+      "First entry rewritten. Second entry, now different!\n\nThird entry rewritten.",
+      "both separators around a changed middle slice must survive assembly",
+    );
+  }
+
+  // Legacy ledger: slices persisted before `sep` existed carry no separator at
+  // all (undefined, not ""). Assembly must degrade to a plain concat rather
+  // than throw or emit the literal string "undefined".
+  {
+    const legacySlices = [
+      { text: "Entry one.", status: "done", result: "Rewritten one." },
+      { text: "Entry two.", status: "done", result: "Rewritten two." },
+    ];
+    let assembled;
+    assert.doesNotThrow(() => { assembled = assembleLedgerText(legacySlices); }, "legacy ledger (no sep) must not throw");
+    assert.equal(assembled, "Rewritten one.Rewritten two.", "legacy ledger degrades to plain concat, not \"undefined\"");
+  }
+}
+console.log("selfcheck: ledger split/assemble whitespace assertions passed");
