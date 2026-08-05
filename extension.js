@@ -119,9 +119,26 @@
         if (when >= bestWhen) { bestWhen = when; old = prefix; }
       }
       if (!old) return null;
-      for (var j = 0; j < SUFFIXES.length; j++) {
-        var v = localStorage.getItem(old + SUFFIXES[j]);
-        if (v !== null) localStorage.setItem(NS + SUFFIXES[j], v);
+      // Copy is not atomic (localStorage has no transactions), so track which
+      // suffixes actually landed. A mid-copy throw (quota is a live concern here —
+      // see the comment above on transient doubled usage) rolls back everything
+      // written so far, rather than leaving the current load to boot on a mixed
+      // legacy/default state. The sentinel-last ordering still makes a *later*
+      // retry safe; this makes the *current* load safe too.
+      var written = [];
+      try {
+        for (var j = 0; j < SUFFIXES.length; j++) {
+          var v = localStorage.getItem(old + SUFFIXES[j]);
+          if (v !== null) {
+            localStorage.setItem(NS + SUFFIXES[j], v);
+            written.push(SUFFIXES[j]);
+          }
+        }
+      } catch (e) {
+        for (var r = 0; r < written.length; r++) {
+          try { localStorage.removeItem(NS + written[r]); } catch (e2) {}
+        }
+        return null;
       }
       return old;
     } catch (e) { return null; }
@@ -2582,12 +2599,26 @@
           // historyDepth arithmetic, profile fields). Track dropped entries for toast.
           var dropped = 0;
           var skippedConn = 0;
+          var reassigned = 0;
 
           // profiles/customs: must be arrays; entries must be objects with string
           // id, name, prompt — validProfileEntry is defined once near the loader.
           if (Array.isArray(data.profiles)) {
             var before = data.profiles.length;
-            profiles = data.profiles.filter(validProfileEntry);
+            // validProfileEntry checks shape but not id uniqueness. A duplicate id
+            // makes the drag-reorder handler's `profiles.find(x => x.id === dragId)`
+            // resolve to the FIRST match, silently mutating the wrong row. Mint a
+            // fresh id (same scheme the UI uses for new profiles) for every entry
+            // after the first with a given id.
+            var seenIds = {};
+            profiles = data.profiles.filter(validProfileEntry).map(function (p) {
+              if (seenIds.hasOwnProperty(p.id)) {
+                p.id = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+                reassigned++;
+              }
+              seenIds[p.id] = true;
+              return p;
+            });
             dropped += before - profiles.length;
             saveP();
           }
@@ -2640,6 +2671,7 @@
           }
           var parts = [];
           if (dropped > 0) parts.push(dropped + " malformed " + (dropped === 1 ? "entry" : "entries") + " dropped");
+          if (reassigned > 0) parts.push(reassigned + " duplicate " + (reassigned === 1 ? "id" : "ids") + " reassigned");
           if (skippedConn > 0) parts.push("connection settings ignored");
           var msg = parts.length ? "Imported (" + parts.join("; ") + ")" : "Imported!";
           showToast(null, msg, "ok");

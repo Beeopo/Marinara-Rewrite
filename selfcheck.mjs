@@ -541,10 +541,17 @@ const _adopt = (ls) =>
       if (++writes > 3) { const e = new Error("QuotaExceededError"); e.name = "QuotaExceededError"; throw e; }
       base.setItem(k, v);
     },
+    removeItem: (k) => base.removeItem(k),
     dump: () => base.dump(),
   };
   assert.equal(_adopt(ls), null, "a swallowed throw must report failure, not success");
   assert.equal(ls.getItem(_NS + "-p"), null, "sentinel must be unset so the next load retries");
+  // A partial copy is not just a missing sentinel: the suffixes written before the
+  // throw (here "-c", "-h", "-r") must be rolled back too, or the CURRENT load boots
+  // on a mixed legacy/default state even though the NEXT load would retry cleanly.
+  for (const s of _SUF) {
+    assert.equal(ls.getItem(_NS + s), null, "drift: partial adoption left " + s + " behind after a mid-copy failure");
+  }
   // retry on a healthy store completes the adoption
   const ls2 = _fakeLS(ls.dump());
   assert.equal(_adopt(ls2), "rwa-9f3c1a2b", "retry must find the legacy set again");
@@ -618,6 +625,44 @@ const _adopt = (ls) =>
   // an entirely malformed array falls back to defaults rather than an empty list
   const allBad = run('[null,null]');
   assert.ok(allBad.length > 0, "an all-malformed array must fall back to DEF_PROFILES, not empty");
+}
+// (l) import must dedupe colliding profile ids. validProfileEntry checks shape but
+// never uniqueness, and the drag-reorder handler resolves the dragged row via
+// `profiles.find(x => x.id === dragId)` — first-match semantics — so two entries
+// sharing an id let dragging the LATER one silently mutate the EARLIER one's order.
+// Runs the SHIPPED import block, not a hand-copied mirror.
+{
+  const _impSrc = _SRC.slice(
+    _SRC.indexOf("if (Array.isArray(data.profiles))"),
+    _SRC.indexOf("if (Array.isArray(data.customs))"),
+  );
+  assert.ok(_impSrc.includes("data.profiles.filter(validProfileEntry)"), "could not extract profiles-import block from extension.js");
+  const _validSrc = _SRC.slice(_SRC.indexOf("function validProfileEntry"), _SRC.indexOf("// Filter, don't just array-check"));
+  const _runImport = (list) => new Function("data", `
+    ${_validSrc}
+    var profiles = [];
+    var dropped = 0;
+    var reassigned = 0;
+    function saveP() {}
+    ${_impSrc}
+    return { profiles: profiles, dropped: dropped, reassigned: reassigned };
+  `)({ profiles: list });
+
+  const dup = [
+    { id: "expand", name: "A", order: 0, prompt: "pa" },
+    { id: "compress", name: "C", order: 1, prompt: "pc" },
+    { id: "expand", name: "B", order: 2, prompt: "pb" },
+  ];
+  const res = _runImport(dup);
+  assert.equal(res.profiles.length, 3, "all entries must be preserved — a collision is not malformed data");
+  assert.equal(res.reassigned, 1, "exactly one collision must be counted as reassigned");
+  const ids = res.profiles.map((p) => p.id);
+  assert.equal(new Set(ids).size, 3, "drift: duplicate profile ids survived import");
+  // the drag-resolution this exists to protect now finds the right object
+  const src = res.profiles.find((x) => x.id === "expand");
+  assert.equal(src.name, "A", "drag-resolution must land on the surviving \"expand\" row");
+  const rowB = res.profiles.find((p) => p.name === "B");
+  assert.notEqual(rowB.id, "expand", "the later duplicate must get a fresh id, not keep the collided one");
 }
 // 8) connection settings never travel through export or import.
 // Export already stripped apiKey, but that only protects the file's author. An
