@@ -40,7 +40,10 @@
       // browser sends text/plain, Fastify hands the route a raw string, and the zod
       // schema rejects it ("Expected object, received string") before the handler runs.
       // Restore the old contract here rather than at each call site.
-      if (o.body != null && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+      // Only for a string body. fetch derives the right Content-Type for FormData,
+      // Blob and URLSearchParams itself — including a multipart boundary that cannot
+      // be reconstructed once discarded — so forcing JSON on those would corrupt them.
+      if (typeof o.body === "string" && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
       return fetch("/api" + path, Object.assign({}, o, { headers: headers, cache: o.cache || "no-store" }))
         .then(function (r) { return r.json().catch(function () { return null; }); });
     },
@@ -54,9 +57,12 @@
   };
 
   // ── Storage ───────────────────────────────────────────────────────────────
-  // Fixed namespace. 5.x used "rwa-" + the engine-generated extension id, but both
-  // the old and the new engine mint a fresh id on every import, so the namespace
-  // moved each time and stranded the previous install's profiles and history.
+  // Fixed namespace. 5.x used "rwa-" + the engine-generated extension id. The engine
+  // dedupes an import by extension NAME and patches the existing row in place, so a
+  // same-name reimport keeps its id — but the old manifest baked the version into the
+  // name ("Rewrite Assistant v5.1"), so every release imported as a brand-new
+  // extension, got a fresh id, and stranded the previous install's profiles and
+  // history. v6.0's name carries no version, which fixes that half independently.
   var NS = "rwa-rewrite-assistant";
   // "-p" is LAST on purpose: it doubles as the "already adopted" sentinel below.
   // Writing it first would make a mid-copy throw (localStorage quota — and a copy
@@ -173,8 +179,13 @@
   // below throw, and because the engine splices this file synchronously into its
   // main(), that throw aborts every remaining top-level statement: no bindings, no
   // popup, and nothing in the UI to say why. Filtering here covers every writer.
-  var profiles = loadArr(K_PROF, DEF_PROFILES).filter(validProfileEntry);
-  if (!profiles.length) profiles = DEF_PROFILES.slice();
+  // Restore defaults only when something was there and NOTHING survived — that is
+  // corruption. An already-empty array is a user who deleted every profile (the
+  // delete button has no minimum-count guard), and resurrecting the defaults under
+  // them on the next load would make that choice impossible to keep.
+  var _loadedProfiles = loadArr(K_PROF, DEF_PROFILES);
+  var profiles = _loadedProfiles.filter(validProfileEntry);
+  if (_loadedProfiles.length && !profiles.length) profiles = DEF_PROFILES.slice();
 
   var DEF_CFG = {
     cols: 2, rows: 8, typewriter: false, useCharCard: false, showDiff: false,
@@ -1637,6 +1648,12 @@
       // cancels never needed that branch — the Cancel button tears the modal down
       // itself. Shape it here, the one place all three callers pass through, rather
       // than teaching each of them the difference.
+      // ...but check for a cancel first. Abort does NOT always reject: if the user
+      // cancels after the response headers land while r.json() is still consuming the
+      // body, that rejection is swallowed by apiFetch's own .catch into a resolved
+      // null. Without this check the normalization below would pop an error dialog on
+      // what was a perfectly ordinary cancellation.
+      if (!resp && signal && signal.aborted) resp = { aborted: true };
       if (!resp) resp = { error: "The server returned an unreadable response (not JSON)." };
       logDbg("inference.response", {
         mode: mode,
