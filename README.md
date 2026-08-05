@@ -138,10 +138,13 @@ The model generates the rewrite; the extension then has to locate your selected 
 and splice the new text in. Most failures happen at that second step, not the generation step.
 
 - **The selection can't be located in the stored message.** The text shown on screen does not always match what
-  is stored byte-for-byte: Markdown markers (`*emphasis*`, `_italics_`, `` `code` ``), list bullets, and the blank
-  lines between paragraphs are common sources of mismatch. The extension tries several matching passes (exact, then
-  whitespace-flexible, then first/last-word anchors that span line breaks, then a Markdown-tolerant word match)
-  before giving up, but a selection that straddles formatting boundaries can still miss.
+  is stored byte-for-byte: Markdown markers (`*emphasis*`, `_italics_`, `` `code` ``), `{{macros}}`, and curly vs
+  straight quotes are all applied when the message is rendered. Locating the selection is two steps: it is matched
+  **exactly** against the rendered text, then that span is aligned back to stored content by character-level LCS
+  diffing, with anchor-windowing for long messages. Each step reports its own error — "could not locate the
+  selected text in the rendered message", and "could not map the selection back to stored content". A selection
+  whose edges land inside a formatting marker or a macro refuses rather than risk a bad splice; trimming the
+  selection to whole words, clear of markers, usually resolves it.
 - **Output quality depends entirely on the configured model.** Small local models in particular may ignore the
   length target, leak the surrounding context into the rewrite, or return commentary instead of just the passage.
 - **Context costs tokens and attention.** Enabling surrounding text, previous messages, lorebook entries, Extender
