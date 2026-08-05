@@ -98,16 +98,33 @@ assert.ok(_CSS.includes(".rwa-win ::-webkit-scrollbar"), "drift: extension.css m
 // The shim rebuilds them so the 5.1 body needs no call-site changes.
 assert.ok(/^\(function \(host\) \{/m.test(_SRC), "drift: IIFE parameter is not `host` (shim missing)");
 assert.ok(_SRC.includes("var marinara = {"), "drift: compat shim object missing");
-assert.ok(_SRC.includes('"x-marinara-csrf"'), "drift: apiFetch shim not sending the CSRF header");
 assert.ok(_SRC.includes('fetch("/api" + path'), "drift: apiFetch shim not prefixing /api");
 // Match the shim's OWN teardown, not the bare word: extension.js has three
 // unrelated removeEventListener call sites (drag handling, a focus listener), so
 // the bare-word form passed even with the shim's teardown deleted.
 assert.ok(/target\.removeEventListener\(type, handler, options\)/.test(_SRC), "drift: on() shim not registering teardown");
-// A body with no Content-Type makes the browser send text/plain; Fastify then hands
-// the route a raw string and the zod schema rejects it before the handler runs. This
-// silently broke the default sidecar mode once already.
-assert.ok(/o\.body != null && !headers\.has\("Content-Type"\)/.test(_SRC), "drift: apiFetch no longer defaults Content-Type on a body");
+// Run the SHIPPED header logic rather than pattern-matching it. A text guard pins
+// the condition, not the effect: scoping the set to `if (method === "PATCH")` leaves
+// the guarded substring verbatim and restores the original HTTP 400 on sidecar, and
+// changing the CSRF value to anything but "1" makes every write 403 — both with a
+// green suite. The engine compares `raw === CSRF_HEADER_VALUE` exactly.
+{
+  const _hdrSrc = _SRC.slice(_SRC.indexOf("var o = opts || {};"), _SRC.indexOf('return fetch("/api" + path'));
+  const _hdr = (o) => new Function("opts", _hdrSrc + "\nreturn headers;")(o);
+  assert.equal(_hdr({ method: "POST", body: "{}" }).get("content-type"), "application/json",
+    "drift: apiFetch no longer defaults Content-Type: application/json on a bodied POST");
+  assert.equal(_hdr({ method: "PATCH", body: "{}" }).get("content-type"), "application/json",
+    "drift: apiFetch no longer defaults Content-Type on a bodied PATCH");
+  assert.equal(_hdr({ method: "POST", headers: { "content-type": "application/xml" }, body: "<x/>" }).get("content-type"),
+    "application/xml", "drift: apiFetch overrides a caller's explicit Content-Type");
+  assert.equal(_hdr({ method: "GET" }).get("content-type"), null,
+    "drift: a bodiless GET must not get a Content-Type");
+  assert.equal(_hdr({ method: "POST", body: "{}" }).get("x-marinara-csrf"), "1",
+    "drift: apiFetch not sending the CSRF header, or sending a value the engine rejects");
+  // a non-string body must keep the Content-Type fetch would derive for it
+  assert.equal(_hdr({ method: "POST", body: new URLSearchParams({ a: "1" }) }).get("content-type"), null,
+    "drift: apiFetch forces JSON on a non-string body (would destroy a multipart boundary)");
+}
 // v6.0: the storage namespace is a fixed literal. Deriving it from the engine's
 // extension id stranded the user's data on every re-import.
 assert.ok(_SRC.includes("function adoptLegacyNamespace"), "drift: adoptLegacyNamespace missing");
@@ -611,8 +628,14 @@ const _adopt = (ls) =>
 {
   const CONN = JSON.parse(_SRC.match(/var CONN_KEYS = (\[[^\]]*\]);/)[1].replace(/'/g, '"'));
   assert.deepEqual(CONN, ["apiKey", "apiUrl", "extenderUrl", "connMode"], "drift: CONN_KEYS changed");
-  assert.ok(_SRC.includes("CONN_KEYS.indexOf(k) === -1"), "drift: export no longer filters connection keys");
-  assert.ok(_SRC.includes("CONN_KEYS.indexOf(k) !== -1"), "drift: import no longer skips connection keys");
+  // Pin each comparison to its OWN call site. Asserting only that both strings exist
+  // somewhere lets them be swapped — a one-character edit each — which exports the
+  // user's apiKey in plaintext and lets an imported file redirect apiUrl, with both
+  // asserts and the behavioural mirror below still green.
+  assert.ok(/CONN_KEYS\.indexOf\(k\) === -1\) safeCfg\[k\] = cfg\[k\]/.test(_SRC),
+    "drift: export no longer filters connection keys OUT");
+  assert.ok(/CONN_KEYS\.indexOf\(k\) !== -1\) \{ skippedConn\+\+; return; \}/.test(_SRC),
+    "drift: import no longer SKIPS connection keys");
 
   // mirror of the import config merge
   const DEF_CFG = { cols: 2, connMode: "sidecar", apiUrl: "http://127.0.0.1:11434/v1", apiKey: "", extenderUrl: "x" };
